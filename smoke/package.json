@@ -1,0 +1,12 @@
+{
+  "name": "3dvoxeldemo-smoke",
+  "private": true,
+  "type": "module",
+  "description": "Headless browser smoke tests for the single-file demo (dev tooling, not part of the product).",
+  "scripts": {
+    "test": "node smoke.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.45.0"
+  }
+}

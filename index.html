@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>QWEN FLASH // AWAKENING</title>
+<style>
+  /* ---- M0: full-screen canvas, no scrollbars ---- */
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #04060c;
+  }
+  canvas#gl {
+    display: block;
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    outline: none;
+  }
+  .ui {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    font-family: ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    color: #9fdcff;
+    z-index: 10;
+  }
+  /* ---- FPS / status HUD (top-left, small) ---- */
+  #hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: rgba(159, 220, 255, 0.85);
+    text-shadow: 0 0 6px rgba(0, 180, 255, 0.35);
+    opacity: 0;
+    transition: opacity 0.4s ease;
+    pointer-events: none;
+  }
+  #hud.on { opacity: 1; }
+  /* ---- Boot overlay: title + START button (audio unlock gate) ---- */
+  #overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 22px;
+    background: radial-gradient(ellipse at 50% 45%, rgba(8, 16, 30, 0.92) 0%, rgba(3, 5, 10, 0.97) 70%);
+    pointer-events: auto;
+    transition: opacity 0.5s ease;
+  }
+  #overlay.hide { opacity: 0; pointer-events: none; }
+  #overlay .title {
+    font-size: 15px;
+    letter-spacing: 0.42em;
+    color: #6fc7ff;
+    text-shadow: 0 0 18px rgba(0, 190, 255, 0.6);
+    text-indent: 0.42em;
+  }
+  #overlay .subtitle {
+    font-size: 11px;
+    letter-spacing: 0.3em;
+    color: rgba(150, 200, 240, 0.55);
+  }
+  #startBtn {
+    pointer-events: auto;
+    margin-top: 8px;
+    padding: 14px 42px;
+    font-family: inherit;
+    font-size: 14px;
+    letter-spacing: 0.25em;
+    text-indent: 0.25em;
+    color: #bff2ff;
+    background: rgba(0, 40, 70, 0.35);
+    border: 1px solid rgba(110, 210, 255, 0.55);
+    border-radius: 2px;
+    cursor: pointer;
+    box-shadow: 0 0 24px rgba(0, 170, 255, 0.25), inset 0 0 18px rgba(0, 170, 255, 0.12);
+    transition: background 0.2s ease, box-shadow 0.2s ease;
+  }
+  #startBtn:hover {
+    background: rgba(0, 70, 110, 0.45);
+    box-shadow: 0 0 34px rgba(0, 190, 255, 0.45), inset 0 0 22px rgba(0, 190, 255, 0.2);
+  }
+  #startBtn:disabled { cursor: default; opacity: 0.4; }
+  /* ---- Boot failure / watchdog message ---- */
+  #bootError {
+    position: absolute;
+    inset: auto auto 26px 50%;
+    transform: translateX(-50%);
+    font-size: 12px;
+    letter-spacing: 0.15em;
+    color: #ffb27a;
+    background: rgba(30, 12, 4, 0.7);
+    border: 1px solid rgba(255, 140, 60, 0.4);
+    border-radius: 2px;
+    padding: 10px 16px;
+    text-align: center;
+    white-space: pre-line;
+    display: none;
+  }
+  #bootError.show { display: block; }
+</style>
+<!--
+  Boot watchdog (classic script, runs before the module):
+  if the Three.js CDN import or renderer creation never completes within
+  15 s, surface a visible message instead of leaving the page stuck.
+-->
+<script>
+(function () {
+  window.__SIM_BOOT_DEADLINE__ = setTimeout(function () {
+    if (!window.__SIM_BOOTED__) {
+      var el = document.getElementById('bootError');
+      if (el) {
+        el.textContent =
+          'BOOT STALL — still waiting for the 3D engine (Three.js via CDN).\n' +
+          'Check your network connection and reload the page.';
+        el.classList.add('show');
+      }
+    }
+  }, 15000);
+})();
+</script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div class="ui">
+  <div id="hud" aria-live="off"></div>
+  <div id="overlay">
+    <div class="title">QWEN FLASH // AWAKENING</div>
+    <div class="subtitle">VOXEL DATACENTER CITY &middot; SIMULATION BUILD</div>
+    <button id="startBtn" type="button">ENTER SIMULATION</button>
+  </div>
+  <div id="bootError"></div>
+</div>
+
+<noscript>
+  <div style="position:fixed;inset:0;display:grid;place-items:center;background:#04060c;color:#9fdcff;font-family:monospace;z-index:99">
+    This simulation requires JavaScript.
+  </div>
+</noscript>
+
+<script type="module">
+/* =====================================================================
+ * QWEN FLASH // AWAKENING — single-file voxel datacenter-city demo
+ * ---------------------------------------------------------------------
+ * Ground rules (see PLAN.md):
+ *  - one file, Three.js via CDN is the only external dependency
+ *  - no references before init; subsystems register into one `systems`
+ *    registry and boot in a fixed order
+ *  - everything animated is driven by the central update(dt, t) loop;
+ *    subsystems implement { init, update, onQuality?, onAwaken?, dispose? }
+ * ===================================================================== */
+import * as THREE from 'three';
+
+/* ------------------------------------------------------------------ *
+ * CFG — tunables live here (quality tiers land in M14)
+ * ------------------------------------------------------------------ */
+const CFG = {
+  maxPixelRatio: 2,
+  bootWatchdogMs: 15000,
+  color: {
+    void: 0x05070d,        // M0/M1 empty-void background
+    fog: 0x060a14,
+    fogDensity: 0.004,
+  },
+};
+
+/* ------------------------------------------------------------------ *
+ * BOOT — deterministic state machine: LOADER → RUNNING (→ ERROR)
+ * - guards against double-start
+ * - the START click is the user gesture that unlocks audio (M11 beds
+ *   attach to the same unlock in a later milestone)
+ * ------------------------------------------------------------------ */
+const BOOT = {
+  state: 'LOADER',          // LOADER | RUNNING | ERROR
+  started: false,
+  frames: 0,
+
+  enter(next) {
+    if (BOOT.started && next === 'RUNNING') return;   // no double-init
+    BOOT.state = next;
+    if (next === 'RUNNING') {
+      BOOT.started = true;
+      AUDIO.unlock();                       // audio gate (user gesture)
+      document.getElementById('overlay').classList.add('hide');
+      document.getElementById('hud').classList.add('on');
+      lastNow = performance.now();
+      requestAnimationFrame(frame);        // one and only one loop
+    }
+  },
+
+  fail(msg) {
+    BOOT.state = 'ERROR';
+    const el = document.getElementById('bootError');
+    if (el) {
+      el.textContent = msg;
+      el.classList.add('show');
+    }
+  },
+};
+
+/* ------------------------------------------------------------------ *
+ * AUDIO — gesture-gated unlock stub.
+ * M11 builds the master graph + beds on top of this context.
+ * ------------------------------------------------------------------ */
+const AUDIO = {
+  ctx: null,
+  master: null,
+
+  unlock() {
+    if (AUDIO.ctx) {
+      if (AUDIO.ctx.state === 'suspended') AUDIO.ctx.resume();
+      return;
+    }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;                        // no WebAudio: silent, no crash
+    try {
+      AUDIO.ctx = new AC();
+      AUDIO.master = AUDIO.ctx.createGain();
+      AUDIO.master.gain.value = 0.8;
+      AUDIO.master.connect(AUDIO.ctx.destination);
+    } catch (_) {
+      AUDIO.ctx = null;
+    }
+  },
+};
+
+/* ------------------------------------------------------------------ *
+ * Renderer / scene / camera (ACES tone mapping, sRGB output)
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById('gl');
+
+const renderer = new THREE.WebGLRenderer({
+  canvas,
+  antialias: true,
+  powerPreference: 'high-performance',
+});
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(CFG.color.void);
+scene.fog = new THREE.FogExp2(CFG.color.fog, CFG.color.fogDensity);
+
+const camera = new THREE.PerspectiveCamera(
+  60,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  3000,
+);
+// M0 placeholder position; M1 hands this to the CAMERA system.
+camera.position.set(0, 4, 18);
+camera.lookAt(0, 2, 0);
+
+function onResize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CFG.maxPixelRatio));
+  renderer.setSize(w, h, false);
+}
+window.addEventListener('resize', onResize);
+window.addEventListener('orientationchange', onResize);
+onResize();
+
+/* ------------------------------------------------------------------ *
+ * Subsystems — fixed boot order, one update(dt, t) per frame.
+ * M0 registers BOOT-controller-free subsystems only: HUD.
+ * ------------------------------------------------------------------ */
+const systems = [];
+function registerSystem(sys) {
+  if (!sys || !sys.name || systems.some(s => s.name === sys.name)) return;
+  systems.push(sys);
+}
+
+/* ---- HUD: FPS counter + boot state (DOM, no 3D canvas text) ---- */
+const HUD = {
+  name: 'HUD',
+  el: null,
+  fps: 0,
+  acc: 0,
+  accFrames: 0,
+
+  init() {
+    HUD.el = document.getElementById('hud');
+  },
+
+  update(dt) {
+    HUD.acc += dt;
+    HUD.accFrames++;
+    if (HUD.acc >= 0.5) {
+      HUD.fps = HUD.accFrames / HUD.acc;
+      HUD.acc = 0;
+      HUD.accFrames = 0;
+      if (HUD.el) {
+        HUD.el.textContent =
+          `FPS ${String(Math.round(HUD.fps)).padStart(2, ' ')}\n` +
+          `STATE ${BOOT.state}`;
+        HUD.el.style.whiteSpace = 'pre';
+      }
+    }
+  },
+};
+
+registerSystem(HUD);
+for (const s of systems) if (s.init) s.init();
+
+/* ------------------------------------------------------------------ *
+ * Central loop — driven only after BOOT.enter('RUNNING')
+ * ------------------------------------------------------------------ */
+let lastNow = performance.now();
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - lastNow) / 1000, 0.1);   // clamp (tab-hide)
+  lastNow = now;
+  const t = now / 1000;
+  for (const s of systems) if (s.update) s.update(dt, t);
+  renderer.render(scene, camera);
+  BOOT.frames++;
+}
+
+/* ------------------------------------------------------------------ *
+ * Startup
+ * ------------------------------------------------------------------ */
+try {
+  const startBtn = document.getElementById('startBtn');
+  startBtn.addEventListener('click', () => {
+    if (BOOT.state !== 'LOADER') return;     // idempotent gate
+    BOOT.enter('RUNNING');
+    startBtn.disabled = true;
+  });
+
+  // Boot succeeded: renderer constructed, scene + camera attached,
+  // overlay ready — clear the watchdog, refresh will re-run all of it.
+  window.__SIM_BOOTED__ = true;
+  if (window.__SIM_BOOT_DEADLINE__) clearTimeout(window.__SIM_BOOT_DEADLINE__);
+} catch (err) {
+  BOOT.fail(
+    'BOOT FAILURE — ' + (err && err.message ? err.message : 'unknown error') +
+    '\nReload the page to retry.',
+  );
+}
+
+/* Dev / smoke-test handle (not part of the game). */
+window.SIM = {
+  BOOT,
+  HUD,
+  renderer,
+  scene,
+  camera,
+  systems,
+};
+</script>
+</body>
+</html>
