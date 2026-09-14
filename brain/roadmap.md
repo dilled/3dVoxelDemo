@@ -2,12 +2,12 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-09-15T01:43:00"
+updated: "2026-09-15T02:32:41"
 ---
 
 # Roadmap
 
-Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status below; M0–M2 done and smoke-verified headless (M2: KIT material kit, 8 draw-call gate test rig).
+Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status below; M0–M3 done and smoke-verified headless (M3: seeded chunked city far layer, flat draw calls, see [[world-chunk-generation]]).
 
 ```mermaid
 gantt
@@ -19,8 +19,8 @@ gantt
   M1 systems registry, input, camera :done, m1, after m0, 2d
   M2 voxel material kit :done, m2, after m1, 2d
   section World
-  M3 chunked city far layer :active, m3, after m2, 3d
-  M4 building detail passes :m4, after m3, 3d
+  M3 chunked city far layer :done, m3, after m2, 3d
+  M4 building detail passes :active, m4, after m3, 3d
   section Creature & life
   M5 Qwen creature dormant :m5, after m4, 3d
   M6 traffic + ambient life :m6, after m5, 2d
@@ -38,5 +38,5 @@ gantt
 
 ## Notes
 
-- M2 landed `KIT` (material library, canvas textures, instanced builders, merged batcher, lighting rig) and a *temporary* gate test rig at (0,0,-80) — M3's city generator must absorb or relocate it (see [[m2-material-kit]]).
+- M3 landed `WORLD`: mulberry32-seeded 16×16-block chunks in a 5×5 keep-set, 8 weighted archetypes, 3 LOD rings, ≤ 3 instanced draw calls per chunk with frustum culling — the M2 gate test rig is absorbed inside the city (keep-out at (0,0,-80)). Per-archetype detail passes are M4; the central plaza (±2 blocks) is reserved for the M5 creature pedestal.
 - Hero point lights are reserved in `KIT.heroLights` (intensity 0) for M5/M9/M11.

@@ -43,7 +43,7 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 | **M0** ✅ | Single-file scaffold: full-screen canvas, Three.js via CDN, scene/renderer/camera, `BOOT` state machine with START button + audio gate, FPS counter | START always leads to a live 60 fps loop; page refresh never leaves a stuck state |
 | **M1** ✅ | Core loop: fixed-order `systems` registry + `update(dt)`, `INPUT` (WASD/ZQSD, pointer-lock mouse look, wheel zoom, middle-mouse orbit, gamepad), `CAMERA` ground/cinematic modes with shake API | Fly around an empty dark void in both cameras; gamepad works; nothing throws without one |
 | **M2** ✅ | Procedural voxel material kit: shared materials, canvas-texture helpers (LED grid, holo signs, glow sprites), instanced box/cylinder + merged-geometry builders, lighting rig | Kit renders a test wall/tower with animated LED faces and signs at < 10 draw calls |
-| **M3** | Chunked city generation (far layer): seeded PRNG, city grid, 16×16 block chunks generated/unbuilt around player, weighted archetypes, 3-ring distance LOD | City extends beyond initial view, no visible duplication, draw calls flat as you fly out |
+| **M3** ✅ | Chunked city generation (far layer): seeded PRNG, city grid, 16×16 block chunks generated/unbuilt around player, weighted archetypes, 3-ring distance LOD | City extends beyond initial view, no visible duplication, draw calls flat as you fly out |
 | **M4** | Building detail passes (near layer): per-archetype details (server racks, cooling towers, substations, antennas, fiber spires, holo signs), per-building seeded variation, zone haze | Every archetype readable from 50–200 m and procedurally varied; FPS within target |
 | **M5** | The Qwen machine-creature (dormant): plaza pedestal, full creature build from primitives, named rig parts, dormant breathing/idle state, instanced compute-node voxels | Reads as "dormant colossal machine" from street level; silhouette holds from 3 camera distances |
 | **M6** | Traffic & ambient life (pooled): object pools, maintenance drones, sky vehicles with light trails, steam/spark emitters, FPS-tier adaptive caps | City feels inhabited; caps never exceed tier; pools never allocate per frame |
@@ -91,15 +91,15 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 - **Done-when:** kit renders a test wall/tower with animated LED faces
       and signs at < 10 draw calls.
 
-### M3 — Chunked city generation (far layer)
-- [ ] Seeded PRNG (mulberry32), city grid: blocks, avenues, height falloff
+### M3 — Chunked city generation (far layer) ✅
+- [x] Seeded PRNG (mulberry32), city grid: blocks, avenues, height falloff
       around the central plaza, ring roads.
-- [ ] Chunk = 16×16 block grid; generate on demand around player,
+- [x] Chunk = 16×16 block grid; generate on demand around player,
       unbuild behind; simple per-chunk budget (density by distance ring).
-- [ ] Building archetype picker with weights by zone:
+- [x] Building archetype picker with weights by zone:
       server tower, rack slab, cooling tower, substation, antenna farm,
       fiber conduit spire, holo-sign tower, residential-ish data housing.
-- [ ] Distance LOD: 3 rings (dense / mid / silhouetted-boxes + haze color).
+- [x] Distance LOD: 3 rings (dense / mid / silhouetted-boxes + haze color).
 - **Done-when:** city extends well beyond initial view, no visible
   duplication, draw calls stay flat as you fly further out.
 

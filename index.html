@@ -232,10 +232,30 @@ const CFG = {
     heroPointDecay: 2,
   },
   kit: {
-    testTower: { x: 0, z: -80 },  // M2 gate demo (temporary until M3 absorbs it)
+    testTower: { x: 0, z: -80 },  // M2 gate demo (absorbed by the M3 city: keep-out area)
     ledHz: 15,                   // LED canvas redraw rate
     signHz: 8,                  // holo-sign flicker redraw rate
     signTagCycle: 8,            // s per UNSLOTH tagline
+  },
+  city: {
+    block: 24,                  // metres per block
+    chunkBlocks: 16,            // chunk = 16×16 blocks (384 m)
+    radius: 2,                  // Chebyshev chunk rings kept built (5×5 = 1920 m)
+    seed: 0x51A7C3,             // deterministic city — identical every run/refresh
+    plazaBlocks: 2,             // central plaza kept clear (M5 creature pedestal)
+    occupancy: [0.92, 0.85, 0.78], // per-chunk budget: building density by LOD ring
+    haze: 0x16273f,             // far-ring silhouette haze tint
+    hazeAmount: 0.55,
+    archetypes: {
+      server:  { weights: { core: 5, mid: 4, outer: 1 }, tint: 0xbfd4f2, glow: true },
+      rack:    { weights: { core: 2, mid: 3, outer: 2 }, tint: 0x9fb0d0 },
+      cool:    { weights: { core: 1, mid: 2, outer: 2 }, tint: 0xaebcd6 },
+      sub:     { weights: { core: 1, mid: 2, outer: 2 }, tint: 0x94a8c8 },
+      antenna: { weights: { core: 1, mid: 1, outer: 2 }, tint: 0xa4b8d8 },
+      fiber:   { weights: { core: 2, mid: 1, outer: 1 }, tint: 0x9fe8ff, glow: true },
+      holo:    { weights: { core: 2, mid: 1, outer: 1 }, tint: 0xc4d8f8, glow: true },
+      housing: { weights: { core: 1, mid: 2, outer: 4 }, tint: 0xc0b098 },
+    },
   },
 };
 
@@ -1098,9 +1118,327 @@ const KIT = {
   dispose() {},
 };
 
+/* ==================================================================== *
+ * WORLD — chunked city generation, far layer (M3)
+ *
+ *  - seeded PRNG (mulberry32): every block seed derives from WORLD.seed,
+ *    so the city is identical on every run/refresh and a chunk rebuilt
+ *    later is byte-identical (no visible duplication, no shimmer)
+ *  - city grid: 24 m blocks; avenues every 5 blocks — they radiate from
+ *    the central plaza and therefore trace the ring roads; the central
+ *    plaza (±2 blocks) stays clear for the M5 creature; a small keep-out
+ *    preserves the M2 test rig
+ *  - chunk = 16×16 blocks (384 m); generated on demand around the
+ *    player, retired outside the 5×5 keep-set; per-chunk budget =
+ *    building density by distance ring
+ *  - 8 building archetypes, weights by zone (core / mid / outer),
+ *    height falloff with radius from the plaza
+ *  - distance LOD: 3 rings — dense mass / mid mass / hazed silhouettes
+ *  - each chunk costs ≤ 3 draw calls (structural boxes / emissive boxes /
+ *    cylinders — one InstancedMesh each), each mesh frustum-culled with
+ *    its own bounding sphere → draw calls stay flat as you fly out
+ * --------------------------------------------------------------------- */
+
+/* deterministic PRNG — the whole city derives from these seeds */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* allocation-free tint helpers (numbers in, number out) */
+function _tintShade(hex, v) {   // brightness × v
+  const r = Math.min(255, Math.floor(((hex >> 16) & 255) * v));
+  const g = Math.min(255, Math.floor(((hex >> 8) & 255) * v));
+  const b = Math.min(255, Math.floor((hex & 255) * v));
+  return (r << 16) | (g << 8) | b;
+}
+function _tintHaze(hex, k, haze) {   // lerp toward the city-haze tint
+  const r = Math.round(((hex >> 16) & 255) * (1 - k) + ((haze >> 16) & 255) * k);
+  const g = Math.round(((hex >> 8) & 255) * (1 - k) + ((haze >> 8) & 255) * k);
+  const b = Math.round((hex & 255) * (1 - k) + (haze & 255) * k);
+  return (r << 16) | (g << 8) | b;
+}
+
+const WORLD = {
+  name: 'WORLD',
+  mulberry: mulberry32,
+  seed: CFG.city.seed,
+  BLOCK: CFG.city.block,
+  CHUNK: CFG.city.chunkBlocks,
+  RADIUS: CFG.city.radius,
+  root: null,
+  ground: null,
+  chunks: new Map(),      // "cx,cz" -> chunk
+  _pool: [],               // retired chunks (buffers reused, never disposed)
+  _pcx: NaN, _pcz: NaN,    // last player chunk (triggers _sync on change)
+  playerKey: '',
+  _farTint: {},
+  stats: { chunks: 0, instances: 0, ring: [0, 0, 0], meters: 0 },
+
+  init() {
+    const C = CFG.city;
+    WORLD.root = new THREE.Group();
+    scene.add(WORLD.root);
+    /* far-ring silhouette tints (hazed once, not per-building) */
+    for (const k in C.archetypes) {
+      WORLD._farTint[k] = _tintHaze(C.archetypes[k].tint, C.hazeAmount, C.haze);
+    }
+    /* ground: one big plane with a repeating block-grid texture.
+     * 6240 m = 26 avenue periods of 120 m; corner at -3120 m sits on the
+     * 24 m block grid, so texture lines stay world-aligned to the city. */
+    const gt = makeCanvasTexture(250, 250, (ctx, w, h) => {
+      ctx.fillStyle = '#0a0f17';
+      ctx.fillRect(0, 0, w, h);
+      const cell = 50;                        // 5 block-cells per avenue period
+      ctx.strokeStyle = 'rgba(90,140,190,0.15)';
+      ctx.lineWidth = 2;
+      for (let i = 1; i < 5; i++) {
+        ctx.beginPath(); ctx.moveTo(i * cell + 0.5, 0); ctx.lineTo(i * cell + 0.5, h); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, i * cell + 0.5); ctx.lineTo(w, i * cell + 0.5); ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(110,190,255,0.28)';   // avenue / ring-road line
+      ctx.lineWidth = 3;
+      ctx.strokeRect(1.5, 1.5, w - 3, h - 3);
+    });
+    gt.tex.wrapS = gt.tex.wrapT = THREE.RepeatWrapping;
+    gt.tex.repeat.set(52, 52);               // 6240 m / 120 m period
+    gt.tex.anisotropy = 8;
+    WORLD.ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(6240, 6240),
+      new THREE.MeshLambertMaterial({ map: gt.tex }),
+    );
+    WORLD.ground.rotation.x = -Math.PI / 2;
+    WORLD.root.add(WORLD.ground);
+  },
+
+  /* per-block seed — deterministic for (bx, bz) forever */
+  _seedFor(bx, bz) {
+    let h = WORLD.seed
+      ^ Math.imul(bx + 131, 0x9E3779B1)
+      ^ Math.imul(bz + 397, 0x85EBCA77);
+    h = Math.imul(h ^ (h >>> 15), 0xC2B2AE3D) >>> 0;
+    return h;
+  },
+
+  /* avenues every 5 blocks (they radiate from the plaza ⇒ ring roads);
+   * central plaza kept clear; keep-out preserves the M2 test rig */
+  _skipBlock(bx, bz) {
+    const m5 = n => ((n % 5) + 5) % 5;
+    if (m5(bx) === 0 || m5(bz) === 0) return true;
+    if (Math.max(Math.abs(bx), Math.abs(bz)) <= CFG.city.plazaBlocks) return true;
+    const P = CFG.kit.testTower;
+    const wx = (bx + 0.5) * WORLD.BLOCK, wz = (bz + 0.5) * WORLD.BLOCK;
+    if (Math.abs(wx - P.x) < 16 && Math.abs(wz - P.z) < 16) return true;
+    return false;
+  },
+
+  update(dt, t) {
+    const p = CAMERA.pos;
+    const bx = Math.floor(p.x / WORLD.BLOCK);
+    const bz = Math.floor(p.z / WORLD.BLOCK);
+    const cx = Math.floor(bx / WORLD.CHUNK);
+    const cz = Math.floor(bz / WORLD.CHUNK);
+    WORLD.playerKey = cx + ',' + cz;
+    if (cx === WORLD._pcx && cz === WORLD._pcz) return;
+    WORLD._pcx = cx; WORLD._pcz = cz;
+    WORLD._sync();
+  },
+
+  /* (re)build the keep-set around the player, retire the rest */
+  _sync() {
+    const keep = new Set();
+    for (let dx = -WORLD.RADIUS; dx <= WORLD.RADIUS; dx++) {
+      for (let dz = -WORLD.RADIUS; dz <= WORLD.RADIUS; dz++) {
+        const cx = WORLD._pcx + dx, cz = WORLD._pcz + dz;
+        const key = cx + ',' + cz;
+        keep.add(key);
+        const ring = Math.max(Math.abs(dx), Math.abs(dz));
+        const have = WORLD.chunks.get(key);
+        if (!have) WORLD._spawnChunk(cx, cz, ring);
+        else if (have.ring !== ring) WORLD._fill(have, ring);   // LOD change
+      }
+    }
+    for (const [key, ch] of WORLD.chunks) {
+      if (keep.has(key)) continue;
+      WORLD.chunks.delete(key);
+      ch.boxA.count = 0; ch.boxG.count = 0; ch.cyl.count = 0;
+      ch.boxA.mesh.count = 0; ch.boxG.mesh.count = 0; ch.cyl.mesh.count = 0;
+      ch.group.visible = false;
+      WORLD._pool.push(ch);           // buffers reused, never disposed
+    }
+    WORLD._countStats();
+  },
+
+  _spawnChunk(cx, cz, ring) {
+    let ch = WORLD._pool.pop();
+    if (!ch) {
+      ch = {
+        cx: 0, cz: 0, ring: 0,
+        group: new THREE.Group(),
+        boxA: KIT.InstancedBox(1000, [1, 1, 1], MATS.metalDark),
+        boxG: KIT.InstancedBox(600, [1, 1, 1], MATS.server),
+        cyl: KIT.InstancedCylinder(240, 0.5, 0.5, 1, 10, MATS.metalDark),
+      };
+    }
+    ch.cx = cx; ch.cz = cz;
+    ch.group.add(ch.boxA.mesh, ch.boxG.mesh, ch.cyl.mesh);
+    WORLD.root.add(ch.group);
+    WORLD.chunks.set(cx + ',' + cz, ch);
+    WORLD._fill(ch, ring);
+  },
+
+  /* refill one chunk from its block seeds — pure function of (cx, cz, ring) */
+  _fill(ch, ring) {
+    const K = WORLD.CHUNK, B = WORLD.BLOCK;
+    ch.cx = Math.round(ch.cx); ch.cz = Math.round(ch.cz);
+    ch.ring = ring;
+    ch.boxA.count = 0; ch.boxG.count = 0; ch.cyl.count = 0;
+    ch.group.visible = true;
+    const bx0 = ch.cx * K, bz0 = ch.cz * K;
+    for (let i = 0; i < K; i++) {
+      const bx = bx0 + i;
+      for (let j = 0; j < K; j++) {
+        const bz = bz0 + j;
+        if (WORLD._skipBlock(bx, bz)) continue;
+        const rng = mulberry32(WORLD._seedFor(bx, bz));
+        if (rng() >= CFG.city.occupancy[ring]) continue;         // vacant lot
+        const wx = (bx + 0.5) * B, wz = (bz + 0.5) * B;
+        const dist = Math.hypot(wx, wz);
+        const zone = dist < 220 ? 'core' : dist < 520 ? 'mid' : 'outer';
+        const fall = 0.35 + 0.65 * Math.exp(-dist * 0.0045);   // height falloff
+        const arch = WORLD._pick(rng, zone);
+        WORLD._mass(rng, ch, arch, CFG.city.archetypes[arch], wx, wz, fall, ring);
+      }
+    }
+    for (const b of [ch.boxA, ch.boxG, ch.cyl]) {
+      b.commit();
+      if (b.count > 0) {
+        b.mesh.computeBoundingSphere();   // InstancedMesh-aware bounds
+        b.mesh.frustumCulled = true;       // cull whole chunks off-screen
+      }
+    }
+  },
+
+  /* dev/smoke seam: rebuild one chunk in place (determinism check) */
+  regen(key) {
+    const ch = WORLD.chunks.get(key);
+    if (ch) WORLD._fill(ch, ch.ring);
+  },
+
+  _pick(rng, zone) {
+    const A = CFG.city.archetypes;
+    let total = 0;
+    for (const k in A) total += A[k].weights[zone];
+    let r = rng() * total;
+    for (const k in A) {
+      r -= A[k].weights[zone];
+      if (r < 0) return k;
+    }
+    return 'server';
+  },
+
+  /* building mass (far layer; per-archetype detail arrives in M4) */
+  _mass(rng, ch, arch, A, x, z, fall, ring) {
+    const far = ring >= 2;
+    const tint = far ? WORLD._farTint[arch] : _tintShade(A.tint, 0.85 + rng() * 0.3);
+    const box = A.glow ? ch.boxG : ch.boxA;
+    const R = (a, b) => a + rng() * (b - a);
+
+    if (far) {
+      /* silhouette ring: one hazed box per building, archetype-sized */
+      const dims = {
+        server:  [R(10, 14), R(22, 50) * fall],
+        rack:    [R(16, 20), R(3, 6)],
+        cool:    [R(9, 14), R(6, 12)],
+        sub:     [R(10, 13), R(2.5, 4)],
+        antenna: [R(5, 7), R(6, 10)],
+        fiber:   [R(4.5, 6), R(38, 68) * fall],
+        holo:    [R(5, 6.5), R(18, 30) * (0.6 + 0.4 * fall)],
+        housing: [R(11, 14), R(7, 15) * (0.7 + 0.3 * fall)],
+      }[arch];
+      box.add(x, dims[1] / 2, z, [dims[0], dims[1], dims[0]], tint);
+      return;
+    }
+
+    switch (arch) {
+    case 'server': {
+      const w = R(9, 14), h = R(22, 52) * fall;
+      box.add(x, h / 2, z, [w, h, w], tint);
+      const u = h * 0.18;
+      box.add(x, h + u / 2, z, [w * 0.62, u, w * 0.62], _tintShade(tint, 1.15));
+      break;
+    }
+    case 'rack': {
+      const w = R(15, 21), h = R(3, 6);
+      box.add(x, h / 2, z, [w, h, w * 0.72], tint);
+      const a = R(4, 6);
+      box.add(x + w * 0.35, a * 0.25, z + w * 0.2, [a, a * 0.5, a],
+        _tintShade(tint, 0.8));
+      break;
+    }
+    case 'cool': {
+      const r = R(4.5, 7), h = R(6, 13);
+      ch.cyl.add(x, h / 2, z, [r * 2, h, r * 2], tint);
+      ch.cyl.add(x, h + 0.9, z, [r * 1.2, 1.8, r * 1.2], _tintShade(tint, 1.1));
+      break;
+    }
+    case 'sub': {
+      const w = R(10, 13), h = R(2.5, 4);
+      box.add(x, h / 2, z, [w, h, w * 0.7], tint);
+      ch.cyl.add(x - w * 0.3, h + 0.8, z, [0.7, 1.6, 0.7], _tintShade(tint, 1.2));
+      ch.cyl.add(x + w * 0.3, h + 0.8, z, [0.7, 1.6, 0.7], _tintShade(tint, 1.2));
+      break;
+    }
+    case 'antenna': {
+      const w = R(5, 7), h = R(2.5, 4);
+      box.add(x, h / 2, z, [w, h, w], tint);
+      const mh = R(12, 22);
+      ch.cyl.add(x, h + mh / 2, z, [0.8, mh, 0.8], _tintShade(tint, 1.1));
+      break;
+    }
+    case 'fiber': {
+      const h = R(38, 68) * fall, w = R(4.5, 6);
+      box.add(x, h / 2, z, [w, h, w], tint);
+      box.add(x, h + 1, z, [w * 0.5, 2, w * 0.5], _tintShade(tint, 1.3));
+      break;
+    }
+    case 'holo': {
+      const h = R(18, 30) * (0.6 + 0.4 * fall);
+      box.add(x, h / 2, z, [5, h, 5], tint);
+      box.add(x, h + 1.5, z, [6.5, 3, 6.5], _tintShade(tint, 1.2));  // pad (M4 sign)
+      break;
+    }
+    case 'housing': {
+      const w = R(11, 14), h = R(7, 15) * (0.7 + 0.3 * fall);
+      box.add(x, h / 2, z, [w, h, w * 0.85], tint);
+      break;
+    }
+    }
+  },
+
+  _countStats() {
+    let inst = 0;
+    const ring = [0, 0, 0];
+    for (const ch of WORLD.chunks.values()) {
+      inst += ch.boxA.count + ch.boxG.count + ch.cyl.count;
+      if (ch.ring <= 2) ring[ch.ring]++;
+    }
+    WORLD.stats.chunks = WORLD.chunks.size;
+    WORLD.stats.instances = inst;
+    WORLD.stats.ring = ring;
+    WORLD.stats.meters = (2 * WORLD.RADIUS + 1) * WORLD.CHUNK * WORLD.BLOCK;
+  },
+};
+
 /* ------------------------------------------------------------------ *
  * Subsystems — FIXED BOOT ORDER = registration order.
- * M0: HUD   M1: INPUT, CAMERA   M2: KIT
+ * M0: HUD   M1: INPUT, CAMERA   M2: KIT   M3: WORLD
  * ------------------------------------------------------------------ */
 const systems = [];
 function registerSystem(sys) {
@@ -1149,6 +1487,7 @@ const HUD = {
 registerSystem(INPUT);
 registerSystem(CAMERA);
 registerSystem(KIT);
+registerSystem(WORLD);
 registerSystem(HUD);
 for (const s of systems) if (s.init) s.init();
 
@@ -1209,6 +1548,7 @@ window.SIM = {
   INPUT,
   CAMERA,
   KIT,
+  WORLD,
   HUD,
   CFG,
   renderer,

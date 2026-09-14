@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-15T01:42:17"
+updated: "2026-09-15T02:32:16"
 ---
 
 <!-- compiled_truth -->
@@ -41,3 +41,9 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
   affects: [smoke-harness-dev-tooling]
+
+- time: 2026-09-15T02:32:16
+  kind: decision
+  summary: "M3 extends the harness: WORLD checks — mulberry32 known-vector + distinct per-block seeds, 5×5 keep-set (25 chunks, ring 1/8/16, ≥1900 m, >2500 instances), byte-identical chunk regeneration (WORLD.regen + instanceMatrix compare), flat draw calls after flying to (0,4,1600) (far ≤ near+8, <150), and unbuild-behind/ahead on chunk change; M2 gate now hides WORLD.root around the <10 draw-call read"
+  source: M3 implementation
+  affects: [smoke-harness-dev-tooling, world-chunk-generation]

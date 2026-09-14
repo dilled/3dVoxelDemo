@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [kit, materials, draw-calls, three]
 created: "2026-09-15T01:41:27"
-updated: "2026-09-15T01:41:48"
+updated: "2026-09-15T02:32:16"
 ---
 
 <!-- compiled_truth -->
@@ -34,3 +34,9 @@ M2's `KIT` system is the shared foundation every later visual milestone builds o
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
   affects: [m2-material-kit]
+
+- time: 2026-09-15T02:32:16
+  kind: decision
+  summary: "M3 absorbed the test rig: it now sits inside the WORLD city grid behind a 16 m keep-out at (0,0,-80); the smoke M2 <10-draw-call gate hides WORLD.root while measuring, and the M1 fixed-order check is INPUT→CAMERA→KIT→WORLD→HUD"
+  source: M3 implementation
+  affects: [m2-material-kit, world-chunk-generation, smoke-harness-dev-tooling]

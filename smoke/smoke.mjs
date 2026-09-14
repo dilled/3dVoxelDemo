@@ -27,9 +27,19 @@
  *   M2 checks:
  *   - KIT registered: material library, canvas textures (LED/QWEN/
  *     UNSLOTH/glow), lighting rig (hemi + moon + 2 reserved point lights)
- *   - gate: full test wall/tower scene renders at < 10 draw calls
+ *   - gate: test wall/tower (city hidden) renders at < 10 draw calls
  *   - LED canvas textures actually redraw (frame counter advances)
  *   - rendered pixels visibly change over time (animation on GPU)
+ *
+ *   M3 checks:
+ *   - WORLD registered in the fixed system order
+ *   - mulberry32 PRNG matches a known vector; per-block seeds differ
+ *   - 5×5 chunk set built around the player (25 chunks, rings 1/8/16),
+ *     thousands of instances, keep-set spans well beyond the fog view
+ *   - chunk regeneration is byte-identical (deterministic seeds ⇒ no
+ *     visible duplication / shimmer)
+ *   - draw calls stay flat (within budget) after flying far out, and
+ *     the old keep-set is unbuilt behind while new chunks build ahead
  *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
@@ -235,7 +245,7 @@ try {
   {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
-      JSON.stringify(names) === JSON.stringify(['INPUT', 'CAMERA', 'KIT', 'HUD']),
+      JSON.stringify(names) === JSON.stringify(['INPUT', 'CAMERA', 'KIT', 'WORLD', 'HUD']),
       names.join(', '));
   }
 
@@ -395,12 +405,15 @@ try {
       kit.hasKit && kit.rig && kit.mats >= 5 && kit.builders && kit.signs && kit.lights,
       `mats=${kit.mats}`);
 
-    const c0 = await page.evaluate(() => window.SIM.renderer.info.render.calls);
-    await sleep(300);
+    // The M2 gate measures the KIT test wall/tower alone: hide the M3
+    // city for a frame or two, read the draw-call count, show it again.
+    await page.evaluate(() => { window.SIM.WORLD.root.visible = false; });
+    await sleep(250);
     const c1 = await page.evaluate(() => window.SIM.renderer.info.render.calls);
-    check('M2 gate: test wall/tower scene renders at < 10 draw calls',
+    await page.evaluate(() => { window.SIM.WORLD.root.visible = true; });
+    check('M2 gate: test wall/tower (city hidden) renders at < 10 draw calls',
       Number.isInteger(c1) && c1 >= 1 && c1 < 10,
-      `calls ${c0} -> ${c1}`);
+      `calls=${c1}`);
 
     const f0 = kit.texA;
     await sleep(450);
@@ -415,7 +428,97 @@ try {
       !shot1.equals(shot2));
   }
 
-  /* ---- 7. No errors anywhere ---- */
+  /* ------------------------------------------------------------------
+   * M3 — chunked city generation (far layer)
+   * ------------------------------------------------------------------ */
+
+  /* ---- 7a. Seeded PRNG: known vector + per-block seeds differ ---- */
+  {
+    const prng = await page.evaluate(() => {
+      const r = window.SIM.WORLD.mulberry(12345);
+      return [r(), r(), r()];
+    });
+    check('WORLD mulberry32 matches the known PRNG vector',
+      Math.abs(prng[0] - 0.9797282677609473) < 1e-9 &&
+      Math.abs(prng[1] - 0.3067522644996643) < 1e-9 &&
+      Math.abs(prng[2] - 0.484205421525985) < 1e-9,
+      prng.map(v => v.toFixed(4)).join(', '));
+    const seeds = await page.evaluate(() => {
+      const w = window.SIM.WORLD;
+      return [w._seedFor(3, 4), w._seedFor(3, 5), w._seedFor(4, 3)];
+    });
+    check('per-block seeds are distinct (no duplicated neighbours)',
+      new Set(seeds).size === seeds.length, seeds.join(', '));
+  }
+
+  /* ---- 7b. City built around the player: 5×5 chunks, 3 LOD rings ---- */
+  await sleep(400);
+  let st = await page.evaluate(() => ({
+    chunks: window.SIM.WORLD.stats.chunks,
+    instances: window.SIM.WORLD.stats.instances,
+    ring: window.SIM.WORLD.stats.ring.slice(),
+    meters: window.SIM.WORLD.stats.meters,
+    player: window.SIM.WORLD.playerKey,
+  }));
+  check('WORLD built a 5×5 chunk keep-set around the player',
+    st.chunks === 25,
+    `chunks=${st.chunks}, player=${st.player}`);
+  check('LOD ring distribution is 1 dense / 8 mid / 16 silhouette',
+    st.ring[0] === 1 && st.ring[1] === 8 && st.ring[2] === 16,
+    `ring=${st.ring.join('/')}`);
+  check('city extends far beyond initial view (keep-set >> fog view)',
+    st.meters >= 1900 && st.instances > 2500,
+    `meters=${st.meters}, instances=${st.instances}`);
+
+  /* ---- 7c. Deterministic regeneration (no duplication / shimmer) ---- */
+  {
+    const snap = async () => page.evaluate(() => {
+      const c = window.SIM.WORLD.chunks.get('1,1');
+      return {
+        n: c.boxA.count,
+        m: Array.from(c.boxA.mesh.instanceMatrix.array),
+      };
+    });
+    const before = await snap();
+    await page.evaluate(() => window.SIM.WORLD.regen('1,1'));
+    const after = await snap();
+    check('chunk regeneration is byte-identical (seeded, no duplication)',
+      before.n > 100 && before.n === after.n &&
+      before.m.length === after.m.length &&
+      before.m.every((v, i) => v === after.m[i]),
+      `instances=${before.n}`);
+  }
+
+  /* ---- 7d. Draw calls flat + unbuild-behind as you fly far out ---- */
+  {
+    const cNear = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    await page.evaluate(() => {
+      window.SIM.CAMERA.pos.set(0, 4, 1600);   // fly ~4 city radii out
+    });
+    await sleep(700);                           // sync: retire old, build new
+    const cFar = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    check('draw calls stay flat (and within budget) when flying far out',
+      cFar < 150 && cFar <= cNear + 8,
+      `near=${cNear}, far=${cFar}`);
+    const unbuild = await page.evaluate(() => {
+      const w = window.SIM.WORLD;
+      return {
+        player: w.playerKey,
+        oldGone: !w.chunks.has('0,0'),
+        ahead: w.chunks.has('0,4'),
+        chunks: w.stats.chunks,
+      };
+    });
+    check('old keep-set unbuilt behind, new chunks built ahead',
+      unbuild.player === '0,4' && unbuild.oldGone && unbuild.ahead &&
+      unbuild.chunks === 25,
+      `player=${unbuild.player}, oldGone=${unbuild.oldGone}, ahead=${unbuild.ahead}`);
+    // fly back so later checks run from the city centre
+    await page.evaluate(() => { window.SIM.CAMERA.pos.set(0, 4, 18); });
+    await sleep(400);
+  }
+
+  /* ---- 8. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));
 } finally {
