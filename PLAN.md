@@ -41,7 +41,7 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 | Phase | Scope | Gate |
 |---|---|---|
 | **M0** ✅ | Single-file scaffold: full-screen canvas, Three.js via CDN, scene/renderer/camera, `BOOT` state machine with START button + audio gate, FPS counter | START always leads to a live 60 fps loop; page refresh never leaves a stuck state |
-| **M1** | Core loop: fixed-order `systems` registry + `update(dt)`, `INPUT` (WASD/ZQSD, pointer-lock mouse look, wheel zoom, middle-mouse orbit, gamepad), `CAMERA` ground/cinematic modes with shake API | Fly around an empty dark void in both cameras; gamepad works; nothing throws without one |
+| **M1** ✅ | Core loop: fixed-order `systems` registry + `update(dt)`, `INPUT` (WASD/ZQSD, pointer-lock mouse look, wheel zoom, middle-mouse orbit, gamepad), `CAMERA` ground/cinematic modes with shake API | Fly around an empty dark void in both cameras; gamepad works; nothing throws without one |
 | **M2** | Procedural voxel material kit: shared materials, canvas-texture helpers (LED grid, holo signs, glow sprites), instanced box/cylinder + merged-geometry builders, lighting rig | Kit renders a test wall/tower with animated LED faces and signs at < 10 draw calls |
 | **M3** | Chunked city generation (far layer): seeded PRNG, city grid, 16×16 block chunks generated/unbuilt around player, weighted archetypes, 3-ring distance LOD | City extends beyond initial view, no visible duplication, draw calls flat as you fly out |
 | **M4** | Building detail passes (near layer): per-archetype details (server racks, cooling towers, substations, antennas, fiber spires, holo signs), per-building seeded variation, zone haze | Every archetype readable from 50–200 m and procedurally varied; FPS within target |
@@ -67,13 +67,13 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 - **Done-when:** clicking START always leads to a live 60 fps loop;
   refreshing the page never leaves a stuck state.
 
-### M1 — Core loop, input, camera foundations
-- [ ] Fixed-order `systems` registry + `update(dt)`; clamped `dt`.
-- [ ] `INPUT`: WASD/ZQSD, Shift, Space, mouse look (pointer lock), wheel zoom,
+### M1 — Core loop, input, camera foundations ✅
+- [x] Fixed-order `systems` registry + `update(dt)`; clamped `dt`.
+- [x] `INPUT`: WASD/ZQSD, Shift, Space, mouse look (pointer lock), wheel zoom,
       middle-mouse orbit, key to switch camera modes.
-- [ ] Gamepad: poll per frame, optional, no crash without one (deadzone,
+- [x] Gamepad: poll per frame, optional, no crash without one (deadzone,
       axes for look/move, trigger for zoom).
-- [ ] `CAMERA`: ground/exploration mode (height-clamped, collision-lite) and
+- [x] `CAMERA`: ground/exploration mode (height-clamped, collision-lite) and
       cinematic free-fly; smooth lerp between modes; subtle shake API.
 - **Done-when:** you can fly around an empty dark void in both cameras,
       gamepad moves the camera when plugged in, nothing throws without one.

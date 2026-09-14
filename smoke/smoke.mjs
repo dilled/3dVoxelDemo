@@ -12,7 +12,17 @@
  *   - window resize updates renderer size + camera aspect
  *   - page reload (refresh) returns to a fresh, unstuck LOADER and
  *     START works again
- *   - zero page errors / uncaught exceptions throughout
+ *
+ *   M1 checks:
+ *   - systems registry boots in fixed order (INPUT, CAMERA, HUD)
+ *   - no gamepad: loop stays clean, camera holds still, nothing throws
+ *   - fake gamepad: left-stick forward moves the camera
+ *   - keyboard: W moves forward, Space rises, Shift sprints (no throw)
+ *   - wheel zoom changes FOV
+ *   - V switches GROUND <-> CINE (blend lerps to target)
+ *   - middle-mouse orbit moves the camera around a fixed target, then
+ *     releases back into a controllable pose
+ *   - shake API: impulse raises energy, energy decays to zero
  *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
@@ -195,7 +205,166 @@ try {
       `state=${s.state}, frames=${s.frames}`);
   }
 
-  /* ---- 6. No errors anywhere ---- */
+  /* ------------------------------------------------------------------
+   * M1 — core loop, input, camera foundations
+   * ------------------------------------------------------------------ */
+
+  async function cam() {
+    return page.evaluate(() => ({
+      mode: window.SIM.CAMERA.mode,
+      blend: window.SIM.CAMERA.blend,
+      blendTarget: window.SIM.CAMERA.blendTarget,
+      x: window.SIM.camera.position.x,
+      y: window.SIM.camera.position.y,
+      z: window.SIM.camera.position.z,
+      fov: window.SIM.camera.fov,
+      energy: window.SIM.CAMERA.shakeEnergy,
+      pad: window.SIM.INPUT.pad.connected,
+      pos: window.SIM.CAMERA.pos.z,
+    }));
+  }
+
+  /* ---- 6a. Fixed-order systems registry ---- */
+  {
+    const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
+    check('systems registered in fixed order',
+      JSON.stringify(names) === JSON.stringify(['INPUT', 'CAMERA', 'HUD']),
+      names.join(', '));
+  }
+
+  /* ---- 6b. No gamepad: clean, camera holds still ---- */
+  {
+    const hadPad = await page.evaluate(() =>
+      Array.from(navigator.getGamepads || []).some(p => p && p.connected));
+    if (!hadPad) {
+      const a = await cam();
+      await sleep(500);
+      const b = await cam();
+      check('no gamepad: nothing throws, camera holds still',
+        b.x === a.x && b.y === a.y && b.z === a.z && b.pos === a.pos,
+        `dx=${b.x - a.x}, dy=${b.y - a.y}, dz=${b.z - a.z}`);
+    } else {
+      check('no gamepad: nothing throws, camera holds still', true, 'real pad present, skipped');
+    }
+  }
+
+  /* ---- 6c. Fake gamepad: left stick moves the camera ---- */
+  await page.evaluate(() => {
+    const pad = {
+      id: 'smoke-fake-pad',
+      timestamp: 0,
+      connected: true,
+      mapping: 'standard',
+      axes: [0, 0, 0, 0],
+      buttons: new Array(17).fill(null).map(() => ({ pressed: false, touched: false, value: 0 })),
+    };
+    window.__smokePad = pad;
+    navigator.getGamepads = () => [pad];
+  });
+  {
+    const a = await cam();
+    await page.evaluate(() => { window.__smokePad.axes[1] = -1; }); // stick up = forward
+    await sleep(500);
+    await page.evaluate(() => { window.__smokePad.axes[1] = 0; });
+    const b = await cam();
+    check('gamepad: reported connected', b.pad === true);
+    check('gamepad: left stick forward moves camera',
+      b.z < a.z - 1 && b.y === a.y, `dz=${(b.z - a.z).toFixed(2)}, dy=${(b.y - a.y).toFixed(3)}`);
+  }
+  await sleep(400); // let velocity settle before keyboard checks
+
+  /* ---- 6d. Keyboard: W forward, Space rises, no throw ---- */
+  {
+    const a = await cam();
+    await page.keyboard.down('w');
+    await sleep(350);
+    await page.keyboard.up('w');
+    const b = await cam();
+    check('keyboard: W moves forward', b.z < a.z - 0.5 && Math.abs(b.y - a.y) < 0.2,
+      `dz=${(b.z - a.z).toFixed(2)}, dy=${(b.y - a.y).toFixed(3)}`);
+
+    const c = await cam();
+    await page.keyboard.down(' ');
+    await sleep(300);
+    await page.keyboard.up(' ');
+    const d = await cam();
+    check('keyboard: Space rises in ground mode', d.y > c.y + 0.4,
+      `dy=${(d.y - c.y).toFixed(2)}`);
+    await sleep(400);
+  }
+
+  /* ---- 6e. Wheel zoom: FOV follows the wheel ---- */
+  {
+    const a = await cam();
+    await page.mouse.move(640, 400);
+    await page.mouse.wheel(0, -240); // scroll up = zoom in
+    await sleep(200);
+    const b = await cam();
+    check('wheel zoom changes FOV', b.fov < a.fov - 1, `fov ${a.fov.toFixed(1)} -> ${b.fov.toFixed(1)}`);
+  }
+
+  /* ---- 6f. V toggles GROUND <-> CINE with smooth blend ---- */
+  {
+    const a = await cam();
+    await page.keyboard.press('v');
+    await sleep(800); // blend converges (modeBlendTime ~0.55 s)
+    const b = await cam();
+    check('V switches to CINE free-fly', b.mode === 'CINE' && b.blend === 1,
+      `mode=${b.mode}, blend=${b.blend}`);
+    // free-fly: W moves along the look direction (includes vertical)
+    const c2 = await cam();
+    await page.keyboard.down('w');
+    await sleep(350);
+    await page.keyboard.up('w');
+    const d2 = await cam();
+    check('cine: W flies along view axis', d2.z < c2.z - 0.5, `dz=${(d2.z - c2.z).toFixed(2)}`);
+    await page.keyboard.press('v');
+    await sleep(800);
+    const e = await cam();
+    check('V switches back to GROUND (blend lerps)', e.mode === 'GROUND' && e.blend === 0,
+      `mode=${e.mode}, blend=${e.blend}, start=${a.mode}`);
+  }
+
+  /* ---- 6g. Middle-mouse orbit (CDP: real middle-button input) ---- */
+  {
+    const cdp = await page.context().newCDPSession(page);
+    const mid = (type, x, y, extra = {}) =>
+      cdp.send('Input.dispatchMouseEvent', { type, x, y, ...extra });
+    const a = await cam();
+    await mid('mouseMoved', 640, 400);
+    // NOTE: CDP `buttons` enum has no 'middle' — omit it; `button` drives it
+    await mid('mousePressed', 640, 400, { button: 'middle' });
+    await sleep(150);
+    for (let i = 1; i <= 5; i++) {
+      await mid('mouseMoved', 640 + i * 20, 400 + i * 6);
+    }
+    await sleep(250);
+    const b = await cam();
+    const orbiting = await page.evaluate(() => !!window.SIM.CAMERA.orbit);
+    check('middle-mouse: orbit owns the camera', orbiting &&
+      (Math.abs(b.x - a.x) > 0.3 || Math.abs(b.z - a.z) > 0.3),
+      `dx=${(b.x - a.x).toFixed(2)}, dz=${(b.z - a.z).toFixed(2)}`);
+    await mid('mouseReleased', 740, 430, { button: 'middle' });
+    await mid('mouseMoved', 740, 430); // sync post-release pointer state
+    await sleep(250);
+    const c = await cam();
+    const released = await page.evaluate(() => window.SIM.CAMERA.orbit === null);
+    check('middle-mouse: orbit releases back to controllable pose',
+      released && c.mode === 'GROUND', `released=${released}, mode=${c.mode}`);
+  }
+
+  /* ---- 6h. Shake API ---- */
+  {
+    await page.evaluate(() => window.SIM.CAMERA.shake(0.8));
+    await sleep(50);
+    const a = await cam();
+    await sleep(1200); // decay (shakeDecay 2.4 /s)
+    const b = await cam();
+    check('shake: impulse then decays to zero',
+      a.energy > 0 && b.energy === 0, `t+0.05=${a.energy.toFixed(2)}, t+1.25=${b.energy}`);
+  }
+
+  /* ---- 7. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));
 } finally {

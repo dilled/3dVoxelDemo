@@ -44,6 +44,20 @@
     pointer-events: none;
   }
   #hud.on { opacity: 1; }
+  /* ---- M1: control hints (bottom-left, small) ---- */
+  #hint {
+    position: absolute;
+    left: 10px;
+    bottom: 10px;
+    font-size: 11px;
+    line-height: 1.45;
+    color: rgba(150, 200, 240, 0.5);
+    white-space: pre;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+    pointer-events: none;
+  }
+  #hint.on { opacity: 1; }
   /* ---- Boot overlay: title + START button (audio unlock gate) ---- */
   #overlay {
     position: absolute;
@@ -88,7 +102,7 @@
   }
   #startBtn:hover {
     background: rgba(0, 70, 110, 0.45);
-    box-shadow: 0 0 34px rgba(0, 190, 255, 0.45), inset 0 0 22px rgba(0, 190, 255, 0.2);
+    box-shadow: 0 0 34px rgba(0, 190, 255, 0.45), inset 0 0 22px rgba(0, 170, 255, 0.2);
   }
   #startBtn:disabled { cursor: default; opacity: 0.4; }
   /* ---- Boot failure / watchdog message ---- */
@@ -142,6 +156,7 @@
 
 <div class="ui">
   <div id="hud" aria-live="off"></div>
+  <div id="hint"></div>
   <div id="overlay">
     <div class="title">QWEN FLASH // AWAKENING</div>
     <div class="subtitle">VOXEL DATACENTER CITY &middot; SIMULATION BUILD</div>
@@ -163,7 +178,7 @@
  * Ground rules (see PLAN.md):
  *  - one file, Three.js via CDN is the only external dependency
  *  - no references before init; subsystems register into one `systems`
- *    registry and boot in a fixed order
+ *    registry and boot/update in a fixed order
  *  - everything animated is driven by the central update(dt, t) loop;
  *    subsystems implement { init, update, onQuality?, onAwaken?, dispose? }
  * ===================================================================== */
@@ -180,7 +195,36 @@ const CFG = {
     fog: 0x060a14,
     fogDensity: 0.004,
   },
+  input: {
+    lookSens: 0.0022,          // radians per mouse pixel
+    groundSpeed: 16,           // m/s, exploration mode
+    groundSprint: 38,
+    cineSpeed: 30,             // m/s, free-fly mode
+    cineSprint: 70,
+    groundMinY: 0.7,           // ground/exploration height clamp (collision-lite)
+    groundMaxY: 40,
+    fovMin: 30,
+    fovMax: 95,
+    fovZoomRate: 1.1,          // fov degrees per wheel notch
+    padLookGain: 900,          // pseudo-px/s equivalent for gamepad look stick
+    padZoomRate: 42,           // fov degrees/s per trigger unit
+    padDeadzone: 0.12,
+    accel: 12,                // velocity smoothing rate (1/s)
+    modeBlendTime: 0.55,      // s, lerp between camera modes
+    orbitRadius: 22,          // m, middle-mouse orbit radius
+    orbitRadiusMin: 5,
+    orbitRadiusMax: 70,
+    orbitSens: 0.0032,        // radians per px while orbiting
+    orbitElevMin: -Math.PI * 0.45,
+    orbitElevMax: Math.PI * 0.45,
+    pitchClamp: { ground: Math.PI * 0.47, cine: Math.PI * 0.485 },
+    shakeDecay: 2.4,          // energy/s
+    shakeAmp: 0.22,           // metres (energy 1.0 ≈ strong hit)
+  },
 };
+
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const damp = (dt, rate) => 1 - Math.exp(-rate * dt);
 
 /* ------------------------------------------------------------------ *
  * BOOT — deterministic state machine: LOADER → RUNNING (→ ERROR)
@@ -201,12 +245,14 @@ const BOOT = {
       AUDIO.unlock();                       // audio gate (user gesture)
       document.getElementById('overlay').classList.add('hide');
       document.getElementById('hud').classList.add('on');
+      document.getElementById('hint').classList.add('on');
       lastNow = performance.now();
       requestAnimationFrame(frame);        // one and only one loop
     }
   },
 
   fail(msg) {
+    if (BOOT.state === 'ERROR') return;
     BOOT.state = 'ERROR';
     const el = document.getElementById('bootError');
     if (el) {
@@ -266,7 +312,7 @@ const camera = new THREE.PerspectiveCamera(
   0.1,
   3000,
 );
-// M0 placeholder position; M1 hands this to the CAMERA system.
+// M0 spawn — M1 hands ownership to the CAMERA system (pos synced in init).
 camera.position.set(0, 4, 18);
 camera.lookAt(0, 2, 0);
 
@@ -282,9 +328,372 @@ window.addEventListener('resize', onResize);
 window.addEventListener('orientationchange', onResize);
 onResize();
 
+/* ==================================================================== *
+ * INPUT — keyboard / mouse / pointer-lock / wheel / middle-mouse / gamepad
+ *
+ * Physical key codes (e.code), so WASD and AZERTY (ZQSD) map to the same
+ * movement without layout sniffing. Intent state here is consumed by
+ * CAMERA once per frame; INPUT never drives the camera itself.
+ * --------------------------------------------------------------------- */
+const INPUT = {
+  name: 'INPUT',
+
+  keys: new Set(),
+  pointerLocked: false,
+  orbitHeld: false,
+  _lastMouse: null,
+  _padModePrev: false,
+
+  // consumed + cleared by CAMERA every frame:
+  move: { f: 0, s: 0, u: 0 },   // forward / strafe / up, -1..1
+  look: { x: 0, y: 0 },         // accumulated px (mouse) — px equiv (gamepad)
+  zoom: 0,                     // accumulated wheel notches
+  sprint: false,
+  modeSwitch: false,           // V / gamepad A-button edge
+
+  pad: {
+    connected: false,
+    move: { f: 0, s: 0, u: 0 },
+    look: { x: 0, y: 0 },
+    zoom: 0,
+    btnA: false,
+  },
+
+  init() {
+    /* --- keyboard (physical codes: WASD == AZERTY ZQSD) --- */
+    window.addEventListener('keydown', e => {
+      if (BOOT.state !== 'RUNNING') return;
+      if (e.code === 'KeyV' && !e.repeat) INPUT.modeSwitch = true;
+      INPUT.keys.add(e.code);
+      if (e.code === 'Space') e.preventDefault();
+    });
+    window.addEventListener('keyup', e => INPUT.keys.delete(e.code));
+    window.addEventListener('blur', () => {
+      INPUT.keys.clear();          // never stick a key across focus loss
+      INPUT.orbitHeld = false;
+    });
+
+    /* --- mouse look (pointer lock preferred; fallback deltas) --- */
+    window.addEventListener('pointerlockchange', () => {
+      INPUT.pointerLocked = document.pointerLockElement === canvas;
+      if (!INPUT.pointerLocked) INPUT.orbitHeld = false;
+      INPUT._lastMouse = null;
+    });
+    window.addEventListener('mousemove', e => {
+      if (INPUT.pointerLocked) {
+        INPUT.look.x += e.movementX;
+        INPUT.look.y += e.movementY;
+      } else if (INPUT.orbitHeld) {
+        const last = INPUT._lastMouse;
+        if (last) {
+          INPUT.look.x += e.clientX - last.x;
+          INPUT.look.y += e.clientY - last.y;
+        }
+        INPUT._lastMouse = { x: e.clientX, y: e.clientY };
+      }
+    });
+
+    /* --- wheel: zoom (fov) --- */
+    canvas.addEventListener('wheel', e => {
+      e.preventDefault();
+      const notches = e.deltaMode === 1 ? 1 : e.deltaMode === 2 ? 40 : e.deltaY / 100;
+      INPUT.zoom += notches;
+    }, { passive: false });
+
+    /* --- middle mouse: orbit (DOM button: 0=left, 1=middle, 2=right) --- */
+    window.addEventListener('mousedown', e => {
+      if (e.button === 1 && BOOT.state === 'RUNNING') {
+        e.preventDefault();          // kill auto-scroll
+        INPUT.orbitHeld = true;
+        INPUT._lastMouse = { x: e.clientX, y: e.clientY };
+      }
+    });
+    window.addEventListener('mouseup', e => {
+      if (e.button === 1) INPUT.orbitHeld = false;
+    });
+
+    /* --- click canvas: (re)capture the mouse --- */
+    canvas.addEventListener('click', () => {
+      if (BOOT.state === 'RUNNING' && !INPUT.pointerLocked) {
+        try {
+          const p = canvas.requestPointerLock
+            ? canvas.requestPointerLock()
+            : null;
+          if (p && p.catch) p.catch(() => {});   // headless/denied: fine
+        } catch (_) { /* pointer lock unavailable: keep going */ }
+      }
+    });
+  },
+
+  /* Poll the (optional) gamepad. Never throws, no-op without one. */
+  _pollPad() {
+    const p = INPUT.pad;
+    p.connected = false;
+    p.zoom = 0;
+    if (typeof navigator === 'undefined' || !navigator.getGamepads) return;
+    let g = null;
+    try {
+      const pads = navigator.getGamepads();
+      for (let i = 0; i < pads.length; i++) {
+        const c = pads[i];
+        if (c && c.connected !== false) { g = c; break; }
+      }
+    } catch (_) { g = null; }
+    if (!g) return;
+    p.connected = true;
+    const dz = CFG.input.padDeadzone;
+    const ax = i => {
+      const v = g.axes && g.axes[i] !== undefined ? g.axes[i] : 0;
+      if (Math.abs(v) < dz) return 0;
+      return (v - Math.sign(v) * dz) / (1 - dz);
+    };
+    p.move.f = -ax(1);              // left stick up = forward
+    p.move.s = ax(0);
+    p.look.x = g.axes && g.axes[2] !== undefined ? g.axes[2] : 0;
+    p.look.y = g.axes && g.axes[3] !== undefined ? g.axes[3] : 0;
+    const lt = g.buttons && g.buttons[6] ? g.buttons[6].value : 0;
+    const rt = g.buttons && g.buttons[7] ? g.buttons[7].value : 0;
+    p.zoom = rt - lt;               // triggers: R-in / L-out (consumed *dt)
+    p.btnA = !!(g.buttons && g.buttons[0] && g.buttons[0].pressed);
+  },
+
+  update(dt) {
+    const k = INPUT.keys;
+    let f = 0, s = 0, u = 0;
+    if (k.has('KeyW')) f += 1;
+    if (k.has('KeyS')) f -= 1;
+    if (k.has('KeyA')) s -= 1;
+    if (k.has('KeyD')) s += 1;
+    if (k.has('Space')) u += 1;
+    if (k.has('KeyC')) u -= 1;
+    INPUT.sprint = k.has('ShiftLeft') || k.has('ShiftRight');
+
+    INPUT._pollPad();
+    const p = INPUT.pad;
+    INPUT.move.f = clamp(f + p.move.f, -1, 1);
+    INPUT.move.s = clamp(s + p.move.s, -1, 1);
+    INPUT.move.u = clamp(u, -1, 1);
+
+    // gamepad look stick → pseudo-px (same pipeline as mouse)
+    INPUT.look.x += p.look.x * CFG.input.padLookGain * dt;
+    INPUT.look.y += p.look.y * CFG.input.padLookGain * dt;
+
+    // gamepad A-button: camera mode switch (edge-detected)
+    if (p.connected && p.btnA && !INPUT._padModePrev) INPUT.modeSwitch = true;
+    INPUT._padModePrev = p.connected && p.btnA;
+  },
+
+  dispose() { /* listeners live on window/canvas; page lifetime only */ },
+};
+
+/* ==================================================================== *
+ * CAMERA — ground/exploration + cinematic free-fly, orbit, shake
+ *
+ *  - one persistent pose (pos / yaw / pitch / fov), one camera object
+ *  - mode blend lerp: movement basis + clamps cross-fade, so switching
+ *    never snaps
+ *  - middle-mouse orbit owns the pose while held, hands back seamlessly
+ *  - shake: impulse-decay energy → fresh transient offset each frame
+ *    (nothing accumulates into the pose)
+ * --------------------------------------------------------------------- */
+const _camDir = new THREE.Vector3();
+const _fwd = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _wish = new THREE.Vector3();
+const _up = new THREE.Vector3(0, 1, 0);
+const _off = new THREE.Vector3();
+const _tmp = new THREE.Vector3();
+
+const CAMERA = {
+  name: 'CAMERA',
+  mode: 'GROUND',              // GROUND | CINE
+  blend: 0,                   // 0 = ground behaviour, 1 = cine behaviour
+  blendTarget: 0,
+  pos: new THREE.Vector3(0, 4, 18),
+  vel: new THREE.Vector3(),
+  yaw: 0,
+  pitch: 0,
+  fov: 60,
+  shakeEnergy: 0,
+  orbit: null,                 // { target, az, el, radius } while held
+
+  init() {
+    // sync from the M0 seed pose so the spawn is identical
+    CAMERA.pos.copy(camera.position);
+    camera.getWorldDirection(_camDir);
+    // convention: fwd(yaw) = (-sin(yaw), 0, -cos(yaw)) → yaw=0 looks at −Z
+    CAMERA.yaw = Math.atan2(-_camDir.x, -_camDir.z);
+    CAMERA.pitch = Math.asin(clamp(_camDir.y, -1, 1));
+    CAMERA.fov = camera.fov;
+  },
+
+  /* Public shake API: impulse decay, consumed inside update. */
+  shake(intensity = 0.5) {
+    CAMERA.shakeEnergy = Math.min(1.5, CAMERA.shakeEnergy + Math.max(0, intensity));
+  },
+
+  setMode(mode) {
+    if (mode !== 'GROUND' && mode !== 'CINE') return;
+    CAMERA.mode = mode;
+    CAMERA.blendTarget = mode === 'CINE' ? 1 : 0;
+  },
+
+  _startOrbit() {
+    camera.getWorldDirection(_camDir);
+    const L = CFG.input;
+    const target = CAMERA.pos.clone().add(_tmp.copy(_camDir).multiplyScalar(L.orbitRadius));
+    CAMERA.orbit = {
+      target,
+      az: CAMERA.yaw,
+      el: -CAMERA.pitch,    // elevation: camera above target ⇒ pitch is negative
+      radius: L.orbitRadius,
+    };
+  },
+
+  _endOrbit() {
+    if (!CAMERA.orbit) return;
+    const o = CAMERA.orbit;
+    // recover yaw/pitch from the orbited pose (camera looks at target)
+    _tmp.copy(o.target).sub(CAMERA.pos).normalize();
+    CAMERA.yaw = Math.atan2(-_tmp.x, -_tmp.z);
+    CAMERA.pitch = Math.asin(clamp(_tmp.y, -1, 1));
+    CAMERA.orbit = null;
+  },
+
+  update(dt, t) {
+    const L = CFG.input;
+
+    /* ---- consume INPUT (cleared every frame) ---- */
+    // look (mouse px + gamepad pseudo-px)
+    const lookX = INPUT.look.x, lookY = INPUT.look.y, zoomN = INPUT.zoom;
+    INPUT.look.x = 0; INPUT.look.y = 0; INPUT.zoom = 0;
+
+    if (INPUT.modeSwitch) {
+      INPUT.modeSwitch = false;
+      CAMERA.setMode(CAMERA.mode === 'CINE' ? 'GROUND' : 'CINE');
+    }
+
+    /* ---- mode blend (smooth lerp between behaviours) ---- */
+    CAMERA.blend += (CAMERA.blendTarget - CAMERA.blend)
+      * damp(dt, 8 / L.modeBlendTime);
+    if (Math.abs(CAMERA.blendTarget - CAMERA.blend) < 1e-3) {
+      CAMERA.blend = CAMERA.blendTarget;
+    }
+
+    /* ---- fov zoom (wheel notches + gamepad triggers) ---- */
+    CAMERA.fov = clamp(
+      CAMERA.fov + zoomN * L.fovZoomRate + INPUT.pad.zoom * L.padZoomRate * dt,
+      L.fovMin, L.fovMax);
+    camera.fov = CAMERA.fov;
+    camera.updateProjectionMatrix();
+
+    /* ---- middle-mouse orbit (owns the pose while held) ---- */
+    if (INPUT.orbitHeld && !CAMERA.orbit) CAMERA._startOrbit();
+    if (CAMERA.orbit) {
+      const o = CAMERA.orbit;
+      o.az -= lookX * L.orbitSens;
+      o.el = clamp(o.el - lookY * L.orbitSens, L.orbitElevMin, L.orbitElevMax);
+      if (!INPUT.orbitHeld) {
+        CAMERA._endOrbit();
+      } else {
+        o.radius = clamp(o.radius * Math.exp(zoomN * 0.12), L.orbitRadiusMin, L.orbitRadiusMax);
+        const cp = Math.cos(o.el), sp = Math.sin(o.el);
+        CAMERA.pos.set(
+          o.target.x + o.radius * cp * Math.sin(o.az),
+          o.target.y + o.radius * sp,
+          o.target.z + o.radius * cp * Math.cos(o.az),
+        );
+        camera.position.copy(CAMERA.pos);
+        camera.lookAt(o.target);
+        CAMERA._applyShake(t);                  // shake, then return
+        CAMERA._decayShake(dt);
+        return;
+      }
+    }
+
+    /* ---- movement basis ---- */
+    const sy = Math.sin(CAMERA.yaw), cy = Math.cos(CAMERA.yaw);
+    _fwd.set(-sy, 0, -cy);                     // ground-plane forward (yaw=0 ⇒ −Z)
+    _right.set(cy, 0, -sy);                   // ground-plane right
+    _tmp.set(
+      -sy * Math.cos(CAMERA.pitch),
+      Math.sin(CAMERA.pitch),
+      -cy * Math.cos(CAMERA.pitch),
+    );                                         // free-fly forward (from yaw/pitch)
+
+    const M = INPUT.move;
+    const sprint = INPUT.sprint ? 1 : 0;
+    const speedG = CFG.input.groundSpeed * (1 + sprint);
+    const speedC = CFG.input.cineSpeed * (1 + sprint);
+
+    // ground wish: XZ from yaw basis + free vertical
+    _wish.copy(_fwd).multiplyScalar(M.f)
+      .addScaledVector(_right, M.s)
+      .addScaledVector(_up, M.u)
+      .multiplyScalar(speedG);
+    // cine wish: full camera basis
+    _off.copy(_tmp).multiplyScalar(M.f)
+      .addScaledVector(_right, M.s)
+      .addScaledVector(_up, M.u)
+      .multiplyScalar(speedC);
+    // blend the wishes (smooth mode transition)
+    _wish.lerp(_off, CAMERA.blend);
+
+    // velocity smoothing (accelerates/decelerates instead of snapping)
+    const v = CAMERA.vel;
+    if (_wish.lengthSq() > 0) {
+      v.lerp(_wish, damp(dt, L.accel));
+    } else {
+      v.multiplyScalar(Math.max(0, 1 - damp(dt, L.accel * 1.6)));
+      if (v.lengthSq() < 1e-6) v.set(0, 0, 0);
+    }
+    CAMERA.pos.addScaledVector(v, dt);
+
+    /* ---- look ---- */
+    const pitchMax = L.pitchClamp.ground + (L.pitchClamp.cine - L.pitchClamp.ground) * CAMERA.blend;
+    CAMERA.yaw -= lookX * L.lookSens;
+    CAMERA.pitch = clamp(CAMERA.pitch - lookY * L.lookSens, -pitchMax, pitchMax);
+
+    /* ---- collision-lite: ground height clamp (void for now) ----
+     * cross-fade: full clamp in GROUND, none in CINE */
+    {
+      const clampedY = clamp(CAMERA.pos.y, L.groundMinY, L.groundMaxY);
+      CAMERA.pos.y += (clampedY - CAMERA.pos.y) * (1 - CAMERA.blend);
+    }
+
+    /* ---- write pose to camera + shake ---- */
+    camera.position.copy(CAMERA.pos);
+    const cp = Math.cos(CAMERA.pitch);
+    _camDir.set(-sy * cp, Math.sin(CAMERA.pitch), -cy * cp).normalize();
+    camera.lookAt(_tmp.copy(CAMERA.pos).add(_camDir));
+    CAMERA._applyShake(t);
+    CAMERA._decayShake(dt);
+  },
+
+  /* transient view offset — recomputed fresh, never accumulates */
+  _applyShake(t) {
+    if (CAMERA.shakeEnergy <= 1e-4) return;
+    const e = CAMERA.shakeEnergy * CFG.input.shakeAmp;
+    _off.set(
+      Math.sin(t * 43.7) * e * 0.55,
+      Math.cos(t * 51.3) * e * 0.35,
+      Math.sin(t * 37.1) * e * 0.55,
+    );
+    camera.position.add(_off);
+  },
+
+  _decayShake(dt) {
+    if (CAMERA.shakeEnergy > 0) {
+      CAMERA.shakeEnergy = Math.max(0, CAMERA.shakeEnergy - dt * CFG.input.shakeDecay);
+    }
+  },
+
+  dispose() { },
+};
+
 /* ------------------------------------------------------------------ *
- * Subsystems — fixed boot order, one update(dt, t) per frame.
- * M0 registers BOOT-controller-free subsystems only: HUD.
+ * Subsystems — FIXED BOOT ORDER = registration order.
+ * M0: HUD   M1: INPUT, CAMERA
  * ------------------------------------------------------------------ */
 const systems = [];
 function registerSystem(sys) {
@@ -292,16 +701,21 @@ function registerSystem(sys) {
   systems.push(sys);
 }
 
-/* ---- HUD: FPS counter + boot state (DOM, no 3D canvas text) ---- */
+/* ---- HUD: FPS + state + camera readout (DOM, no 3D canvas text) ---- */
 const HUD = {
   name: 'HUD',
   el: null,
+  hintEl: null,
   fps: 0,
   acc: 0,
   accFrames: 0,
 
   init() {
     HUD.el = document.getElementById('hud');
+    HUD.hintEl = document.getElementById('hint');
+    HUD.hintEl.textContent =
+      'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
+      'MOUSE look · WHEEL zoom · MMB drag orbit · V camera';
   },
 
   update(dt) {
@@ -312,15 +726,21 @@ const HUD = {
       HUD.acc = 0;
       HUD.accFrames = 0;
       if (HUD.el) {
+        const mode = CAMERA.orbit ? 'ORBIT' : CAMERA.mode;
+        const mouse = INPUT.pointerLocked ? 'locked' : 'click to capture';
+        const pad = INPUT.pad.connected ? 'PAD' : '-';
         HUD.el.textContent =
           `FPS ${String(Math.round(HUD.fps)).padStart(2, ' ')}\n` +
-          `STATE ${BOOT.state}`;
+          `STATE ${BOOT.state}\n` +
+          `CAM ${mode} · FOV ${Math.round(camera.fov)} · ${mouse} · ${pad}`;
         HUD.el.style.whiteSpace = 'pre';
       }
     }
   },
 };
 
+registerSystem(INPUT);
+registerSystem(CAMERA);
 registerSystem(HUD);
 for (const s of systems) if (s.init) s.init();
 
@@ -334,7 +754,21 @@ function frame(now) {
   const dt = Math.min((now - lastNow) / 1000, 0.1);   // clamp (tab-hide)
   lastNow = now;
   const t = now / 1000;
-  for (const s of systems) if (s.update) s.update(dt, t);
+  for (const s of systems) {
+    if (!s.update) continue;
+    try {
+      s.update(dt, t);
+    } catch (err) {
+      // one bad subsystem must not strand the whole loop:
+      // surface it and disable it for the rest of the session
+      s.update = null;
+      BOOT.fail(
+        'RUNTIME ERROR in subsystem ' + s.name + ' — ' +
+        (err && err.message ? err.message : err) +
+        '\nSubsystem disabled, reload the page to retry.',
+      );
+    }
+  }
   renderer.render(scene, camera);
   BOOT.frames++;
 }
@@ -364,7 +798,10 @@ try {
 /* Dev / smoke-test handle (not part of the game). */
 window.SIM = {
   BOOT,
+  INPUT,
+  CAMERA,
   HUD,
+  CFG,
   renderer,
   scene,
   camera,
