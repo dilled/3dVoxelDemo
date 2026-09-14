@@ -42,7 +42,7 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 |---|---|---|
 | **M0** ✅ | Single-file scaffold: full-screen canvas, Three.js via CDN, scene/renderer/camera, `BOOT` state machine with START button + audio gate, FPS counter | START always leads to a live 60 fps loop; page refresh never leaves a stuck state |
 | **M1** ✅ | Core loop: fixed-order `systems` registry + `update(dt)`, `INPUT` (WASD/ZQSD, pointer-lock mouse look, wheel zoom, middle-mouse orbit, gamepad), `CAMERA` ground/cinematic modes with shake API | Fly around an empty dark void in both cameras; gamepad works; nothing throws without one |
-| **M2** | Procedural voxel material kit: shared materials, canvas-texture helpers (LED grid, holo signs, glow sprites), instanced box/cylinder + merged-geometry builders, lighting rig | Kit renders a test wall/tower with animated LED faces and signs at < 10 draw calls |
+| **M2** ✅ | Procedural voxel material kit: shared materials, canvas-texture helpers (LED grid, holo signs, glow sprites), instanced box/cylinder + merged-geometry builders, lighting rig | Kit renders a test wall/tower with animated LED faces and signs at < 10 draw calls |
 | **M3** | Chunked city generation (far layer): seeded PRNG, city grid, 16×16 block chunks generated/unbuilt around player, weighted archetypes, 3-ring distance LOD | City extends beyond initial view, no visible duplication, draw calls flat as you fly out |
 | **M4** | Building detail passes (near layer): per-archetype details (server racks, cooling towers, substations, antennas, fiber spires, holo signs), per-building seeded variation, zone haze | Every archetype readable from 50–200 m and procedurally varied; FPS within target |
 | **M5** | The Qwen machine-creature (dormant): plaza pedestal, full creature build from primitives, named rig parts, dormant breathing/idle state, instanced compute-node voxels | Reads as "dormant colossal machine" from street level; silhouette holds from 3 camera distances |
@@ -79,14 +79,14 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
       gamepad moves the camera when plugged in, nothing throws without one.
 
 ### M2 — Procedural voxel material kit
-- [ ] Shared material library: emissive server faces, dark metal, glass,
+- [x] Shared material library: emissive server faces, dark metal, glass,
       glow panels, cable material — all cheap (mostly `MeshLambert`/`Basic` +
       a few `Standard` for hero parts).
-- [ ] `makeCanvasTexture` helpers: animated LED grid, holo sign face,
+- [x] `makeCanvasTexture` helpers: animated LED grid, holo sign face,
       soft glow sprite, "UNSLOTH" + "QWEN" sign faces.
-- [ ] Instance helpers: `InstancedBox` builder (position/scale/color),
+- [x] Instance helpers: `InstancedBox` builder (position/scale/color),
       `InstancedCylinder`, merged-geometry batcher.
-- [ ] Lighting rig: hemi + one key directional "moon/anti-sun",
+- [x] Lighting rig: hemi + one key directional "moon/anti-sun",
       a few point lights reserved for hero moments only.
 - **Done-when:** kit renders a test wall/tower with animated LED faces
       and signs at < 10 draw calls.

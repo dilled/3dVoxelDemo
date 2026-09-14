@@ -14,7 +14,7 @@
  *     START works again
  *
  *   M1 checks:
- *   - systems registry boots in fixed order (INPUT, CAMERA, HUD)
+ *   - systems registry boots in fixed order (INPUT, CAMERA, KIT, HUD)
  *   - no gamepad: loop stays clean, camera holds still, nothing throws
  *   - fake gamepad: left-stick forward moves the camera
  *   - keyboard: W moves forward, Space rises, Shift sprints (no throw)
@@ -23,6 +23,13 @@
  *   - middle-mouse orbit moves the camera around a fixed target, then
  *     releases back into a controllable pose
  *   - shake API: impulse raises energy, energy decays to zero
+ *
+ *   M2 checks:
+ *   - KIT registered: material library, canvas textures (LED/QWEN/
+ *     UNSLOTH/glow), lighting rig (hemi + moon + 2 reserved point lights)
+ *   - gate: full test wall/tower scene renders at < 10 draw calls
+ *   - LED canvas textures actually redraw (frame counter advances)
+ *   - rendered pixels visibly change over time (animation on GPU)
  *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
@@ -228,7 +235,7 @@ try {
   {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
-      JSON.stringify(names) === JSON.stringify(['INPUT', 'CAMERA', 'HUD']),
+      JSON.stringify(names) === JSON.stringify(['INPUT', 'CAMERA', 'KIT', 'HUD']),
       names.join(', '));
   }
 
@@ -362,6 +369,50 @@ try {
     const b = await cam();
     check('shake: impulse then decays to zero',
       a.energy > 0 && b.energy === 0, `t+0.05=${a.energy.toFixed(2)}, t+1.25=${b.energy}`);
+  }
+
+  /* ------------------------------------------------------------------
+   * M2 — procedural voxel material kit
+   * ------------------------------------------------------------------ */
+  {
+    const kit = await page.evaluate(() => ({
+      hasKit: !!window.SIM.KIT,
+      rig: !!(window.SIM.KIT && window.SIM.KIT.testRig),
+      mats: window.SIM.KIT ? Object.keys(window.SIM.KIT.MATS).length : 0,
+      builders: window.SIM.KIT ?
+        [window.SIM.KIT.InstancedBox, window.SIM.KIT.InstancedCylinder,
+         window.SIM.KIT.mergeGeometries, window.SIM.KIT.makeCanvasTexture]
+          .every(f => typeof f === 'function') : false,
+      texA: window.SIM.KIT && window.SIM.KIT.tex ? window.SIM.KIT.tex.ledA.frame : -1,
+      signs: window.SIM.KIT ?
+        ['ledA', 'ledB', 'signQwen', 'signUnsloth', 'glow']
+          .every(k => !!(window.SIM.KIT.tex && window.SIM.KIT.tex[k])) : false,
+      lights: window.SIM.KIT ?
+        !!window.SIM.KIT.hemi && !!window.SIM.KIT.moon &&
+        window.SIM.KIT.heroLights.length === 2 : false,
+    }));
+    check('KIT registered with material library + textures + lighting rig',
+      kit.hasKit && kit.rig && kit.mats >= 5 && kit.builders && kit.signs && kit.lights,
+      `mats=${kit.mats}`);
+
+    const c0 = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    await sleep(300);
+    const c1 = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    check('M2 gate: test wall/tower scene renders at < 10 draw calls',
+      Number.isInteger(c1) && c1 >= 1 && c1 < 10,
+      `calls ${c0} -> ${c1}`);
+
+    const f0 = kit.texA;
+    await sleep(450);
+    const f1 = await page.evaluate(() => window.SIM.KIT.tex.ledA.frame);
+    check('LED faces animate (canvas textures redrawn)', f1 > f0,
+      `frames ${f0} -> ${f1}`);
+
+    const shot1 = await page.screenshot();
+    await sleep(400);
+    const shot2 = await page.screenshot();
+    check('rendered frame visibly changes over time (animated kit)',
+      !shot1.equals(shot2));
   }
 
   /* ---- 7. No errors anywhere ---- */

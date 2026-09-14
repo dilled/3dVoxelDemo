@@ -221,6 +221,22 @@ const CFG = {
     shakeDecay: 2.4,          // energy/s
     shakeAmp: 0.22,           // metres (energy 1.0 ≈ strong hit)
   },
+  lights: {
+    hemiSky: 0x35507e,
+    hemiGround: 0x0b0f18,
+    hemiIntensity: 0.5,
+    moonColor: 0x9fc4ff,
+    moonIntensity: 0.6,
+    moonPos: [-70, 110, -40], // single key "moon / anti-sun" directional
+    heroPointDist: 120,      // reserved point lights: hero moments only
+    heroPointDecay: 2,
+  },
+  kit: {
+    testTower: { x: 0, z: -80 },  // M2 gate demo (temporary until M3 absorbs it)
+    ledHz: 15,                   // LED canvas redraw rate
+    signHz: 8,                  // holo-sign flicker redraw rate
+    signTagCycle: 8,            // s per UNSLOTH tagline
+  },
 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -691,9 +707,400 @@ const CAMERA = {
   dispose() { },
 };
 
+/* ==================================================================== *
+ * KIT — procedural voxel material kit (M2)
+ *
+ *  - shared material library (MATS): emissive server faces, dark metal,
+ *    glass, glow panels, cable + one Standard material reserved for hero
+ *    parts — mostly Lambert/Basic, cheap forward-lit
+ *  - canvas-texture factory: makeCanvasTexture / LED grid / holo sign /
+ *    soft glow sprite; "QWEN" + "UNSLOTH" sign faces
+ *  - instancing helpers: InstancedBox / InstancedCylinder builders
+ *    (capacity up front, per-instance pos/scale/color, zero per-frame
+ *    allocation)
+ *  - merged-geometry batcher: mergeGeometries(parts) → one static mesh
+ *  - lighting rig: hemi + one directional "moon" key light; two point
+ *    lights reserved for hero moments (intensity 0 until claimed)
+ *  - test rig: gate demo — test wall/tower with animated LED faces and
+ *    signs, rendered at < 10 draw calls. Temporary until M3's city
+ *    generator absorbs the plaza.
+ * --------------------------------------------------------------------- */
+
+/* ---- canvas texture factory ---- */
+
+/* One canvas + one CanvasTexture behind a redraw(t) handle.
+ * `frame` counts redraws (smoke-test seam for "it animates"). */
+function makeCanvasTexture(w, h, draw) {
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const T = { canvas, ctx, tex, w, h, frame: 0 };
+  T.redraw = u => {
+    draw(ctx, w, h, u);
+    tex.needsUpdate = true;
+    T.frame++;
+  };
+  T.redraw(0);
+  return T;
+}
+
+/* deterministic cheap hash → [0,1) for per-cell flicker */
+function _hash2(i, j, s) {
+  const x = Math.sin(i * 127.1 + j * 311.7 + s * 74.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+/* animated LED grid face: per-cell on/off flicker + travelling scan line */
+function makeLedGrid(cols, rows, seed, palette) {
+  const cell = 10, gap = 2;
+  const W = cols * cell, H = rows * cell;
+  return makeCanvasTexture(W, H, (ctx, w, h, t) => {
+    ctx.fillStyle = '#04060c';
+    ctx.fillRect(0, 0, w, h);
+    for (let i = 0; i < cols; i++) {
+      for (let j = 0; j < rows; j++) {
+        const n = _hash2(i, j, seed);
+        const wave = 0.5 + 0.5 * Math.sin(
+          t * (1.2 + n * 2.4) + n * 12.6 + i * 0.35 + j * 0.21);
+        const on = n * 0.72 + wave * 0.52;         // 0..~1.24
+        if (on < 0.34) continue;                  // dark cell
+        ctx.globalAlpha = Math.min(1, (on - 0.34) * 1.7);
+        ctx.fillStyle = palette[Math.floor(n * palette.length) % palette.length];
+        ctx.fillRect(i * cell + gap, j * cell + gap, cell - gap * 2, cell - gap * 2);
+      }
+    }
+    // travelling scan line (cheap "data" feel)
+    const sy = (t * H * 0.14) % H;
+    const g = ctx.createLinearGradient(0, sy - 10, 0, sy + 10);
+    g.addColorStop(0, 'rgba(120,220,255,0)');
+    g.addColorStop(0.5, 'rgba(120,220,255,0.22)');
+    g.addColorStop(1, 'rgba(120,220,255,0)');
+    ctx.fillStyle = g;
+    ctx.globalAlpha = 1;
+    ctx.fillRect(0, sy - 10, w, 20);
+  });
+}
+
+/* neon holo sign face; `sub` may be a string or a function (tagline cycle) */
+function makeHoloSign(text, sub, color, w = 256, h = 96) {
+  return makeCanvasTexture(w, h, (ctx, ww, hh, t) => {
+    ctx.clearRect(0, 0, ww, hh);
+    const flicker = 0.84 + 0.16 * Math.sin(t * 7.3) * Math.sin(t * 2.9);
+    ctx.globalAlpha = flicker;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.strokeRect(4, 4, ww - 8, hh - 8);
+    ctx.globalAlpha = flicker * 0.25;
+    ctx.strokeRect(10, 10, ww - 20, hh - 20);
+    ctx.globalAlpha = flicker;
+    ctx.fillStyle = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 18;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `700 ${Math.floor(hh * 0.34)}px ui-monospace, monospace`;
+    ctx.fillText(text, ww / 2, hh * 0.42);
+    if (sub) {
+      ctx.shadowBlur = 8;
+      ctx.font = `400 ${Math.floor(hh * 0.15)}px ui-monospace, monospace`;
+      ctx.globalAlpha = flicker * 0.9;
+      const s = typeof sub === 'function' ? sub() : sub;
+      ctx.fillText(s, ww / 2, hh * 0.78);
+    }
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+  });
+}
+
+/* soft radial glow sprite (additive) */
+function makeGlowTexture(size = 128, rgb = '150,235,255') {
+  return makeCanvasTexture(size, size, (ctx, w, h) => {
+    ctx.clearRect(0, 0, w, h);
+    const g = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w / 2);
+    g.addColorStop(0, `rgba(${rgb},1)`);
+    g.addColorStop(0.35, `rgba(${rgb},0.35)`);
+    g.addColorStop(1, `rgba(${rgb},0)`);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+  });
+}
+
+/* ---- shared material library (cheap: mostly Lambert/Basic) ---- */
+
+const MATS = {
+  metalDark: new THREE.MeshLambertMaterial({ color: 0x2a3344 }),   // dark metal body
+  server: new THREE.MeshLambertMaterial({
+    color: 0x0d1524,
+    emissive: 0x0d3142,        // emissive server face
+  }),
+  glass: new THREE.MeshLambertMaterial({
+    color: 0x8fd8ff,
+    emissive: 0x173f58,
+    transparent: true,
+    opacity: 0.4,
+  }),
+  glow: new THREE.MeshBasicMaterial({
+    color: 0x7fe6ff,
+    transparent: true,
+    opacity: 0.85,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  }),
+  cable: new THREE.MeshLambertMaterial({ color: 0x12161e }),
+  metalHero: new THREE.MeshStandardMaterial({
+    color: 0x6b7c94, roughness: 0.42, metalness: 0.75,
+  }),
+};
+
+/* ---- instancing builders (capacity up front, no per-frame allocation) ---- */
+
+function makeInstanced(geo, material, capacity) {
+  const mesh = new THREE.InstancedMesh(geo, material, capacity);
+  mesh.count = 0;
+  mesh.frustumCulled = false;      // instance spread > single-geo bounds
+  const m4 = new THREE.Matrix4();
+  const pos = new THREE.Vector3();
+  const q = new THREE.Quaternion();
+  const scl = new THREE.Vector3();
+  const col = new THREE.Color();
+  const Y = new THREE.Vector3(0, 1, 0);
+  const B = {
+    mesh,
+    capacity,
+    count: 0,
+    /* add(x, y, z, scale| [sx,sy,sz], color, rotY) — returns self */
+    add(x, y, z, scale = 1, color = null, rotY = 0) {
+      if (B.count >= capacity) return B;
+      pos.set(x, y, z);
+      if (rotY) q.setFromAxisAngle(Y, rotY); else q.identity();
+      if (typeof scale === 'number') scl.set(scale, scale, scale);
+      else scl.set(scale[0], scale[1], scale[2]);
+      m4.compose(pos, q, scl);
+      mesh.setMatrixAt(B.count, m4);
+      if (color !== null) mesh.setColorAt(B.count, col.set(color));
+      B.count++;
+      return B;
+    },
+    commit() {
+      mesh.count = B.count;
+      if (B.count) {
+        mesh.instanceMatrix.needsUpdate = true;
+        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      }
+      return B;
+    },
+  };
+  return B;
+}
+
+/* ---- merged-geometry batcher: many placed primitives → one static mesh ---- */
+
+function mergeGeometries(parts) {
+  // parts: [{ geo, matrix? }] → one non-indexed BufferGeometry (position/normal/uv)
+  const geos = [];
+  let vTotal = 0;
+  for (const { geo, matrix } of parts) {
+    const g = geo.index ? geo.toNonIndexed() : geo.clone();
+    if (matrix) g.applyMatrix4(matrix);
+    geos.push(g);
+    vTotal += g.attributes.position.count;
+  }
+  const out = new THREE.BufferGeometry();
+  for (const name of ['position', 'normal', 'uv']) {
+    const itemSize = geos[0].attributes[name].itemSize;
+    const arr = new Float32Array(vTotal * itemSize);
+    let off = 0;
+    for (const g of geos) {
+      const a = g.attributes[name];
+      arr.set(a.array.subarray(0, a.count * itemSize), off);
+      off += a.count * itemSize;
+    }
+    out.setAttribute(name, new THREE.BufferAttribute(arr, itemSize));
+  }
+  for (const g of geos) g.dispose();
+  return out;
+}
+
+/* ---- the KIT system ---- */
+
+const KIT = {
+  name: 'KIT',
+  MATS,
+  tex: null,
+  hemi: null,
+  moon: null,
+  heroLights: [],          // reserved point lights for hero moments
+  testRig: null,
+  glowSprite: null,
+  _acc: 0,
+  _acc2: 0,
+  _tag: 0,
+
+  init() {
+    /* lighting rig: hemi fill + one key directional (moon / anti-sun) */
+    const L = CFG.lights;
+    KIT.hemi = new THREE.HemisphereLight(L.hemiSky, L.hemiGround, L.hemiIntensity);
+    KIT.moon = new THREE.DirectionalLight(L.moonColor, L.moonIntensity);
+    KIT.moon.position.set(L.moonPos[0], L.moonPos[1], L.moonPos[2]);
+    scene.add(KIT.hemi, KIT.moon);
+    // two point lights reserved for hero moments — cost is only the light
+    // slot while intensity is 0
+    for (let i = 0; i < 2; i++) {
+      const p = new THREE.PointLight(0xffffff, 0, L.heroPointDist, L.heroPointDecay);
+      p.position.set(0, 24, 0);
+      scene.add(p);
+      KIT.heroLights.push(p);
+    }
+
+    /* textures (LED faces, holo signs, glow) */
+    KIT.tex = {
+      ledA: makeLedGrid(48, 24, 0.0, ['#41e0ff', '#59f0ff', '#2fa8ff', '#9ff2ff', '#ffd166']),
+      ledB: makeLedGrid(24, 16, 7.3, ['#41e0ff', '#2fa8ff', '#59f0ff']),
+      signQwen: makeHoloSign('QWEN', 'FLASH // AWAKENING', '#7fe6ff', 256, 96),
+      signUnsloth: makeHoloSign('UNSLOTH', () => KIT._tagline(), '#ffb3d9', 256, 96),
+      glow: makeGlowTexture(128, '150,235,255'),
+    };
+
+    KIT.buildTestRig();
+  },
+
+  _tagline() {
+    return ['LOCAL ≠ SLOW', 'WHY RUSH?'][KIT._tag];
+  },
+
+  /* M2 gate demo: test wall/tower — 8 draw calls total:
+   * tower boxes (1) + cylinders (1) + wall boxes (1) + LED planes (2)
+   * + holo signs (2) + glow sprite (1) */
+  buildTestRig() {
+    const g = new THREE.Group();
+    const P = CFG.kit.testTower;
+    const X = P.x, Z = P.z;
+
+    /* tower body — one InstancedMesh with per-instance tint */
+    const tower = KIT.InstancedBox(12, [1, 1, 1], MATS.metalDark);
+    tower.add(X, 0.5, Z, [16, 1, 16], 0xcfd8e8);          // base slab
+    tower.add(X, 13, Z, [10, 24, 10], 0xe8eef8);          // main mass
+    tower.add(X, 28, Z, [6, 8, 6], 0xd3dcef);             // upper stage
+    tower.add(X, 33.2, Z, [3, 2.4, 3], 0xbcc7de);         // roof block
+    tower.add(X, 35.2, Z, [1.2, 1.6, 1.2], 0xd8e0f0);     // crown
+    tower.commit();
+    g.add(tower.mesh);
+
+    /* legs + antenna — one instanced cylinder mesh */
+    const cyl = KIT.InstancedCylinder(8, 0.5, 0.5, 1, 10, MATS.cable);
+    for (const [dx, dz] of [[6, 6], [-6, 6], [6, -6], [-6, -6]]) {
+      cyl.add(X + dx, 1.5, Z + dz, [1, 3, 1], 0x9fb4d8);   // leg pillars
+    }
+    cyl.add(X, 39.5, Z, [1, 9, 1], 0x8090b0);               // antenna mast
+    cyl.commit();
+    g.add(cyl.mesh);
+
+    /* test wall — one instanced box row */
+    const wall = KIT.InstancedBox(16, [1, 1, 1], MATS.server);
+    const WX = X - 22, WZ = Z + 14;
+    for (let i = 0; i < 12; i++) {
+      wall.add(WX - 11 + i * 2.2, 1.6, WZ, [2, 3.2, 1.2],
+        i % 3 ? 0xd8e4f8 : 0xb8c8e8);
+    }
+    wall.commit();
+    g.add(wall.mesh);
+
+    /* animated LED faces — two unlit planes, one material each */
+    const ledA = new THREE.Mesh(
+      new THREE.PlaneGeometry(9.6, 5.4),
+      new THREE.MeshBasicMaterial({ map: KIT.tex.ledA.tex }),
+    );
+    ledA.position.set(X, 12.5, Z + 5.06);
+    g.add(ledA);
+    const ledB = new THREE.Mesh(
+      new THREE.PlaneGeometry(5.6, 3.6),
+      new THREE.MeshBasicMaterial({ map: KIT.tex.ledB.tex }),
+    );
+    ledB.position.set(X + 5.06, 16, Z);
+    ledB.rotation.y = Math.PI / 2;
+    g.add(ledB);
+
+    /* holo signs — additive billboard planes */
+    const mkSign = (w, h, T, x, y, z) => {
+      const m = new THREE.Mesh(
+        new THREE.PlaneGeometry(w, h),
+        new THREE.MeshBasicMaterial({
+          /* FrontSide: viewer-facing billboards — transparent DoubleSide
+             objects render in two passes (extra draw call per sign) */
+          map: T.tex, transparent: true, side: THREE.FrontSide,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        }),
+      );
+      m.position.set(x, y, z);
+      g.add(m);
+    };
+    mkSign(8.4, 3.2, KIT.tex.signQwen, X, 37.4, Z + 3.2);
+    mkSign(5.2, 2.2, KIT.tex.signUnsloth, WX, 4.9, WZ + 0.8);
+
+    /* soft glow sprite at the antenna tip */
+    const glow = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: KIT.tex.glow.tex, transparent: true,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }),
+    );
+    glow.position.set(X, 44.5, Z);
+    glow.scale.set(3.4, 3.4, 1);
+    g.add(glow);
+    KIT.glowSprite = glow;
+
+    scene.add(g);
+    KIT.testRig = g;
+  },
+
+  /* builders (attached so later milestones share them) */
+  InstancedBox: (capacity, size = [1, 1, 1], material = MATS.metalDark) =>
+    makeInstanced(new THREE.BoxGeometry(size[0], size[1], size[2]), material, capacity),
+
+  InstancedCylinder: (capacity, r1 = 0.5, r2 = 0.5, h = 1, radial = 10,
+    material = MATS.metalDark) =>
+    makeInstanced(new THREE.CylinderGeometry(r1, r2, h, radial), material, capacity),
+
+  mergeGeometries: parts => mergeGeometries(parts),
+  makeCanvasTexture: (w, h, draw) => makeCanvasTexture(w, h, draw),
+  makeLedGrid: (cols, rows, seed, palette) => makeLedGrid(cols, rows, seed, palette),
+  makeHoloSign: (text, sub, color, w, h) => makeHoloSign(text, sub, color, w, h),
+  makeGlowTexture: (size, rgb) => makeGlowTexture(size, rgb),
+
+  update(dt, t) {
+    /* LED faces: 15 Hz canvas redraw (small canvases, cheap) */
+    KIT._acc += dt;
+    const ledStep = 1 / CFG.kit.ledHz;
+    if (KIT._acc >= ledStep) {
+      KIT._acc %= ledStep;
+      KIT.tex.ledA.redraw(t);
+      KIT.tex.ledB.redraw(t + 137.2);
+    }
+    /* holo signs: 8 Hz flicker redraw + slow tagline cycle */
+    KIT._acc2 += dt;
+    const signStep = 1 / CFG.kit.signHz;
+    if (KIT._acc2 >= signStep) {
+      KIT._acc2 %= signStep;
+      KIT.tex.signQwen.redraw(t);
+      KIT.tex.signUnsloth.redraw(t);
+    }
+    const tagN = Math.floor(t / CFG.kit.signTagCycle) & 1;
+    if (tagN !== KIT._tag) KIT._tag = tagN;
+    /* glow sprite pulse */
+    if (KIT.glowSprite) {
+      const s = 3.4 * (1 + 0.1 * Math.sin(t * 2.3));
+      KIT.glowSprite.scale.set(s, s, 1);
+    }
+  },
+
+  dispose() {},
+};
+
 /* ------------------------------------------------------------------ *
  * Subsystems — FIXED BOOT ORDER = registration order.
- * M0: HUD   M1: INPUT, CAMERA
+ * M0: HUD   M1: INPUT, CAMERA   M2: KIT
  * ------------------------------------------------------------------ */
 const systems = [];
 function registerSystem(sys) {
@@ -741,6 +1148,7 @@ const HUD = {
 
 registerSystem(INPUT);
 registerSystem(CAMERA);
+registerSystem(KIT);
 registerSystem(HUD);
 for (const s of systems) if (s.init) s.init();
 
@@ -800,6 +1208,7 @@ window.SIM = {
   BOOT,
   INPUT,
   CAMERA,
+  KIT,
   HUD,
   CFG,
   renderer,

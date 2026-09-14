@@ -5,13 +5,13 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-15T01:18:39"
+updated: "2026-09-15T01:42:17"
 ---
 
 <!-- compiled_truth -->
-The smoke harness lives in `smoke/` (dev tooling only, not part of the product): `node smoke/smoke.mjs [url]` serves the project root on :8377 and drives `index.html` in headless Chrome via `playwright-core` (pinned in `smoke/node_modules`, system Chrome at /usr/bin/google-chrome). It asserts the M0 boot contract (LOADER → START → RUNNING, live loop, double-init guard, resize, refresh/re-entry) and the M1 core loop (fixed system order INPUT→CAMERA→HUD, clean-without-gamepad, fake-gamepad movement, keyboard W/Space, wheel FOV zoom, V GROUND/CINE toggle with blend, middle-mouse orbit, shake impulse/decay, zero page errors).
+The smoke harness lives in `smoke/` (dev tooling only, not part of the product): `node smoke/smoke.mjs [url]` serves the project root on :8377 and drives `index.html` in headless Chrome via `playwright-core` (pinned in `smoke/node_modules`, system Chrome at /usr/bin/google-chrome). It asserts the M0 boot contract (LOADER → START → RUNNING, live loop, double-init guard, resize, refresh/re-entry), the M1 core loop (fixed system order INPUT→CAMERA→KIT→HUD, clean-without-gamepad, fake-gamepad movement, keyboard W/Space, wheel FOV zoom, V GROUND/CINE toggle with blend, middle-mouse orbit, shake impulse/decay), and the M2 gate (KIT registration: MATS/builders/textures/lighting rig; full test scene < 10 draw calls read from `renderer.info.render.calls`; LED `frame` counter advancing; two screenshots 0.4 s apart differing), always ending with zero page errors.
 
-Testing seams: `window.SIM` dev handle exposes BOOT/INPUT/CAMERA/HUD/CFG/renderer/scene/camera/systems; gamepads are faked by stubbing `navigator.getGamepads()` in-page with a standard-mapping pad object.
+Testing seams: `window.SIM` dev handle exposes BOOT/INPUT/CAMERA/KIT/HUD/CFG/renderer/scene/camera/systems; gamepads are faked by stubbing `navigator.getGamepads()` in-page with a standard-mapping pad object.
 
 Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` enum has no `middle` — omit `buttons` and pass only `button:'middle'`; DOM `button` value for middle is 1 (0=left, 2=right). Playwright's `mouse.down({button:'middle'})` does emit the real middle button, but for middle-button *drags* the harness uses a CDP session (`page.context().newCDPSession`).
 
@@ -25,6 +25,18 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   affects: [smoke-harness-dev-tooling]
 
 - time: 2026-09-15T01:18:39
+  kind: decision
+  summary: Rewrote compiled_truth to the new best understanding
+  source: brain update-truth
+  affects: [smoke-harness-dev-tooling]
+
+- time: 2026-09-15T01:41:57
+  kind: decision
+  summary: "M2 extends the harness: fixed-order check is now INPUT→CAMERA→KIT→HUD; new M2 checks assert KIT registration (MATS>=5, builders, LED/QWEN/UNSLOTH/glow textures, hemi+moon+2 hero lights), gate scene < 10 draw calls via renderer.info.render.calls, LED frame counter advancing, and two screenshots 0.4 s apart differing (animated render)."
+  source: M2 implementation
+  affects: [smoke-harness-dev-tooling]
+
+- time: 2026-09-15T01:42:17
   kind: decision
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
