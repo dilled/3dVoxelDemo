@@ -44,7 +44,7 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 | **M1** ✅ | Core loop: fixed-order `systems` registry + `update(dt)`, `INPUT` (WASD/ZQSD, pointer-lock mouse look, wheel zoom, middle-mouse orbit, gamepad), `CAMERA` ground/cinematic modes with shake API | Fly around an empty dark void in both cameras; gamepad works; nothing throws without one |
 | **M2** ✅ | Procedural voxel material kit: shared materials, canvas-texture helpers (LED grid, holo signs, glow sprites), instanced box/cylinder + merged-geometry builders, lighting rig | Kit renders a test wall/tower with animated LED faces and signs at < 10 draw calls |
 | **M3** ✅ | Chunked city generation (far layer): seeded PRNG, city grid, 16×16 block chunks generated/unbuilt around player, weighted archetypes, 3-ring distance LOD | City extends beyond initial view, no visible duplication, draw calls flat as you fly out |
-| **M4** | Building detail passes (near layer): per-archetype details (server racks, cooling towers, substations, antennas, fiber spires, holo signs), per-building seeded variation, zone haze | Every archetype readable from 50–200 m and procedurally varied; FPS within target |
+| **M4** ✅ | Building detail passes (near layer): 5 pooled detail InstancedMeshes per near chunk (fans, dishes, pulses, holo signs, LED facades), per-archetype detail on the M3 mass, per-building seeded salt, ring-2 silhouette stays zero-detail | Every archetype readable from 50–200 m and procedurally varied; draw calls flat (32 near) |
 | **M5** | The Qwen machine-creature (dormant): plaza pedestal, full creature build from primitives, named rig parts, dormant breathing/idle state, instanced compute-node voxels | Reads as "dormant colossal machine" from street level; silhouette holds from 3 camera distances |
 | **M6** | Traffic & ambient life (pooled): object pools, maintenance drones, sky vehicles with light trails, steam/spark emitters, FPS-tier adaptive caps | City feels inhabited; caps never exceed tier; pools never allocate per frame |
 | **M7** | Particle & FX system: pooled points/sprites, `FX.pulse`, animated electrical arcs, screen-space flash, impulse camera shake | Each effect has a manual trigger key and costs nothing while idle |
@@ -103,21 +103,36 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 - **Done-when:** city extends well beyond initial view, no visible
   duplication, draw calls stay flat as you fly further out.
 
-### M4 — Building detail passes (near layer)
-- [ ] Per-archetype detail builders on top of the M3 mass:
-      - server racks: LED windows, front doors, cable trays, roof vents
+### M4 — Building detail passes (near layer) ✅
+- [x] Per-archetype detail builders on top of the M3 mass — five pooled
+      InstancedMeshes per ring 0/1 chunk (fan / dish / pulse / sign /
+      LED window; ~5 extra draw calls per near chunk, all shared
+      geometries + shared materials, zero per-frame allocation):
+      - server/rack: LED window facades (shared animated canvas texture;
+        fair two-pass allocation — every candidate gets one seeded facade
+        before any gets a second; long ±Z faces always, ±X seeded)
       - cooling towers: big animated fans (shared rotating instanced
-        blades), steam emitters (M7 particles), pipes between towers
-      - substations: transformer boxes, insulators, spark points
+        blades) + pipes connecting nearby towers (static mass boxes)
+      - substations: spark points on the shared pulse mesh
       - antennas: masts, dishes (slow scan), blinking beacons
-      - fiber spires: glowing conduit bands with animated UV/texture offset
-        or scrolling emissive dash instances (light traveling in cable)
+      - fiber spires: glowing conduit bands with scrolling emissive dash
+        instances (light traveling up the spire)
       - holo-sign towers: animated canvas texture + additive billboard
-- [ ] Detail level by ring; nearest ring gets unique per-building variation
-      (seeded per-building salt → not duplicated neighbors).
-- [ ] Distant haze: fog + per-chunk far-ring color grading to city haze.
+      - (deliberate delta: front doors / cable trays / roof vents not
+        modeled as separate parts — mass variation + lit facades carry
+        readability; steam emitters wait on the M7 particle pool)
+- [x] Detail level by ring (0/1 = near/full, 2 = silhouette with zero
+      detail → clean far layer) + per-building seeded salt (block seed)
+      → no two neighbours share a detail layout.
+- [x] Distant haze: exponential fog over the clean far silhouettes
+      (ring-2 chunks carry no animated/emissive detail to shimmer).
 - **Done-when:** standing in the city, every archetype is readable from
-  50–200 m and looks procedurally varied; FPS within target.
+  50–200 m and looks procedurally varied; FPS within target — verified:
+  street-level + elevated screenshots in `smoke/shots/` (LED facade,
+  QWEN/UNSLOTH signs, spinning fans, varied silhouettes); smoke M4
+  section green (near-ring led=568 / fan=151 / pulse=318 / sign=9 /
+  dish=8, ring-2 all zero, byte-identical regen, fans+pulses animate,
+  32 draw calls near — flat vs M3).
 
 ### M5 — The Qwen machine-creature (dormant)
 - [ ] Central plaza: darkened mega-core pedestal, creature ~ several

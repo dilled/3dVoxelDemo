@@ -41,6 +41,15 @@
  *   - draw calls stay flat (within budget) after flying far out, and
  *     the old keep-set is unbuilt behind while new chunks build ahead
  *
+ *   M4 checks:
+ *   - near-ring (rings 0–1) chunks carry the detail pass: LED facades on
+ *     multiple building sides, spinning fans, animated pulses, signs,
+ *     dishes; the silhouette ring stays zero-detail (clean far layer)
+ *   - detail instance matrices are byte-identical across chunk regen
+ *   - fans rotate and pulses animate; per-mesh culling bounds are
+ *     instance-aware (contain every instance they describe)
+ *   - total draw calls stay inside budget with the detail pass on
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -518,7 +527,142 @@ try {
     await sleep(400);
   }
 
-  /* ---- 8. No errors anywhere ---- */
+  /* ---- 8. M4 — near-layer detail pass (recognizable buildings up close) ---- */
+  {
+    /* 8a. five pooled detail meshes per chunk; near rings full, far ring zero.
+     * Settle first: 7d just flew back, the keep-set must be fully rebuilt
+     * (mid-`_fill` chunk state is transient). */
+    for (let i = 0; i < 30; i++) {
+      const s = await page.evaluate(() => ({
+        p: window.SIM.WORLD.playerKey,
+        c: window.SIM.WORLD.stats.chunks,
+      }));
+      if (s.p === '0,0' && s.c === 25) break;
+      await sleep(100);
+    }
+    const detail = await page.evaluate(() => {
+      const w = window.SIM.WORLD;
+      const rows = [];
+      for (const [k, ch] of w.chunks) {
+        rows.push({
+          k, ring: ch.ring,
+          fan: ch.fan.count, dish: ch.dish.count, pulse: ch.pulse.count,
+          sign: ch.sign.count, led: ch.ledWin.count,
+        });
+      }
+      const sum = rows.reduce((a, r) => {
+        for (const m of ['fan', 'dish', 'pulse', 'sign', 'led']) a[m] += r[m];
+        return a;
+      }, { fan: 0, dish: 0, pulse: 0, sign: 0, led: 0 });
+      return { rows, sum };
+    });
+    const near = detail.rows.filter(r => r.ring < 2);
+    const far = detail.rows.filter(r => r.ring === 2);
+    check('M4: near-ring chunks carry the detail pass (LED facades + motion)',
+      near.length === 9 &&
+      near.every(r => r.led >= 40 && r.fan + r.pulse > 0),
+      `near=${near.length}, led total=${detail.sum.led}`);
+    check('M4: silhouette ring keeps zero detail (clean far layer)',
+      far.length === 16 &&
+      far.every(r => r.fan === 0 && r.dish === 0 && r.pulse === 0 &&
+        r.sign === 0 && r.led === 0),
+      `far=${far.length}`);
+    check('M4: detail totals within per-chunk budgets (city-wide)',
+      detail.sum.fan >= 100 && detail.sum.pulse >= 200 &&
+      detail.sum.led >= 400 && detail.sum.sign >= 8 &&
+      detail.sum.sign <= 72 && detail.sum.dish >= 4,
+      `fan=${detail.sum.fan}, pulse=${detail.sum.pulse}, led=${detail.sum.led}, ` +
+      `sign=${detail.sum.sign}, dish=${detail.sum.dish}`);
+
+    /* 8b. LED facades face multiple sides — no one-wall city */
+    const ledFaces = await page.evaluate(() => {
+      const w = window.SIM.WORLD;
+      const dirs = new Set();
+      for (const ch of w.chunks.values()) {
+        const a = ch.ledWin.mesh.instanceMatrix.array;
+        for (let i = 0; i < ch.ledWin.count; i++) {
+          const nx = a[i * 16 + 8], nz = a[i * 16 + 10];
+          if (Math.abs(nz) > Math.abs(nx)) dirs.add(nz > 0 ? 'z+' : 'z-');
+          else dirs.add(nx > 0 ? 'x+' : 'x-');
+        }
+      }
+      return [...dirs];
+    });
+    check('M4: LED facades cover multiple building sides',
+      ledFaces.length >= 3, ledFaces.join(','));
+
+    /* 8c. per-mesh culling bounds are instance-aware (contain instances) */
+    const bounds = await page.evaluate(() => {
+      const w = window.SIM.WORLD;
+      const ch = w.chunks.get('0,0');
+      if (!ch) return 'missing chunk 0,0';
+      const names = ['boxA', 'boxG', 'cyl', 'fan', 'dish', 'pulse', 'sign', 'ledWin'];
+      for (let n = 0; n < names.length; n++) {
+        const b = ch[names[n]];
+        if (!b.count) continue;
+        const bs = b.mesh.boundingSphere;
+        if (!bs) return `no sphere: ${names[n]}`;
+        const a = b.mesh.instanceMatrix.array;
+        const sample = [...new Set([0, 1, 2, b.count - 1])].filter(
+          i => i >= 0 && i < b.count);
+        for (const i of sample) {
+          const o = i * 16;
+          const dx = a[o + 12] - bs.center.x;
+          const dy = a[o + 13] - bs.center.y;
+          const dz = a[o + 14] - bs.center.z;
+          if (Math.hypot(dx, dy, dz) > bs.radius)
+            return `outside: ${names[n]} i=${i} ` +
+              `d=${Math.hypot(dx, dy, dz).toFixed(1)} r=${bs.radius.toFixed(1)}`;
+        }
+      }
+      return 'ok';
+    });
+    check('M4: per-mesh culling bounds contain their instances',
+      bounds === 'ok', `bounds=${bounds}`);
+
+    /* 8d. detail matrices are deterministic across chunk regeneration */
+    const ledSnap = async () => page.evaluate(() => {
+      const c = window.SIM.WORLD.chunks.get('1,1');
+      return {
+        led: Array.from(c.ledWin.mesh.instanceMatrix.array),
+        sign: Array.from(c.sign.mesh.instanceMatrix.array),
+      };
+    });
+    const ledBefore = await ledSnap();
+    await page.evaluate(() => window.SIM.WORLD.regen('1,1'));
+    const ledAfter = await ledSnap();
+    check('M4: detail matrices byte-identical across chunk regeneration',
+      ledBefore.led.length > 16 &&
+      ledBefore.led.every((v, i) => v === ledAfter.led[i]) &&
+      ledBefore.sign.length === ledAfter.sign.length &&
+      ledBefore.sign.every((v, i) => v === ledAfter.sign[i]),
+      `led instances=${ledBefore.led.length / 16}`);
+
+    /* 8e. fans rotate, pulses animate — the near layer is alive */
+    const anim = async () => page.evaluate(() => {
+      const ch = window.SIM.WORLD.chunks.get('0,0');
+      return {
+        fan: ch.fan.count ? ch.fan.mesh.instanceMatrix.array.slice(0, 64) : null,
+        pulse: ch.pulse.mesh.instanceMatrix.array.slice(0, 64),
+      };
+    });
+    const anim0 = await anim();
+    await sleep(300);
+    const anim1 = await anim();
+    check('M4: fans rotate and pulses animate (near layer alive)',
+      anim0.fan !== null &&
+      anim0.fan.some((v, i) => v !== anim1.fan[i]) &&
+      anim0.pulse.some((v, i) => v !== anim1.pulse[i]),
+      `fans=${anim0.fan ? 'yes' : 'no'}`);
+
+    /* 8f. draw-call budget with the detail pass on */
+    const calls = await page.evaluate(
+      () => window.SIM.renderer.info.render.calls);
+    check('M4: draw calls inside budget with detail on (< 150)',
+      calls < 150, `calls=${calls}`);
+  }
+
+  /* ---- 9. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));
 } finally {

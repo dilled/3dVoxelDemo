@@ -257,6 +257,15 @@ const CFG = {
       housing: { weights: { core: 1, mid: 2, outer: 4 }, tint: 0xc0b098 },
     },
   },
+  detail: {
+    /* M4 near layer: ring 0 = full pass (lvl 2), ring 1 = light pass (lvl 1),
+     * ring 2 stays the M3 silhouette. Per-building variation is seeded from
+     * the block seed (per-building salt ⇒ no duplicated neighbours). */
+    ledPerChunk: 64,             // LED-window plane cap per chunk (fair 2-pass)
+    dashPerChunk: 4,             // traveling light dashes per chunk (fiber spires)
+    signPerChunk: 1,             // holo-sign billboards per chunk
+    ledTexture: 0,               // 0 = ledA / 1 = ledB (picked per building)
+  },
 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -872,6 +881,23 @@ const MATS = {
   metalHero: new THREE.MeshStandardMaterial({
     color: 0x6b7c94, roughness: 0.42, metalness: 0.75,
   }),
+  /* M4: shared additive glow for beacons / sparks / fiber light dashes
+   * (white base colour — per-instance colour drives the look). */
+  pulseGlow: new THREE.MeshBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0.95,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }),
+  /* M4: holo-sign billboard faces — one material per shared texture
+   * (WORLD picks one per chunk, so a chunk's signs cost one draw call). */
+  signMat: {
+    qwen: new THREE.MeshBasicMaterial({
+      transparent: true, side: THREE.FrontSide,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }),
+    unsloth: null, // set in KIT.init once textures exist
+    city: null,    // set in KIT.init
+    core: null,    // set in KIT.init
+  },
 };
 
 /* ---- instancing builders (capacity up front, no per-frame allocation) ---- */
@@ -975,13 +1001,30 @@ const KIT = {
     }
 
     /* textures (LED faces, holo signs, glow) */
+    /* holo-sign billboard materials (shared across chunks, FrontSide) */
+    MATS.signMat.unsloth = new THREE.MeshBasicMaterial({
+      transparent: true, side: THREE.FrontSide,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    MATS.signMat.city = MATS.signMat.unsloth.clone();
+    MATS.signMat.core = MATS.signMat.unsloth.clone();
+
     KIT.tex = {
       ledA: makeLedGrid(48, 24, 0.0, ['#41e0ff', '#59f0ff', '#2fa8ff', '#9ff2ff', '#ffd166']),
       ledB: makeLedGrid(24, 16, 7.3, ['#41e0ff', '#2fa8ff', '#59f0ff']),
       signQwen: makeHoloSign('QWEN', 'FLASH // AWAKENING', '#7fe6ff', 256, 96),
       signUnsloth: makeHoloSign('UNSLOTH', () => KIT._tagline(), '#ffb3d9', 256, 96),
       glow: makeGlowTexture(128, '150,235,255'),
+      /* M4: shared city-sign faces for the WORLD holo-sign billboards */
+      signCity: makeHoloSign('UNSLOTH', () => KIT._tagline(), '#ff9ecb', 256, 96),
+      signCore: makeHoloSign('QWEN', 'CORE COMPUTE', '#7fe6ff', 256, 96),
     };
+    /* bind the shared sign materials to their textures (WORLD reuses them)
+     * — each material is bound once, so per-chunk signs stay one draw call */
+    MATS.signMat.qwen.map = KIT.tex.signQwen.tex;
+    MATS.signMat.unsloth.map = KIT.tex.signUnsloth.tex;
+    MATS.signMat.city.map = KIT.tex.signCity.tex;
+    MATS.signMat.core.map = KIT.tex.signCore.tex;
 
     KIT.buildTestRig();
   },
@@ -1179,12 +1222,55 @@ const WORLD = {
   _pcx: NaN, _pcz: NaN,    // last player chunk (triggers _sync on change)
   playerKey: '',
   _farTint: {},
+  /* M4 near-layer detail pass */
+  _detailAssets: null,
+  _cool: null,            // per _fill: cooling-tower anchor list (pipes)
+  _nLed: 0,
+  _nSign: 0,
+  _nDash: 0,
+  _m4: new THREE.Matrix4(),
+  _p4: new THREE.Vector3(),
+  _q4: new THREE.Quaternion(),
+  _s4: new THREE.Vector3(),
+  _y4: new THREE.Vector3(0, 1, 0),
+  _z4: new THREE.Vector3(0, 0, 1),
+  _c4: new THREE.Color(),
+  _camDir4: new THREE.Vector3(),
   stats: { chunks: 0, instances: 0, ring: [0, 0, 0], meters: 0 },
 
   init() {
     const C = CFG.city;
     WORLD.root = new THREE.Group();
     scene.add(WORLD.root);
+    /* M4: shared detail geometries/materials (one of each, pooled chunks
+     * attach their own InstancedMesh on top — zero per-frame allocation). */
+    WORLD._detailAssets = {
+      fanGeo: mergeGeometries([
+        { geo: new THREE.CylinderGeometry(0.5, 0.5, 0.22, 8) },
+        { geo: new THREE.BoxGeometry(3.7, 0.2, 0.42), matrix: new THREE.Matrix4().makeTranslation(1.0, 0, 0) },
+        { geo: new THREE.BoxGeometry(3.7, 0.2, 0.42), matrix: new THREE.Matrix4().makeTranslation(-1.0, 0, 0) },
+        { geo: new THREE.BoxGeometry(3.7, 0.2, 0.42), matrix: new THREE.Matrix4().makeRotationY(Math.PI / 2).multiply(new THREE.Matrix4().makeTranslation(1.0, 0, 0)) },
+        { geo: new THREE.BoxGeometry(3.7, 0.2, 0.42), matrix: new THREE.Matrix4().makeRotationY(-Math.PI / 2).multiply(new THREE.Matrix4().makeTranslation(1.0, 0, 0)) },
+      ]),
+      fanCap: 64,
+      dishGeo: (() => {
+        const g = new THREE.CylinderGeometry(0.55, 1.2, 0.5, 10);
+        g.rotateZ(-1.15);   // tilted dish face, swept by the per-frame rotY
+        return g;
+      })(),
+      dishCap: 40,
+      pulseGeo: new THREE.BoxGeometry(1, 1, 1),
+      pulseCap: 48,
+      signGeo: new THREE.PlaneGeometry(1, 1),
+      signCap: 8,
+      ledGeo: new THREE.PlaneGeometry(1, 1),
+      ledCap: 64,
+      signMats: { qwen: MATS.signMat.qwen, unsloth: MATS.signMat.unsloth, city: MATS.signMat.city, core: MATS.signMat.core },
+      ledMats: {
+        a: new THREE.MeshBasicMaterial({ map: KIT.tex.ledA.tex, side: THREE.FrontSide }),
+        b: new THREE.MeshBasicMaterial({ map: KIT.tex.ledB.tex, side: THREE.FrontSide }),
+      },
+    };
     /* far-ring silhouette tints (hazed once, not per-building) */
     for (const k in C.archetypes) {
       WORLD._farTint[k] = _tintHaze(C.archetypes[k].tint, C.hazeAmount, C.haze);
@@ -1245,9 +1331,13 @@ const WORLD = {
     const cx = Math.floor(bx / WORLD.CHUNK);
     const cz = Math.floor(bz / WORLD.CHUNK);
     WORLD.playerKey = cx + ',' + cz;
-    if (cx === WORLD._pcx && cz === WORLD._pcz) return;
+    if (cx === WORLD._pcx && cz === WORLD._pcz) {
+      WORLD._updateDetail(t);
+      return;
+    }
     WORLD._pcx = cx; WORLD._pcz = cz;
     WORLD._sync();
+    WORLD._updateDetail(t);
   },
 
   /* (re)build the keep-set around the player, retire the rest */
@@ -1269,21 +1359,48 @@ const WORLD = {
       WORLD.chunks.delete(key);
       ch.boxA.count = 0; ch.boxG.count = 0; ch.cyl.count = 0;
       ch.boxA.mesh.count = 0; ch.boxG.mesh.count = 0; ch.cyl.mesh.count = 0;
+      ch.fan.reset(); ch.dish.reset(); ch.pulse.reset();
+      ch.sign.reset(); ch.ledWin.reset();
       ch.group.visible = false;
       WORLD._pool.push(ch);           // buffers reused, never disposed
     }
     WORLD._countStats();
   },
 
+  /* M4: pooled detail InstancedMesh (capacity up front; reset on recycle).
+   * col=true pre-allocates instanceColor at capacity so per-frame
+   * setColorAt never grows the buffer (three sizes it from mesh.count). */
+  _detailMesh(geo, mat, cap, col = false) {
+    const B = makeInstanced(geo, mat, cap);
+    B.pars = new Array(cap);
+    if (col) {
+      B.mesh.instanceColor = new THREE.InstancedBufferAttribute(
+        new Float32Array(cap * 3).fill(1), 3);
+    }
+    B.reset = () => {
+      B.count = 0; B.mesh.count = 0; B.mesh.visible = false;
+      if (col && B.mesh.instanceColor) B.mesh.instanceColor.needsUpdate = true;
+    };
+    return B;
+  },
+
   _spawnChunk(cx, cz, ring) {
     let ch = WORLD._pool.pop();
     if (!ch) {
+      const D = WORLD._detailAssets;
       ch = {
         cx: 0, cz: 0, ring: 0,
         group: new THREE.Group(),
         boxA: KIT.InstancedBox(1000, [1, 1, 1], MATS.metalDark),
         boxG: KIT.InstancedBox(600, [1, 1, 1], MATS.server),
         cyl: KIT.InstancedCylinder(240, 0.5, 0.5, 1, 10, MATS.metalDark),
+        /* M4 near-layer detail (near-ring chunks only; capped, pooled, and
+         * frustum-culled like the mass meshes — zero per-frame allocation) */
+        fan:   WORLD._detailMesh(D.fanGeo, MATS.metalDark, D.fanCap),
+        dish:  WORLD._detailMesh(D.dishGeo, MATS.metalDark, D.dishCap),
+        pulse: WORLD._detailMesh(D.pulseGeo, MATS.pulseGlow, D.pulseCap, true),
+        sign:  WORLD._detailMesh(D.signGeo, MATS.signMat.qwen, D.signCap),
+        ledWin: WORLD._detailMesh(D.ledGeo, D.ledMats.a, D.ledCap),
       };
     }
     ch.cx = cx; ch.cz = cz;
@@ -1293,14 +1410,30 @@ const WORLD = {
     WORLD._fill(ch, ring);
   },
 
-  /* refill one chunk from its block seeds — pure function of (cx, cz, ring) */
+  /* refill one chunk from its block seeds — pure function of (cx, cz, ring).
+   * M4: near rings also get the per-archetype detail pass, then one
+   * chunk-level pass (pipes) runs after the block loop. */
   _fill(ch, ring) {
     const K = WORLD.CHUNK, B = WORLD.BLOCK;
     ch.cx = Math.round(ch.cx); ch.cz = Math.round(ch.cz);
     ch.ring = ring;
     ch.boxA.count = 0; ch.boxG.count = 0; ch.cyl.count = 0;
+    ch.fan.reset(); ch.dish.reset(); ch.pulse.reset();
+    ch.sign.reset(); ch.ledWin.reset();
     ch.group.visible = true;
     const bx0 = ch.cx * K, bz0 = ch.cz * K;
+    const lvl = ring >= 2 ? 0 : ring === 1 ? 1 : 2;
+    const ledMats = WORLD._detailAssets.ledMats;
+    const signMats = WORLD._detailAssets.signMats;
+    /* chunk texture picks — deterministic from (cx, cz): every building in
+     * the chunk shares them, so each detail mesh stays one draw call */
+    const key = ((ch.cx * 73856093) ^ (ch.cz * 19349663)) >>> 0;
+    ch.ledWin.mesh.material = ledMats[(key & 1) ? 'b' : 'a'];
+    const signName = ['qwen', 'unsloth', 'city', 'core'][key & 3];
+    ch.sign.mesh.material = signMats[signName];
+    WORLD._nLed = 0; WORLD._nSign = 0; WORLD._nDash = 0;
+    WORLD._cool = null;
+    ch._ledCands = [];
     for (let i = 0; i < K; i++) {
       const bx = bx0 + i;
       for (let j = 0; j < K; j++) {
@@ -1313,14 +1446,46 @@ const WORLD = {
         const zone = dist < 220 ? 'core' : dist < 520 ? 'mid' : 'outer';
         const fall = 0.35 + 0.65 * Math.exp(-dist * 0.0045);   // height falloff
         const arch = WORLD._pick(rng, zone);
-        WORLD._mass(rng, ch, arch, CFG.city.archetypes[arch], wx, wz, fall, ring);
+        const A = CFG.city.archetypes[arch];
+        const info = WORLD._mass(rng, ch, arch, A, wx, wz, fall, ring);
+        if (lvl > 0) {
+          /* per-building salt = the block seed itself: neighbours differ */
+          const salt = (WORLD._seedFor(bx, bz) ^ 0x9E3779B9) >>> 0;
+          WORLD._detail(ch, rng, info, lvl, salt);
+          if (arch === 'cool') {
+            if (!WORLD._cool) WORLD._cool = [];
+            WORLD._cool.push(wx, info.h * 0.35, wz, info.r);
+          }
+        }
       }
     }
-    for (const b of [ch.boxA, ch.boxG, ch.cyl]) {
+    if (lvl === 2 && WORLD._cool && WORLD._cool.length >= 8) {
+      WORLD._coolPipes(ch, mulberry32(key ^ 0x7F4A1D2E));
+    }
+    if (ch._ledCands && ch._ledCands.length) {
+      WORLD._ledPass(ch);
+    }
+    for (const b of [ch.boxA, ch.boxG, ch.cyl,
+      ch.fan, ch.dish, ch.pulse, ch.sign, ch.ledWin]) {
       b.commit();
       if (b.count > 0) {
         b.mesh.computeBoundingSphere();   // InstancedMesh-aware bounds
         b.mesh.frustumCulled = true;       // cull whole chunks off-screen
+        b.mesh.visible = true;
+        if (b === ch.pulse) {
+          /* dashes travel far up the spires: grow the culling sphere so a
+           * visible spire never makes the dash mesh pop out of existence */
+          for (let i = 0; i < b.count; i++) {
+            const p = b.pars[i];
+            if (p.k !== 3) continue;
+            WORLD._p4.set(p.x, p.hi, p.z);
+            if (!b.mesh.boundingSphere.containsPoint(WORLD._p4)) {
+              b.mesh.boundingSphere.expandByPoint(WORLD._p4);
+            }
+          }
+        }
+      } else {
+        b.mesh.visible = false;
       }
     }
   },
@@ -1343,12 +1508,15 @@ const WORLD = {
     return 'server';
   },
 
-  /* building mass (far layer; per-archetype detail arrives in M4) */
+  /* building mass (far layer) + building record (M4 detail pass). The mass
+   * consumes the same seeded rng; the record hands the exact dims back so
+   * the detail pass lands on the mass, deterministically. */
   _mass(rng, ch, arch, A, x, z, fall, ring) {
     const far = ring >= 2;
     const tint = far ? WORLD._farTint[arch] : _tintShade(A.tint, 0.85 + rng() * 0.3);
     const box = A.glow ? ch.boxG : ch.boxA;
     const R = (a, b) => a + rng() * (b - a);
+    const info = { arch, x, z, h: 0, w: 6, r: 4, tint };
 
     if (far) {
       /* silhouette ring: one hazed box per building, archetype-sized */
@@ -1363,7 +1531,8 @@ const WORLD = {
         housing: [R(11, 14), R(7, 15) * (0.7 + 0.3 * fall)],
       }[arch];
       box.add(x, dims[1] / 2, z, [dims[0], dims[1], dims[0]], tint);
-      return;
+      info.w = dims[0]; info.h = dims[1];
+      return info;
     }
 
     switch (arch) {
@@ -1372,6 +1541,7 @@ const WORLD = {
       box.add(x, h / 2, z, [w, h, w], tint);
       const u = h * 0.18;
       box.add(x, h + u / 2, z, [w * 0.62, u, w * 0.62], _tintShade(tint, 1.15));
+      info.w = w; info.h = h;
       break;
     }
     case 'rack': {
@@ -1380,12 +1550,14 @@ const WORLD = {
       const a = R(4, 6);
       box.add(x + w * 0.35, a * 0.25, z + w * 0.2, [a, a * 0.5, a],
         _tintShade(tint, 0.8));
+      info.w = w; info.h = h;
       break;
     }
     case 'cool': {
       const r = R(4.5, 7), h = R(6, 13);
       ch.cyl.add(x, h / 2, z, [r * 2, h, r * 2], tint);
       ch.cyl.add(x, h + 0.9, z, [r * 1.2, 1.8, r * 1.2], _tintShade(tint, 1.1));
+      info.r = r; info.h = h;
       break;
     }
     case 'sub': {
@@ -1393,6 +1565,7 @@ const WORLD = {
       box.add(x, h / 2, z, [w, h, w * 0.7], tint);
       ch.cyl.add(x - w * 0.3, h + 0.8, z, [0.7, 1.6, 0.7], _tintShade(tint, 1.2));
       ch.cyl.add(x + w * 0.3, h + 0.8, z, [0.7, 1.6, 0.7], _tintShade(tint, 1.2));
+      info.w = w; info.h = h;
       break;
     }
     case 'antenna': {
@@ -1400,25 +1573,336 @@ const WORLD = {
       box.add(x, h / 2, z, [w, h, w], tint);
       const mh = R(12, 22);
       ch.cyl.add(x, h + mh / 2, z, [0.8, mh, 0.8], _tintShade(tint, 1.1));
+      info.w = w; info.h = h + mh;   // h = mast tip (beacons/dishes mount here)
       break;
     }
     case 'fiber': {
       const h = R(38, 68) * fall, w = R(4.5, 6);
       box.add(x, h / 2, z, [w, h, w], tint);
       box.add(x, h + 1, z, [w * 0.5, 2, w * 0.5], _tintShade(tint, 1.3));
+      info.w = w; info.h = h;
       break;
     }
     case 'holo': {
       const h = R(18, 30) * (0.6 + 0.4 * fall);
       box.add(x, h / 2, z, [5, h, 5], tint);
       box.add(x, h + 1.5, z, [6.5, 3, 6.5], _tintShade(tint, 1.2));  // pad (M4 sign)
+      info.w = 5; info.h = h + 3;
       break;
     }
     case 'housing': {
       const w = R(11, 14), h = R(7, 15) * (0.7 + 0.3 * fall);
       box.add(x, h / 2, z, [w, h, w * 0.85], tint);
+      info.w = w; info.h = h;
       break;
     }
+    }
+    return info;
+  },
+
+  /* ==================================================================
+   * M4 — near-layer detail passes (per-archetype, seeded per-building)
+   * ------------------------------------------------------------------
+   *  - ring 0 = full pass, ring 1 = light pass, ring 2 stays silhouette
+   *  - animated parts live in five per-chunk pooled InstancedMeshes
+   *    (fan / dish / pulse / sign / ledWin); everything static lands in
+   *    the existing mass meshes, so a chunk still costs a few calls only
+   *  - per-building variation: salt = the block seed (see _fill) — two
+   *    neighbours can never get the same salt, so details never repeat
+   *  - distant haze stays the M3 grade: FogExp2 + per-chunk far-ring
+   *    tint pre-lerped toward CFG.city.haze
+   * ================================================================== */
+
+  _detail(ch, rng, info, lvl, salt) {
+    const { arch, x, z, h, w, r, tint } = info;
+    const R = (a, b) => a + rng() * (b - a);
+    const pulseSlot = () =>
+      ch.pulse.count < ch.pulse.capacity ? ch.pulse.count : -1;
+    switch (arch) {
+    case 'server':
+    case 'rack': {
+      /* front door + cable trays + roof vents (full pass) */
+      if (lvl === 2) {
+        const side = salt & 3, dw = Math.min(3, w * 0.3);
+        const ox = side < 2 ? 1 : -1, oz = side < 2 ? 0 : 1;
+        ch.boxA.add(x + ox * (w / 2 + 0.08), 1.35, z + oz * (w * 0.72 / 2 + 0.08),
+          [ox ? dw : 0.25, 2.7, oz ? dw : 0.25], 0x0a101d);
+        /* cable trays: two low rails along one wall */
+        const ax = oz ? 1 : 0, az = oz ? 0 : 1;
+        const L = w * 0.8;
+        ch.boxA.add(x + ax * (w / 2 + 0.3), 0.5, z + az * (w * 0.4),
+          [ax ? 0.4 : L, 0.3, az ? 0.4 : L], 0x141a26);
+        ch.boxA.add(x + ax * (w / 2 + 0.3), 1.25, z + az * (w * 0.4),
+          [ax ? 0.4 : L, 0.3, az ? 0.4 : L], 0x141a26);
+        /* roof vents (2–4 boxes, seeded layout) */
+        const nv = 2 + ((salt >> 3) & 3);
+        for (let i = 0; i < nv; i++) {
+          const vx = ((Math.sin(salt * 0.13 + i * 2.1) * 43758.5453) % 1) * w * 0.6 - w * 0.3;
+          const vz = ((Math.sin(salt * 0.29 + i * 4.7) * 43758.5453) % 1) * w * 0.6 - w * 0.3;
+          const vs = R(0.8, 1.6);
+          ch.boxA.add(x + vx, h + 0.35, z + vz, [vs, 0.7, vs], _tintShade(tint, 0.7));
+        }
+      }
+      /* LED windows on all four facades (near + full rings; shared textures
+       * animate from the KIT, so the faces stay alive without new calls).
+       * Long faces always, short faces seeded — so from any walking angle
+       * at least one lit facade is on the building. */
+      /* LED-window candidate — actual placement happens in _ledPass after
+       * the block loop, so the per-chunk budget spreads fairly: every
+       * server/rack gets one seeded facade before any gets a second. */
+      if (h > 3) (ch._ledCands = ch._ledCands || []).push({ info, salt });
+      break;
+    }
+    case 'cool': {
+      /* big animated fan: shared rotating instanced blades (one instance
+       * per tower; steam vents arrive with the M6/M7 particle pool) */
+      if (ch.fan.count < ch.fan.capacity) {
+        const slot = ch.fan.count;
+        ch.fan.add(x, h + 0.5, z, r * 0.46, 0xb8c8e8);
+        ch.fan.pars[slot] = {
+          x, y: h + 0.5, z, s: r * 0.46,
+          sp: R(2.2, 4.5) * (rng() < 0.5 ? 1 : -1),
+          ph: rng() * 6.28,
+        };
+      }
+      break;
+    }
+    case 'sub': {
+      /* transformer boxes + insulators (full pass) + spark points */
+      if (lvl === 2) {
+        const n = 2 + ((salt >> 4) & 2);
+        for (let i = 0; i < n; i++) {
+          const tx = x + ((i - (n - 1) / 2) * w * 0.5),
+                ts = R(1.4, 2.2);
+          ch.boxA.add(tx, h + ts / 2, z, [ts, ts, ts * 0.8], _tintShade(tint, 0.75));
+          ch.cyl.add(tx - ts * 0.25, h + ts + 0.3, z, [0.22, 0.6, 0.22], 0xd8e8ff);
+          ch.cyl.add(tx + ts * 0.25, h + ts + 0.3, z, [0.22, 0.6, 0.22], 0xd8e8ff);
+        }
+      }
+      /* spark points: brief additive bursts at the bushings */
+      const sp0 = pulseSlot();
+      if (sp0 >= 0) {
+        ch.pulse.add(x - w * 0.3, h + 0.5, z, 0.5);
+        ch.pulse.pars[sp0] = {
+          k: 2, x: x - w * 0.3, y: h + 0.5, z, sc: 0.5,
+          ph: rng() * 6.28, f: R(0.25, 0.6),
+        };
+      }
+      break;
+    }
+    case 'antenna': {
+      /* mast tip: blinking beacon (near + full) + slow-scanning dish (full) */
+      const tipY = h;
+      const b0 = pulseSlot();
+      if (b0 >= 0) {
+        ch.pulse.add(x, tipY + 0.6, z, 0.7);
+        ch.pulse.pars[b0] = {
+          k: 1, x, y: tipY + 0.6, z, sc: 0.7,
+          ph: rng() * 6.28, f: R(1.2, 2.5),
+        };
+      }
+      if (lvl === 2 && ch.dish.count < ch.dish.capacity) {
+        const slot = ch.dish.count;
+        const dy = h - R(2, 6);
+        ch.dish.add(x, dy, z, 2.0, 0xa8b8d8);
+        ch.dish.pars[slot] = {
+          x, y: dy, z, s: 1.3,
+          base: rng() * 6.28, amp: R(0.7, 1.5), sp: R(0.08, 0.22), ph: rng() * 6.28,
+        };
+      }
+      break;
+    }
+    case 'fiber': {
+      /* glowing conduit bands (static emissive) + traveling light dashes */
+      const bandH = Math.min(10, h * 0.4);
+      ch.boxG.add(x, h * 0.35, z, [w + 0.5, bandH, 0.5], 0x59e0ff);
+      ch.boxG.add(x, h * 0.62, z, [0.5, bandH, w + 0.5], 0x59e0ff);
+      const d0 = pulseSlot();
+      if (d0 >= 0 && WORLD._nDash < CFG.detail.dashPerChunk) {
+        WORLD._nDash++;
+        ch.pulse.add(x, 1, z, [0.55, 4, 0.55]);
+        ch.pulse.pars[d0] = {
+          k: 3, x, y: 1, z, s: [0.55, 4, 0.55],
+          lo: 1, hi: h + 3,
+          sp: R(8, 14), ph: rng(),
+        };
+      }
+      break;
+    }
+    case 'holo': {
+      /* animated canvas face + additive billboard (one per chunk) */
+      if (WORLD._nSign < CFG.detail.signPerChunk &&
+        ch.sign.count < ch.sign.capacity) {
+        const slot = ch.sign.count;
+        const sy = h + 5;
+        const s = R(6, 10);
+        ch.sign.add(x, sy, z, [s, s * 0.375, 1]);
+        ch.sign.pars[slot] = { x, y: sy, z, s: [s, s * 0.375, 1] };
+        WORLD._nSign++;
+      }
+      break;
+    }
+    case 'housing': {
+      /* dim emissive window band (reads as data housing at range) */
+      if (lvl === 2) {
+        ch.boxG.add(x, 1.2, z, [w * 0.9, 0.6, w * 0.72], 0x3a2f1e);
+      }
+      break;
+    }
+    }
+  },
+
+  /* fair LED-window placement (near rings): pass 1 gives one seeded
+   * facade to every candidate building; pass 2 (while budget remains)
+   * gives a second, opposite-ish facade. Seeded face ⇒ procedural
+   * variety with no two neighbours sharing a facade pattern. */
+  _ledPass(ch) {
+    const cands = ch._ledCands;
+    cands.sort((a, b) => (a.salt - b.salt) | 0);
+    const cap = CFG.detail.ledPerChunk;
+    const room = () =>
+      WORLD._nLed < cap && ch.ledWin.count < ch.ledWin.capacity;
+    let i = 0;
+    while (i < cands.length && room()) {
+      WORLD._ledFace(ch, cands[i++], cands[i - 1].salt & 3);
+    }
+    i = 0;
+    while (i < cands.length && room()) {
+      const c = cands[i++];
+      const f2 = (c.salt >> 3) & 3;
+      WORLD._ledFace(ch, c, f2 === (c.salt & 3) ? (f2 + 2) & 3 : f2);
+    }
+    ch._ledCands = null;
+  },
+
+  _ledFace(ch, c, face) {
+    const { x, z, h, w } = c.info;
+    const cw = w * 0.8, chh = Math.min(h * 0.6, 12);
+    const off = w / 2 + 0.06, y = 1.5 + chh / 2;
+    if (face === 0) ch.ledWin.add(x, y, z + off, [cw, chh, 1]);
+    else if (face === 1) ch.ledWin.add(x, y, z - off, [cw, chh, 1], null, Math.PI);
+    else if (face === 2) ch.ledWin.add(x + off, y, z, [1, chh, cw], null, Math.PI / 2);
+    else ch.ledWin.add(x - off, y, z, [1, chh, cw], null, -Math.PI / 2);
+    WORLD._nLed++;
+  },
+
+  /* pipes between cooling towers (full pass, in-chunk clusters) */
+  _coolPipes(ch, rng) {
+    const arr = WORLD._cool;
+    const n = arr.length / 4;
+    if (n < 2) return;
+    for (let i = 0; i < n; i++) {
+      const ax = arr[i * 4], ay = arr[i * 4 + 1], az = arr[i * 4 + 2], ar = arr[i * 4 + 3];
+      let bi = -1, bd = 1e9;
+      for (let j = 0; j < n; j++) {
+        if (j === i) continue;
+        const d = (arr[j * 4] - ax) * (arr[j * 4] - ax) + (arr[j * 4 + 2] - az) * (arr[j * 4 + 2] - az);
+        if (d < bd) { bd = d; bi = j; }
+      }
+      if (bi < 0 || bd > 80 * 80) continue;   // only link nearby towers
+      const bx2 = arr[bi * 4], bz2 = arr[bi * 4 + 2];
+      const dx = bx2 - ax, dz = bz2 - az;
+      const len = Math.hypot(dx, dz);
+      if (len < 1) continue;
+      /* box length is local +X; rotY θ sends +X → (cosθ, 0, −sinθ),
+       * so θ must be −atan2(dz, dx) to point A → B */
+      const th = -Math.atan2(dz, dx);
+      const y = ay * 0.8 + 1;
+      ch.boxA.add((ax + bx2) / 2, y, (az + bz2) / 2, [len * 0.9, 0.35, 0.5],
+        0x37455e, th);
+      ch.boxA.add((ax + bx2) / 2, y + 0.3, (az + bz2) / 2, [len * 0.9, 0.15, 0.2],
+        0x37455e, th);
+    }
+  },
+
+  /* per-frame animation of the five detail meshes (near-ring chunks only).
+   * Runs after _sync, so every visible detail chunk is in the keep-set;
+   * culled/empty meshes cost nothing (count = 0 ⇒ mesh invisible). */
+  _updateDetail(t) {
+    const camP = camera.position;
+    const M = WORLD._m4, P = WORLD._p4, Q = WORLD._q4, S = WORLD._s4,
+      Y = WORLD._y4, C = WORLD._c4, D = WORLD._camDir4;
+    for (const ch of WORLD.chunks.values()) {
+      if (!ch.group.visible) continue;
+      /* fans: shared rotating blades (constant per-fan speed/phase) */
+      const fan = ch.fan;
+      if (fan.count > 0) {
+        for (let i = 0; i < fan.count; i++) {
+          const p = fan.pars[i];
+          P.set(p.x, p.y, p.z);
+          Q.setFromAxisAngle(Y, p.ph + t * p.sp);
+          S.set(p.s, p.s, p.s);
+          M.compose(P, Q, S);
+          fan.mesh.setMatrixAt(i, M);
+        }
+        fan.mesh.instanceMatrix.needsUpdate = true;
+      }
+      /* dishes: slow scanning sweep around a seeded base heading */
+      const dish = ch.dish;
+      if (dish.count > 0) {
+        for (let i = 0; i < dish.count; i++) {
+          const p = dish.pars[i];
+          P.set(p.x, p.y, p.z);
+          Q.setFromAxisAngle(Y, p.base + p.amp * Math.sin(t * p.sp + p.ph));
+          S.set(p.s, p.s, p.s);
+          M.compose(P, Q, S);
+          dish.mesh.setMatrixAt(i, M);
+        }
+        dish.mesh.instanceMatrix.needsUpdate = true;
+      }
+      /* pulses: beacons (k=1) / sparks (k=2) / fiber dashes (k=3) */
+      const pulse = ch.pulse;
+      if (pulse.count > 0) {
+        for (let i = 0; i < pulse.count; i++) {
+          const p = pulse.pars[i];
+          if (p.k === 3) {
+            /* light traveling in the conduit: loops up the spire */
+            P.set(p.x, p.lo + (p.hi - p.lo) * ((t * (p.sp / 60) + p.ph) % 1), p.z);
+            Q.identity();
+            S.set(p.s[0], p.s[1], p.s[2]);
+            M.compose(P, Q, S);
+            pulse.mesh.setMatrixAt(i, M);
+            C.set(0.35, 0.95, 1).multiplyScalar(0.8);
+            pulse.mesh.setColorAt(i, C);
+          } else {
+            P.set(p.x, p.y, p.z);
+            Q.identity();
+            let I;
+            if (p.k === 1) {
+              /* beacon: slow breathing pulse (amber/white by salt) */
+              I = 0.25 + 0.75 * (0.5 + 0.5 * Math.sin(t * (0.6 * p.f) + p.ph));
+              C.set(p.ph < 3.14 ? 1 : 0.9, 0.85, 0.55).multiplyScalar(I);
+            } else {
+              /* spark: brief bursts, ~1 on every few seconds */
+              I = Math.max(0, Math.sin(t * (2.5 * p.f) + p.ph));
+              I = Math.pow(I, 12) * 1.6;
+              C.set(0.75, 0.9, 1).multiplyScalar(I);
+            }
+            S.set(p.sc * (1 + I * 0.3), p.sc * (1 + I * 0.3), p.sc * (1 + I * 0.3));
+            M.compose(P, Q, S);
+            pulse.mesh.setMatrixAt(i, M);
+            pulse.mesh.setColorAt(i, C);
+          }
+        }
+        pulse.mesh.instanceMatrix.needsUpdate = true;
+        if (pulse.mesh.instanceColor) pulse.mesh.instanceColor.needsUpdate = true;
+      }
+      /* holo-sign billboards: face the camera, one shared texture each */
+      const sign = ch.sign;
+      if (sign.count > 0) {
+        for (let i = 0; i < sign.count; i++) {
+          const p = sign.pars[i];
+          P.set(p.x, p.y, p.z);
+          D.copy(camP).sub(P); D.y = 0;
+          if (D.lengthSq() > 1e-4) D.normalize();
+          Q.setFromUnitVectors(WORLD._z4, D);
+          S.set(p.s[0], p.s[1], 1);
+          M.compose(P, Q, S);
+          sign.mesh.setMatrixAt(i, M);
+        }
+        sign.mesh.instanceMatrix.needsUpdate = true;
+      }
+      /* ledWin: static — the shared LED textures animate (KIT redraws) */
     }
   },
 
@@ -1426,7 +1910,9 @@ const WORLD = {
     let inst = 0;
     const ring = [0, 0, 0];
     for (const ch of WORLD.chunks.values()) {
-      inst += ch.boxA.count + ch.boxG.count + ch.cyl.count;
+      inst += ch.boxA.count + ch.boxG.count + ch.cyl.count
+        + ch.fan.count + ch.dish.count + ch.pulse.count
+        + ch.sign.count + ch.ledWin.count;
       if (ch.ring <= 2) ring[ch.ring]++;
     }
     WORLD.stats.chunks = WORLD.chunks.size;
@@ -1434,6 +1920,7 @@ const WORLD = {
     WORLD.stats.ring = ring;
     WORLD.stats.meters = (2 * WORLD.RADIUS + 1) * WORLD.CHUNK * WORLD.BLOCK;
   },
+
 };
 
 /* ------------------------------------------------------------------ *
