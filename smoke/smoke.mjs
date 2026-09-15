@@ -204,6 +204,18 @@
  *   - heap flat; screenshot shows the full-screen flash (mean
  *     luminance well above the idle pose, shots/m74-flash.png)
  *
+ *   M7.5 checks (camera shake — impulse decay consumed by CAMERA):
+ *   - registered: CFG.input shake tunables (amp/decay/cap/impulse),
+ *     CAMERA.shake API, energy 0, Key N trigger idle
+ *   - idle cost zero: 0 energy ⇒ _applyShake is a no-op (no objects,
+ *     no materials, no draw calls — structurally free)
+ *   - manual Key N: energy rises, camera position offset from the pose,
+ *     bounded by shakeAmp × energy, offset changes frame to frame
+ *   - decays cleanly to still: energy monotone to exactly 0, camera
+ *     returns exactly to the pose
+ *   - never accumulates: 10 rapid re-triggers hold at the energy cap;
+ *     shake(10) clamps to the cap; negative is a no-op; heap flat
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -3229,6 +3241,170 @@ try {
       ` flash=${flashLum.toFixed(1)}`);
     await page.waitForFunction(() => window.SIM.FX._flash === 0,
       { timeout: 5000 });
+  }
+
+  /* ------------------------------------------------------------------
+   * M7.5 — camera shake: impulse decay consumed by CAMERA
+   *
+   *  One energy scalar on CAMERA (no pool, no mesh, no material):
+   *  shake(intensity) adds energy clamped to CFG.input.shakeCap ⇒
+   *  repeated triggers accumulate up to the cap and then hold (never
+   *  run away). Every frame _applyShake adds a FRESH transient offset
+   *  to camera.position (never written into CAMERA.pos — nothing
+   *  accumulates into the pose) and _decayShake drains the energy to
+   *  exactly 0 (linear, −dt × CFG.input.shakeDecay). Dev trigger:
+   *  Key N. No objects allocated, nothing rendered ⇒ idle cost is
+   *  structurally zero (0 energy ⇒ _applyShake early-returns).
+   * ------------------------------------------------------------------ */
+  {
+    const reg = await page.evaluate(() => {
+      const S = window.SIM;
+      return {
+        amp: S.CFG.input.shakeAmp,
+        decay: S.CFG.input.shakeDecay,
+        cap: S.CFG.input.shakeCap,
+        impulse: S.CFG.input.shakeImpulse,
+        hasApi: typeof S.CAMERA.shake === 'function',
+        energy: S.CAMERA.shakeEnergy,
+        trigger: S.INPUT.shakeTrigger,
+      };
+    });
+    check('M7.5: camera shake registered — CFG.input tunables, CAMERA.shake API, energy 0, Key N trigger idle',
+      reg.hasApi && reg.amp > 0 && reg.decay > 0 && reg.cap > 0 &&
+      reg.impulse > 0 && reg.energy === 0 && reg.trigger === false,
+      `amp=${reg.amp}, decay=${reg.decay}, cap=${reg.cap},` +
+      ` impulse=${reg.impulse}`);
+
+    /* idle cost zero: 0 energy ⇒ _applyShake early-returns ⇒ the
+     * camera position is untouched (nothing to allocate, nothing to
+     * render — the shake adds no objects at all) */
+    const idle = await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.shakeEnergy = 0;
+      const p = S.camera.position.clone();
+      S.CAMERA._applyShake(0.123);
+      S.CAMERA._applyShake(987.654);
+      return { untouched: S.camera.position.equals(p) };
+    });
+    check('M7.5: idle cost zero — 0 energy ⇒ _applyShake is a no-op (no objects, no materials, no draw calls)',
+      idle.untouched);
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const heapBefore = await heapMin();
+
+    /* deterministic still pose: fixed pos, zero velocity, no input ⇒
+     * any offset from CAMERA.pos is the shake alone */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(-180, 40, 180);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.fov = 60;                  // reset wheel zoom ⇒ deterministic pose
+      S.CAMERA.yaw = 2.22;
+      S.CAMERA.pitch = -0.35;
+    });
+    await sleep(400);
+
+    /* manual Key N shakes: energy rises, the camera position is
+     * offset from the pose, bounded by shakeAmp × energy, and the
+     * offset changes frame to frame (the camera actually shakes —
+     * fresh transient offset each frame, never written into the pose) */
+    await page.keyboard.press('n');
+    await page.waitForFunction(() => window.SIM.CAMERA.shakeEnergy > 0,
+      { timeout: 5000 });
+    const s0 = await page.evaluate(async () => {
+      const S = window.SIM, C = S.CAMERA;
+      const e = C.shakeEnergy;
+      const bounds = [];
+      const mags = [];
+      for (let i = 0; i < 4; i++) {
+        const o = S.camera.position.clone().sub(C.pos).length();
+        mags.push(o);
+        bounds.push(o <= S.CFG.input.shakeAmp * C.shakeEnergy + 1e-6);
+        await new Promise(r => requestAnimationFrame(r));
+      }
+      const lo = Math.min(...mags), hi = Math.max(...mags);
+      return { e, mags, bounded: bounds.every(Boolean),
+        varying: lo > 1e-4 && hi - lo > 1e-3 };
+    });
+    check('M7.5: key N shakes the camera — offset from the pose, bounded by shakeAmp × energy, varies frame to frame',
+      s0.e > 0 && s0.bounded && s0.varying,
+      `e=${s0.e.toFixed(2)}, mags=${s0.mags.map(v => v.toFixed(3)).join(',')}`);
+
+    /* clean decay: energy monotone to exactly 0, then the camera
+     * returns EXACTLY to the pose (0 energy ⇒ _applyShake skipped ⇒
+     * position = pose, no residual offset) */
+    const decay = await page.evaluate(async () => {
+      const S = window.SIM;
+      const rows = [];
+      for (let i = 0; i < 10; i++) {
+        await new Promise(r => requestAnimationFrame(r));
+        rows.push(S.CAMERA.shakeEnergy);
+      }
+      return rows;
+    });
+    const monotone = decay.every(
+      (v, i) => i === 0 || v <= decay[i - 1] + 1e-9);
+    const strict = decay.slice(0, -1).some(
+      (v, i) => decay[i + 1] < v - 1e-9);
+    await page.waitForFunction(() => window.SIM.CAMERA.shakeEnergy === 0,
+      { timeout: 5000 });
+    const still = await page.evaluate(() => {
+      const S = window.SIM, C = S.CAMERA;
+      return { energy: C.shakeEnergy,
+        off: S.camera.position.clone().sub(C.pos).length() };
+    });
+    check('M7.5: shake decays cleanly to still — energy monotone to exactly 0, camera back exactly on the pose',
+      monotone && strict && still.energy === 0 && still.off === 0,
+      `energy=${still.energy}, off=${still.off}`);
+
+    /* never accumulates: rapid re-triggers accumulate up to the cap
+     * and then hold — energy never exceeds CFG.input.shakeCap */
+    for (let i = 0; i < 10; i++) {
+      await page.keyboard.press('n');
+      await sleep(60);
+    }
+    const rep = await page.evaluate(() => ({
+      energy: window.SIM.CAMERA.shakeEnergy,
+      cap: window.SIM.CFG.input.shakeCap,
+    }));
+    check('M7.5: never accumulates — 10 rapid re-triggers hold at the energy cap',
+      rep.energy > 0 && rep.energy <= rep.cap + 1e-9 &&
+      rep.energy >= rep.cap * 0.8,
+      `energy=${rep.energy.toFixed(2)}, cap=${rep.cap}`);
+    await page.waitForFunction(() => window.SIM.CAMERA.shakeEnergy === 0,
+      { timeout: 5000 });
+
+    /* API semantics: a huge impulse clamps to the cap (not sum),
+     * negative intensity is a no-op */
+    const api = await page.evaluate(() => {
+      const S = window.SIM, C = S.CAMERA;
+      C.shakeEnergy = 0;
+      C.shake(10);
+      const clamped = C.shakeEnergy;
+      C.shakeEnergy = 0;
+      C.shake(-1);
+      const neg = C.shakeEnergy;
+      return { clamped, neg, cap: S.CFG.input.shakeCap };
+    });
+    check('M7.5: shake(intensity) semantics — huge impulse clamps to the cap, negative is a no-op',
+      api.clamped === api.cap && api.neg === 0,
+      `clamped=${api.clamped}, neg=${api.neg}`);
+
+    /* heap flat across the whole shake sequence */
+    const heapAfter = await heapMin();
+    check('M7.5: no allocation per shake (heap flat across the shake sequence)',
+      heapBefore > 0 && heapAfter > 0 &&
+      heapAfter - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,` +
+      ` after=${Math.round(heapAfter / 1024)}KB`);
   }
 
   /* ---- 10. No errors anywhere ---- */

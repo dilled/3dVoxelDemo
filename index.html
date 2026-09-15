@@ -220,6 +220,8 @@ const CFG = {
     pitchClamp: { ground: Math.PI * 0.47, cine: Math.PI * 0.485 },
     shakeDecay: 2.4,          // energy/s
     shakeAmp: 0.22,           // metres (energy 1.0 ≈ strong hit)
+    shakeCap: 1.5,            // max energy — repeated triggers never accumulate past this
+    shakeImpulse: 1.0,       // energy added by the manual dev trigger (Key N)
   },
   lights: {
     hemiSky: 0x35507e,
@@ -564,6 +566,7 @@ const INPUT = {
   pulseTrigger: false,        // R edge — dev trigger: FX.pulse ahead
   arcTrigger: false,          // T edge — dev trigger: FX arcs (sub↔sub, creature→ring)
   flashTrigger: false,        // B edge — dev trigger: FX.flash (screen flash)
+  shakeTrigger: false,        // N edge — dev trigger: CAMERA.shake impulse
 
   pad: {
     connected: false,
@@ -582,6 +585,7 @@ const INPUT = {
       if (e.code === 'KeyR' && !e.repeat) INPUT.pulseTrigger = true;
       if (e.code === 'KeyT' && !e.repeat) INPUT.arcTrigger = true;
       if (e.code === 'KeyB' && !e.repeat) INPUT.flashTrigger = true;
+      if (e.code === 'KeyN' && !e.repeat) INPUT.shakeTrigger = true;
       INPUT.keys.add(e.code);
       if (e.code === 'Space') e.preventDefault();
     });
@@ -745,9 +749,12 @@ const CAMERA = {
     CAMERA.fov = camera.fov;
   },
 
-  /* Public shake API: impulse decay, consumed inside update. */
+  /* Public shake API: impulse decay, consumed inside update.
+   * M7.5 — energy clamps to CFG.input.shakeCap ⇒ repeated triggers
+   * accumulate up to the cap and then hold (never run away). */
   shake(intensity = 0.5) {
-    CAMERA.shakeEnergy = Math.min(1.5, CAMERA.shakeEnergy + Math.max(0, intensity));
+    CAMERA.shakeEnergy =
+      Math.min(CFG.input.shakeCap, CAMERA.shakeEnergy + Math.max(0, intensity));
   },
 
   setMode(mode) {
@@ -785,6 +792,15 @@ const CAMERA = {
     // look (mouse px + gamepad pseudo-px)
     const lookX = INPUT.look.x, lookY = INPUT.look.y, zoomN = INPUT.zoom;
     INPUT.look.x = 0; INPUT.look.y = 0; INPUT.zoom = 0;
+
+    /* dev trigger (Key N edge from INPUT): strong shake impulse —
+     * M7.5. The system itself is the impulse-decay energy below:
+     * _applyShake adds a fresh transient offset each frame (never
+     * written into the pose), _decayShake drains it to exactly 0. */
+    if (INPUT.shakeTrigger) {
+      INPUT.shakeTrigger = false;
+      CAMERA.shake(L.shakeImpulse);
+    }
 
     if (INPUT.modeSwitch) {
       INPUT.modeSwitch = false;
@@ -3507,7 +3523,7 @@ const PARTS = {
 
 /* ==================================================================== *
  * FX — pulse (M7.2) + electrical arcs (M7.3) + screen flash (M7.4);
- *     later: shake (M7.5)
+ *     camera shake (M7.5) lives in CAMERA — it is consumed there
  *
  *  - FX.pulse(origin, radius, color): expanding ground ring on ONE
  *    shared InstancedMesh (per-instance color = tint × fade on the
@@ -4484,7 +4500,7 @@ const HUD = {
     HUD.hintEl.textContent =
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
       'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
-      'P particles · R pulse · T arcs · B flash';
+      'P particles · R pulse · T arcs · B flash · N shake';
   },
 
   update(dt) {

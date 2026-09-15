@@ -59,7 +59,7 @@ smoke-test evidence.
 | **M7.2** ✅ | `FX.pulse(origin, radius, color)`: expanding instanced ring mesh + light-intensity ramp (+ audio hook once M11 lands) | Manual key fires a visible pulse; nothing allocated; idle = zero draw calls added |
 | **M7.3** ✅ | Animated electrical arcs: Line segments regenerated every N frames between anchors (substation→substation, creature→ring) | Manual key sparks arcs between two substations and creature→ring; regen is frame-cheap |
 | **M7.4** ✅ | Screen-space flash: overlay-scene additive plane (or DOM div) driven by `FX.flash(intensity)` | Manual key flashes screen; decays to zero; costs nothing idle |
-| **M7.5** | Camera shake: impulse-decay system consumed by `CAMERA` | Manual key shakes camera with clean decay to still; never accumulates |
+| **M7.5** ✅ | Camera shake: impulse-decay system consumed by `CAMERA` | Manual key shakes camera with clean decay to still; never accumulates |
 | **M8.1** | Night sky: gradient sky dome (big sphere, canvas/shader texture), stars, faint aurora band | Night mood readable from street level; dome correct from street, orbit, and far fly |
 | **M8.2** | Fog depth tune + zone-tinted haze (cyan core / warm avenues) via fog color lerp | Depth readable at 500 m; zone tint visible flying across zones |
 | **M8.3** | Volumetric-ish light shafts: a few additive cone/cylinder meshes from key spires + creature core (only when near / during awakening) | Shafts visible near spire, absent far away (no permanent draw calls) |
@@ -418,10 +418,29 @@ pools never allocate per frame.
   noise, not a regression).
 
 #### M7.5 — Impulse camera shake
-- [ ] Impulse-decay shake system consumed by `CAMERA`.
+- [x] Impulse-decay shake system consumed by `CAMERA`.
 - **Test:** manual key shakes camera, decays cleanly to still, never
       accumulates under repeated triggers.
 - **Commit when:** shake verified.
+- **Verified:** smoke M7.5 section green — the system is the impulse-
+  decay energy scalar on `CAMERA` (no pool, no mesh, no material ⇒
+  idle cost structurally zero: 0 energy ⇒ `_applyShake` early-returns,
+  camera position untouched — verified); Key `N` (`INPUT.shakeTrigger`,
+  consumed in `CAMERA.update`) fires `CAMERA.shake(CFG.input.shakeImpulse)`
+  (1.0) ⇒ camera position offset from the deterministic still pose,
+  bounded by `shakeAmp × energy` at every sampled frame, and the offset
+  magnitude varies frame to frame (fresh transient offset each frame,
+  never written into `CAMERA.pos`); decay monotone to exactly 0 with the
+  camera back EXACTLY on the pose (off === 0); never accumulates — 10
+  rapid re-triggers hold at `CFG.input.shakeCap` (1.5, moved out of the
+  hardcoded cap into `CFG.input`), `shake(10)` clamps to the cap, negative
+  is a no-op; heap flat across the whole sequence. No screenshot gate:
+  a 0.22 m offset is sub-pixel at every deterministic pose, so the
+  analytic checks are strictly stronger than a picture. Note: the
+  pre-existing M6.2 "heap flat" smoke check flakes in this headless
+  environment (~2.6–2.7 MB vs the 2 MB bound) — re-verified to fail at
+  the pre-M7.5 baseline too (1 FAIL / 2 PASS in 3 baseline runs),
+  environmental GC noise, not an M7.5 regression.
 
 **Phase done-when:** every effect has a manual trigger key and costs
 nothing while idle.
