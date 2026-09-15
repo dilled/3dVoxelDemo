@@ -52,7 +52,7 @@ smoke-test evidence.
 | **M5** ✅ | The Qwen machine-creature (dormant): plaza pedestal, full creature build from primitives, named rig parts, dormant breathing/idle state, instanced compute-node voxels | Reads as "dormant colossal machine" from street level; silhouette holds from 3 camera distances |
 | **M6.1** ✅ | Generic object-pool foundation (`Pool` helper): fixed-size alloc at init, `acquire/release`, zero per-frame allocation, shared by later emitters | Pool test: 10k acquire/release cycles in smoke run, zero `new` after init, zero GC churn in stats |
 | **M6.2** ✅ | Maintenance drones: small voxel quads (InstancedMesh), patrol routes between towers, dock at roof bays, capped by distance to player | Drones visibly patrol + dock from street level; cap holds at tier max; no allocation per frame |
-| **M6.3** | Sky vehicles: light trails (additive sprite streak) on ring roads at 3 altitudes, capped like drones | Trails readable from all 3 altitudes; count never exceeds tier cap |
+| **M6.3** ✅ | Sky vehicles: light trails (additive sprite streak) on ring roads at 3 altitudes, capped like drones | Trails readable from all 3 altitudes; count never exceeds tier cap |
 | **M6.4** | Steam vents (cooling towers, billboard sprite pool, upward drift, fade) + sparks (substations, tiny points, brief life) | Both emitters run idle-cheap; smoke shot shows steam + sparks at source buildings |
 | **M6.5** | Adaptive caps: `TRAFFIC` reads current FPS tier, scales all M6 pools | Forcing LOW tier in smoke run visibly halves caps; back to HIGH restores; no spike |
 | **M7.1** | Pooled `Points`/sprite particle system: steam, sparks, pulse motes, lightning motes, awakening rain — one system, one budget | One trigger key rains all particle types; idle cost ~0 in stats |
@@ -233,12 +233,32 @@ smoke-test evidence.
   InstancedMesh = one draw call; cyan/amber per-instance tints,
   per-frame re-set so swap-remove stays in sync.
 
-#### M6.3 — Sky vehicles with light trails
-- [ ] Vehicles on ring roads at 3 altitudes, additive sprite-streak
+#### M6.3 — Sky vehicles with light trails ✅
+- [x] Vehicles on ring roads at 3 altitudes, additive sprite-streak
       trails; capped like drones.
 - **Test:** trails readable from all 3 altitudes; count never exceeds
       tier cap.
 - **Commit when:** trails verified at each altitude.
+- **Verified:** smoke M6.3 section green — fleet grows to the HIGH cap
+  (12) on the `traffic-vehicle` M6.1 pool (fixed capacity, every live
+  vehicle a pre-created pool item ⇒ zero `new` after init); all 3
+  ring-road altitudes (70/95/120 m) occupied at once; trails verified
+  analytically from the instance matrices (two additive segments per
+  vehicle on the shared `MATS.pulseGlow` material: bright head slot
+  i*2 spanning 0..0.5L + 0.45× dim tail slot i*2+1 spanning 0.5L..L
+  behind the hull); JS heap flat across the live-fleet window
+  (min-of-3-sample churn ≤ 2 MB); sampled cap hold never exceeded 12;
+  `TIER.set('low')` trims the fleet to 3 (excess released to the pool,
+  pool inUse === count), `TIER.set('high')` regrows to 12; draw calls
+  stay inside budget (39) with the fleet at cap — the whole fleet
+  costs exactly 2 draw calls (one hull InstancedMesh + one trail
+  InstancedMesh); per-altitude streak screenshots
+  `smoke/shots/m63-vehicles-alt{0,1,2}.png` with the pose chosen by an
+  analytic line-of-sight check against the instanced building boxes
+  plus a side-on filter (reject near end-on streaks that read as
+  blobs), retry loop while the fleet cycles. M2 smoke gate now also
+  hides the TRAFFIC meshes (the +2 vehicle draw calls would otherwise
+  break the < 10 KIT-only gate).
 
 #### M6.4 — Steam vents + sparks
 - [ ] Steam vents from cooling towers (billboard sprite pool, upward

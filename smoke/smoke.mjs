@@ -87,6 +87,20 @@
  *     HIGH cap; draw calls stay inside budget with the fleet at cap
  *   - street-level screenshot with drones in the air (shots/m62-*.png)
  *
+ *   M6.3 checks (sky vehicles with light trails):
+ *   - vehicle pool ('traffic-vehicle', M6.1, fixed capacity = HIGH tier
+ *     cap); fleet grows to the cap; every live vehicle is a pre-created
+ *     pool item (zero `new` after init); JS heap flat (no per-frame alloc)
+ *   - vehicles run along avenue lines at the 3 configured altitudes;
+ *     all 3 altitudes occupied at once; trails = 2 additive segments
+ *     per vehicle (bright head + dim tail) at the analytic positions
+ *     behind the hull on the shared additive material
+ *   - count never exceeds the tier cap; TIER.set('low') trims to the
+ *     LOW cap (excess released to the pool); TIER.set('high') regrows
+ *   - draw calls inside budget with the fleet at cap
+ *   - one screenshot per altitude with the streak in frame
+ *     (shots/m63-vehicles-alt{0,1,2}.png)
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -453,17 +467,21 @@ try {
       `mats=${kit.mats}`);
 
     // The M2 gate measures the KIT test wall/tower alone: hide the M3
-    // city + M5 creature for a frame or two, read the draw-call count,
-    // show it again.
+    // city + M5 creature + M6 TRAFFIC meshes (drones/vehicles/trails)
+    // for a frame or two, read the draw-call count, show it again.
     await page.evaluate(() => {
       window.SIM.WORLD.root.visible = false;
       window.SIM.ENTITY.root.visible = false;
+      const T = window.SIM.TRAFFIC;
+      for (const m of [T.mesh, T.vmesh, T.tmesh]) if (m) m.visible = false;
     });
     await sleep(250);
     const c1 = await page.evaluate(() => window.SIM.renderer.info.render.calls);
     await page.evaluate(() => {
       window.SIM.WORLD.root.visible = true;
       window.SIM.ENTITY.root.visible = true;
+      const T = window.SIM.TRAFFIC;
+      for (const m of [T.mesh, T.vmesh, T.tmesh]) if (m) m.visible = true;
     });
     check('M2 gate: test wall/tower (city + creature hidden) renders at < 10 draw calls',
       Number.isInteger(c1) && c1 >= 1 && c1 < 10,
@@ -1153,6 +1171,302 @@ try {
     }
     check('M6.2: street-level screenshot with drones written (shots/m62-drones-street.png)',
       shotOk, `target drone=${d ? `(${d.px.toFixed(0)}, ${d.py.toFixed(0)}, ${d.pz.toFixed(0)})` : 'none in frame'}`);
+  }
+
+  /* ------------------------------------------------------------------
+   * M6.3 — sky vehicles with light trails (TRAFFIC)
+   * ------------------------------------------------------------------ */
+  {
+    const vcap = await page.evaluate(() => {
+      const S = window.SIM;
+      return (S.TRAFFIC && S.TRAFFIC.vmesh &&
+        S.CFG.traffic.vehicle.tiers[S.TIER.active()]) || 0;
+    });
+    check('M6.3: sky vehicles registered with a pool (M6.1) + tier cap',
+      vcap > 0,
+      `tier=${await page.evaluate(() => window.SIM.TIER.active())}, cap=${vcap}`);
+
+    /* fleet grows to the tier cap — spawns are gated by the fixed pool */
+    await page.waitForFunction(c => {
+      const S = window.SIM;
+      return S.TRAFFIC && S.TRAFFIC.vcount === c;
+    }, vcap, { timeout: 120000 });
+
+    /* all 3 ring-road altitudes occupied at once (random lane picks ⇒
+     * wait for the simultaneous state; each vehicle flies ~18 s, so
+     * this resolves quickly) */
+    const alts = await page.evaluate(() => window.SIM.CFG.traffic.vehicle.altitudes);
+    await page.waitForFunction(n => {
+      const S = window.SIM;
+      const seen = new Set();
+      for (let i = 0; i < S.TRAFFIC.vcount; i++) seen.add(S.TRAFFIC._vLive[i].alt);
+      return seen.size === n;
+    }, 3, { timeout: 60000 });
+
+    const b0 = await page.evaluate(async () => {
+      const S = window.SIM;
+      const T = S.TRAFFIC;
+      const v = S.CFG.traffic.vehicle;
+      const pool = S.POOL.list.find(p => p.name === 'traffic-vehicle');
+      const live = T._vLive.slice(0, T.vcount);
+      window.__m63 = {
+        snaps: live.map(it => ({ ref: it, x: it.px, y: it.py, z: it.pz })),
+      };
+      async function heapMin() {
+        let m = Infinity;
+        for (let i = 0; i < 3; i++) {
+          if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+          await new Promise(r => setTimeout(r, 400));
+        }
+        return m === Infinity ? -1 : m;
+      }
+      const heapBefore = await heapMin();
+      /* analytic trail check: both streak segments sit behind the hull
+       * on the avenue line, half-length L/2, at the hull altitude —
+       * read from the instance matrices themselves (both meshes are
+       * written in the same update() tick, so they are consistent)
+       * with the hull position taken from the hull matrix. */
+      const varr = T.vmesh.instanceMatrix.array;
+      const tarr = T.tmesh.instanceMatrix.array;
+      let trailOk = true;
+      for (let i = 0; i < T.vcount; i++) {
+        const it = T._vLive[i];
+        const L = it.trailLen, W = v.trailW;
+        const vx = varr[i * 16 + 12], vy = varr[i * 16 + 13], vz = varr[i * 16 + 14];
+        const hx = vx - (it.axis === 0 ? 0 : it.dir * L * 0.25);
+        const hz = vz - (it.axis === 0 ? it.dir * L * 0.25 : 0);
+        const tx = vx - (it.axis === 0 ? 0 : it.dir * L * 0.75);
+        const tz = vz - (it.axis === 0 ? it.dir * L * 0.75 : 0);
+        /* head streak = slot i*2, tail streak = slot i*2+1 */
+        const ho = i * 2 * 16, to = ho + 16;
+        const len = it.axis === 0 ? tarr[ho + 10] : tarr[ho];
+        const wid = it.axis === 0 ? tarr[ho] : tarr[ho + 10];
+        const ok =
+          Math.abs(len - L / 2) < 1e-3 && Math.abs(wid - W) < 1e-3 &&
+          Math.abs(tarr[ho + 12] - hx) < 1e-3 &&
+          Math.abs(tarr[ho + 13] - vy) < 1e-3 &&
+          Math.abs(tarr[ho + 14] - hz) < 1e-3 &&
+          Math.abs(tarr[to + 12] - tx) < 1e-3 &&
+          Math.abs(tarr[to + 13] - vy) < 1e-3 &&
+          Math.abs(tarr[to + 14] - tz) < 1e-3;
+        if (!ok) { trailOk = false; break; }
+      }
+      return {
+        count: T.vcount,
+        heapBefore,
+        poolCap: pool ? pool.capacity : -1,
+        inUse: pool ? pool.capacity - pool.top : -1,
+        zeroNew: !!pool && live.every(it =>
+          it.__pool === pool && it.__free === false),
+        altOccupied: [...new Set(live.map(it => it.alt))].length,
+        tmeshCount: T.tmesh.count,
+        trailOk,
+        additive: T.tmesh.material.blending === 2, /* THREE.AdditiveBlending */
+        calls: S.renderer.info.render.calls,
+      };
+    });
+    check('M6.3: fleet grows to the tier cap (one hull + one trail InstancedMesh)',
+      b0.count === vcap && b0.poolCap === vcap && b0.inUse === b0.count &&
+      b0.tmeshCount === b0.count * 2,
+      `count=${b0.count}, poolCap=${b0.poolCap}, inUse=${b0.inUse}, trails=${b0.tmeshCount}`);
+    check('M6.3: every live vehicle is a pre-created pool item (zero `new` after init)',
+      b0.zeroNew === true, `live=${b0.count}`);
+    check('M6.3: all 3 ring-road altitudes occupied at once',
+      b0.altOccupied === 3,
+      `altitudes=${JSON.stringify(alts)}`);
+    check('M6.3: light trails = fading additive streaks behind each hull',
+      b0.trailOk && b0.additive === true,
+      'head 0..L/2 + tail L/2..L behind hull, shared additive material');
+
+    /* movement + no per-frame allocation across a live-fleet window */
+    await sleep(2500);
+    const b1 = await page.evaluate(async () => {
+      const T = window.SIM.TRAFFIC;
+      let moved = 0, releasedGone = 0;
+      const liveSet = T._vLive.slice(0, T.vcount);
+      for (const s of window.__m63.snaps) {
+        if (!liveSet.includes(s.ref)) { releasedGone++; continue; }
+        const dx = s.ref.px - s.x, dy = s.ref.py - s.y, dz = s.ref.pz - s.z;
+        if (dx * dx + dy * dy + dz * dz > 1) moved++;
+      }
+      async function heapMin() {
+        let m = Infinity;
+        for (let i = 0; i < 3; i++) {
+          if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+          await new Promise(r => setTimeout(r, 400));
+        }
+        return m === Infinity ? -1 : m;
+      }
+      return { moved, releasedGone, heap: await heapMin() };
+    });
+    check('M6.3: vehicles visibly fly along the ring roads',
+      b1.moved > 0, `moved=${b1.moved}, released=${b1.releasedGone}`);
+    check('M6.3: no allocation per frame (heap flat with the fleet alive)',
+      b0.heapBefore > 0 && b1.heap > 0 && b1.heap - b0.heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(b0.heapBefore / 1024)}KB, after=${Math.round(b1.heap / 1024)}KB`);
+
+    /* count never exceeds the tier cap (sampled while the fleet cycles) */
+    const capHold = await page.evaluate(async () => {
+      const S = window.SIM;
+      const cap = S.CFG.traffic.vehicle.tiers[S.TIER.active()];
+      for (let i = 0; i < 10; i++) {
+        if (S.TRAFFIC.vcount > cap) return false;
+        await new Promise(r => setTimeout(r, 150));
+      }
+      return true;
+    });
+    check('M6.3: count never exceeds the tier cap', capHold === true,
+      `cap=${await page.evaluate(() => window.SIM.CFG.traffic.vehicle.tiers.high)}`);
+
+    /* tier cap: LOW trims the fleet, HIGH regrows it */
+    const lowCap = await page.evaluate(() => window.SIM.CFG.traffic.vehicle.tiers.low);
+    await page.evaluate(() => window.SIM.TIER.set('low'));
+    await page.waitForFunction(c => window.SIM.TRAFFIC.vcount <= c, lowCap,
+      { timeout: 5000 });
+    const tLow = await page.evaluate(() => {
+      const S = window.SIM;
+      const pool = S.POOL.list.find(p => p.name === 'traffic-vehicle');
+      return { count: S.TRAFFIC.vcount, inUse: pool.capacity - pool.top };
+    });
+    check('M6.3: LOW tier trims the fleet to its cap (excess released to the pool)',
+      tLow.count <= lowCap && tLow.inUse === tLow.count,
+      `count=${tLow.count}, cap=${lowCap}, pool inUse=${tLow.inUse}`);
+    await page.evaluate(() => window.SIM.TIER.set('high'));
+    await page.waitForFunction(c => window.SIM.TRAFFIC.vcount === c, vcap,
+      { timeout: 120000 });
+    check('M6.3: HIGH tier restores the full fleet (regrows on spawn ticks)',
+      (await page.evaluate(() => window.SIM.TRAFFIC.vcount)) === vcap,
+      `count restored to ${vcap}`);
+
+    /* draw-call budget with the fleet at cap */
+    const calls = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    check('M6.3: draw calls inside budget with the fleet at cap',
+      calls > 0 && calls < 150, `calls=${calls}`);
+
+    /* visual gate: one screenshot per altitude with the streak in
+     * frame. The camera stands 150 m further out on the plaza→vehicle
+     * bearing and aims at the streak midpoint; analytic line-of-sight
+     * against the instanced building boxes (same test as M6.2) rejects
+     * occluded candidates. */
+    const shotOk = [false, false, false];
+    for (let a = 0; a < 3; a++) {
+      /* retry until a vehicle at this altitude is inside the 60–260 m
+       * ring with a clear line of sight (the fleet keeps cycling) */
+      let d = null;
+      for (let tries = 0; tries < 40 && !d; tries++) {
+        d = await page.evaluate((alt) => {
+        const S = window.SIM, T = S.TRAFFIC;
+        const cands = [];
+        for (let i = 0; i < T.vcount; i++) {
+          const it = T._vLive[i];
+          if (it.alt !== alt) continue;
+          const dist = Math.hypot(it.px, it.pz);
+          if (dist < 60 || dist > 260) continue;
+          cands.push({ px: it.px, py: it.py, pz: it.pz,
+            dir: it.dir, axis: it.axis, len: it.trailLen });
+        }
+        cands.sort((A, B) => (Math.hypot(A.px, A.pz) - Math.hypot(B.px, B.pz)));
+        const boxes = [];
+        for (const ch of S.WORLD.chunks.values()) {
+          if (!ch.group || !ch.group.visible) continue;
+          for (const b of [ch.boxA, ch.boxG, ch.cyl, ch.ledWin])
+            if (b && b.count > 0) boxes.push(b);
+        }
+        /* scratch clones of the app's own matrices (THREE is module-
+         * scoped, not on window — same trick as the M6.2 section) */
+        const inv = T._vm.clone();
+        const la = T._vp.clone();
+        function segHits(arr, o, ax, ay, az, bx, by, bz) {
+          inv.fromArray(arr, o);
+          inv.invert();
+          const p = la.set(ax, ay, az).applyMatrix4(inv);
+          const px = p.x, py = p.y, pz = p.z;
+          const q = la.set(bx, by, bz).applyMatrix4(inv);
+          const pp = [px, py, pz], qq = [q.x, q.y, q.z];
+          let t0 = 0, t1 = 1;
+          for (let k = 0; k < 3; k++) {
+            const dK = qq[k] - pp[k];
+            if (Math.abs(dK) < 1e-9) {
+              if (pp[k] < -0.5 || pp[k] > 0.5) return false;
+            } else {
+              let te = (-0.5 - pp[k]) / dK, tx = (0.5 - pp[k]) / dK;
+              if (te > tx) { const tm = te; te = tx; tx = tm; }
+              if (t0 < te) t0 = te;
+              if (t1 > tx) t1 = tx;
+              if (t0 > t1) return false;
+            }
+          }
+          return true;
+        }
+        function occluded(ax, ay, az, bx, by, bz) {
+          const dx = bx - ax, dy = by - ay, dz = bz - az;
+          const l2 = dx * dx + dy * dy + dz * dz;
+          for (const b of boxes) {
+            const arr = b.mesh.instanceMatrix.array;
+            for (let i = 0; i < b.count; i++) {
+              const o = i * 16;
+              const cx = arr[o + 12], cy = arr[o + 13], cz = arr[o + 14];
+              const sx = Math.abs(arr[o]) + Math.abs(arr[o + 1]) + Math.abs(arr[o + 2]);
+              const sy = Math.abs(arr[o + 4]) + Math.abs(arr[o + 5]) + Math.abs(arr[o + 6]);
+              const sz = Math.abs(arr[o + 8]) + Math.abs(arr[o + 9]) + Math.abs(arr[o + 10]);
+              const tt = ((cx - ax) * dx + (cy - ay) * dy + (cz - az) * dz) / l2;
+              if (tt < 0 || tt > 1) continue;
+              const px = ax + dx * tt, py = ay + dy * tt, pz = az + dz * tt;
+              const ex = Math.max(sx, sy, sz) * 0.5 + 1;
+              const ex2 = cx - px, ey = cy - py, ez = cz - pz;
+              if (ex2 * ex2 + ey * ey + ez * ez > ex * ex) continue;
+              if (segHits(arr, o, ax, ay, az, bx, by, bz)) return true;
+            }
+          }
+          return false;
+        }
+        for (const c of cands) {
+          const dist = Math.hypot(c.px, c.pz);
+          const ux = c.px / dist, uz = c.pz / dist;
+          /* side-on view: the streak runs along the avenue line while the
+           * camera sits on the radial bearing, so the streak's apparent
+           * length is sin(angle); reject near end-on candidates (blob,
+           * not a readable trail) */
+          if (Math.abs(c.axis === 0 ? uz : ux) > 0.5) continue;
+          const camX = c.px + ux * 150, camZ = c.pz + uz * 150;
+          const midX = c.px - (c.axis === 0 ? 0 : c.dir * c.len * 0.5);
+          const midZ = c.pz - (c.axis === 0 ? c.dir * c.len * 0.5 : 0);
+          if (occluded(camX, 2, camZ, c.px, c.py, c.pz)) continue;
+          if (occluded(camX, 2, camZ, midX, c.py, midZ)) continue;
+          const dx = midX - camX, dy = c.py - 2, dz = midZ - camZ;
+          return { px: c.px, py: c.py, pz: c.pz, x: camX, z: camZ,
+            yaw: Math.atan2(-dx, -dz),
+            pitch: Math.atan2(dy, Math.hypot(dx, dz)) };
+        }
+        return null;
+        }, alts[a]);
+        if (!d) await sleep(500);
+      }
+      if (d) {
+        await page.evaluate(({ x, z, yaw, pitch }) => {
+          const S = window.SIM;
+          S.CAMERA.pos.set(x, 2, z);
+          S.CAMERA.vel.set(0, 0, 0);
+          S.CAMERA.yaw = yaw;
+          S.CAMERA.pitch = pitch;
+        }, d);
+        await sleep(300);
+        await page.screenshot({ path: `${here}/shots/m63-vehicles-alt${a}.png` });
+        shotOk[a] = fs.existsSync(`${here}/shots/m63-vehicles-alt${a}.png`);
+        /* reset to the spawn pose for the remaining checks */
+        await page.evaluate(() => {
+          const S = window.SIM;
+          S.CAMERA.pos.set(0, 4, 18);
+          S.CAMERA.vel.set(0, 0, 0);
+          S.CAMERA.yaw = 0;
+          S.CAMERA.pitch = 0;
+        });
+        await sleep(250);
+      }
+    }
+    check('M6.3: streak screenshots at all 3 altitudes (shots/m63-vehicles-alt{0,1,2}.png)',
+      shotOk.every(Boolean),
+      `alt0=${shotOk[0]}, alt1=${shotOk[1]}, alt2=${shotOk[2]}`);
   }
 
   /* ---- 10. No errors anywhere ---- */

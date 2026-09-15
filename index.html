@@ -267,7 +267,8 @@ const CFG = {
     ledTexture: 0,               // 0 = ledA / 1 = ledB (picked per building)
   },
 
-  /* ---- M6.2: traffic — drones & sky vehicles (drones only in 6.2) ----
+  /* ---- M6.2: traffic — drones & sky vehicles (M6.2 drones, M6.3
+   * sky vehicles: same cap/pool pattern) ----
    * Drones dock on tower rooftops (the M3 building seeds are replayed
    * for placement — see WORLD.buildingAt) and patrol between towers at
    * roof level. One shared InstancedMesh for every drone (one draw
@@ -287,6 +288,19 @@ const CFG = {
                                             // (clears crowns / M4 roof signs)
       dockTime: [3, 9],                      // s at the dock before leaving
       size: 2.0,                             // overall drone scale (m-ish)
+    },
+    /* M6.3: sky vehicles — light-trail streaks on the ring roads at
+     * 3 altitudes, same cap/pool pattern as the drones. */
+    vehicle: {
+      tiers: { high: 12, med: 7, low: 3 },  // per-TIER.active() caps
+      spawnInterval: 0.6,                   // s between spawn attempts
+      radius: 300,                          // hold radius around the player
+      releaseFactor: 1.25,                  // release past radius*factor
+      altitudes: [70, 95, 120],             // the 3 ring-road lanes (m)
+      speed: [26, 44],                      // m/s
+      size: 1.6,                            // hull scale (m-ish)
+      trailLen: [10, 16],                  // streak length (m)
+      trailW: 1.1,                         // streak width / height (m)
     },
   },
 };
@@ -2098,6 +2112,21 @@ const POOL = {
  *    whose dock drifted beyond radius*releaseFactor from the player is
  *    released back to the pool (the M6.5 tier system builds on the
  *    same TIER seam — auto-detect is M14.1)
+ *
+ *  M6.3 — sky vehicles (ring-road light trails):
+ *  - each vehicle flies at constant speed along one avenue line (the
+ *    ring roads: avenues every 5 blocks ⇒ centerlines at 120k + 12 m,
+ *    the exact grid WORLD._skipBlock keeps clear) at one of 3 fixed
+ *    altitudes (CFG.traffic.vehicle.altitudes — above every building
+ *    and the creature, so the trails read from street level)
+ *  - hull: one shared InstancedMesh (merged voxel craft, unlit basic —
+ *    per-instance color IS the tint); trail: one shared additive
+ *    InstancedMesh of thin boxes, two instances per vehicle (bright
+ *    head + dim tail = a fading streak) on the shared MATS.pulseGlow
+ *    material — the whole fleet costs exactly 2 draw calls
+ *  - state lives in the M6.1 pool 'traffic-vehicle' (fixed capacity =
+ *    HIGH tier cap ⇒ zero `new` after init); same tier cap + farthest-
+ *    release trim + hold-radius release as the drones
  * --------------------------------------------------------------------- */
 const TRAFFIC = {
   name: 'TRAFFIC',
@@ -2115,6 +2144,20 @@ const TRAFFIC = {
   _s: new THREE.Vector3(1, 1, 1),
   _y: new THREE.Vector3(0, 1, 0),
   _tint: new THREE.Color(),
+  /* M6.3 vehicle scratch (zero per-frame allocation) */
+  vmesh: null,                 // hulls (one draw call)
+  tmesh: null,                 // additive trail streaks (one draw call)
+  vpool: null,
+  vcount: 0,                   // live vehicles (= vmesh.count)
+  _vLive: null,
+  _vSpawnTimer: 0,
+  _vCap: 12,
+  _vm: new THREE.Matrix4(),
+  _vp: new THREE.Vector3(),
+  _vq: new THREE.Quaternion(),
+  _vqI: new THREE.Quaternion(),
+  _vs: new THREE.Vector3(1, 1, 1),
+  _vtint: new THREE.Color(),
 
   init() {
     /* drone body: merged voxel quad — chassis + 4 rotors + sensor nub
@@ -2162,11 +2205,51 @@ const TRAFFIC = {
       tint: new THREE.Color(0x9fe8ff),
     }));
 
+    /* ---- M6.3: sky vehicles (ring-road light trails) ---- */
+    const vgeo = KIT.mergeGeometries([
+      { geo: new THREE.BoxGeometry(0.7, 0.35, 2.2) },                  // hull
+      { geo: new THREE.BoxGeometry(1.7, 0.12, 0.55),
+        matrix: new THREE.Matrix4().makeTranslation(0, 0.1, -0.1) },   // wing
+      { geo: new THREE.BoxGeometry(0.14, 0.55, 0.4),
+        matrix: new THREE.Matrix4().makeTranslation(0, 0.25, -0.95) }, // tail fin
+    ]);
+    TRAFFIC.vmesh = new THREE.InstancedMesh(
+      vgeo, new THREE.MeshBasicMaterial({ color: 0xffffff }), 12);
+    TRAFFIC.vmesh.count = 0;
+    TRAFFIC.vmesh.frustumCulled = false;
+    TRAFFIC.vmesh.name = 'sky-vehicles';
+    scene.add(TRAFFIC.vmesh);
+
+    /* trail streaks: thin additive boxes on the shared pulseGlow
+     * material (white base ⇒ the per-instance color IS the light).
+     * Two instances per vehicle: bright head + dim tail behind the
+     * hull — a fading streak readable from any angle (the box has
+     * height, so it is not edge-on from street level). */
+    TRAFFIC.tmesh = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(1, 1, 1), MATS.pulseGlow, 24);
+    TRAFFIC.tmesh.count = 0;
+    TRAFFIC.tmesh.frustumCulled = false;
+    TRAFFIC.tmesh.name = 'sky-trails';
+    scene.add(TRAFFIC.tmesh);
+
+    TRAFFIC._vLive = new Array(12);
+    TRAFFIC.vpool = POOL.make('traffic-vehicle', 12, () => ({
+      axis: 0,             // 0 = z-line (x fixed) / 1 = x-line (z fixed)
+      lane: 0,            // fixed avenue coordinate (m)
+      dir: 1,             // travel direction along the line
+      alt: 70,            // lane altitude (m)
+      px: 0, py: 0, pz: 0,
+      speed: 30, size: 1.6, trailLen: 12, phase: 0,
+      tint: new THREE.Color(0x6fe3ff),
+    }));
+
     /* persistent rng: spawn planning is deterministic per page load
      * (seeded once; every call draws from the same stream) */
     TRAFFIC._rng = mulberry32(CFG.city.seed ^ 0x5d37);
     TRAFFIC._spawnTimer = 0;
+    TRAFFIC._vSpawnTimer = 0;
     TRAFFIC._cap = CFG.traffic.drone.tiers[TIER.name];
+    TRAFFIC._vCap = CFG.traffic.vehicle.tiers[TIER.name];
   },
 
   update(dt, t) {
@@ -2245,6 +2328,86 @@ const TRAFFIC = {
     if (TRAFFIC.count > 0) {
       mesh.instanceMatrix.needsUpdate = true;
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    }
+
+    /* ---- M6.3: sky vehicles (ring-road light trails) ---- */
+    const v = CFG.traffic.vehicle;
+    /* tier cap: trim the farthest vehicles down to the tier limit */
+    TRAFFIC._vCap = v.tiers[TIER.name];
+    while (TRAFFIC.vcount > TRAFFIC._vCap) {
+      let fi = -1, fd = -1;
+      for (let i = 0; i < TRAFFIC.vcount; i++) {
+        const it = TRAFFIC._vLive[i];
+        const dist2 =
+          (it.px - CAMERA.pos.x) * (it.px - CAMERA.pos.x) +
+          (it.pz - CAMERA.pos.z) * (it.pz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      TRAFFIC._vReleaseAt(fi >= 0 ? fi : TRAFFIC.vcount - 1);
+    }
+
+    /* spawn attempts (persistent rng — zero allocations) */
+    TRAFFIC._vSpawnTimer -= dt;
+    if (TRAFFIC._vSpawnTimer <= 0 && TRAFFIC.vcount < TRAFFIC._vCap) {
+      TRAFFIC._vSpawnTimer = v.spawnInterval;
+      const it = TRAFFIC.vpool.acquire();
+      if (it) TRAFFIC._spawnVehicle(it);
+      else TRAFFIC._vSpawnTimer = v.spawnInterval * 2;  // pool full, retry
+    }
+
+    /* per-frame flight update (tight loop, pre-allocated state) */
+    const vmesh = TRAFFIC.vmesh, tmesh = TRAFFIC.tmesh;
+    for (let i = TRAFFIC.vcount - 1; i >= 0; i--) {
+      const it = TRAFFIC._vLive[i];
+      /* constant-speed run along the avenue line */
+      if (it.axis === 0) it.pz += it.dir * it.speed * dt;
+      else it.px += it.dir * it.speed * dt;
+      /* hold radius: flew past the player → back to the pool */
+      const drx = it.px - CAMERA.pos.x, drz = it.pz - CAMERA.pos.z;
+      if (drx * drx + drz * drz >
+          v.radius * v.releaseFactor * v.radius * v.releaseFactor) {
+        TRAFFIC._vReleaseAt(i); continue;
+      }
+      /* hull pose (geometry faces +Z; yaw = travel heading) */
+      const yaw = it.axis === 0
+        ? (it.dir > 0 ? 0 : Math.PI)
+        : (it.dir > 0 ? Math.PI / 2 : -Math.PI / 2);
+      TRAFFIC._vp.set(it.px, it.py, it.pz);
+      TRAFFIC._vq.setFromAxisAngle(TRAFFIC._y, yaw);
+      TRAFFIC._vs.set(it.size, it.size, it.size);
+      TRAFFIC._vm.compose(TRAFFIC._vp, TRAFFIC._vq, TRAFFIC._vs);
+      vmesh.setMatrixAt(i, TRAFFIC._vm);
+      /* re-set tint every frame: swap-remove in _vReleaseAt moves
+       * vehicles between slots, and instance colors are per-SLOT */
+      vmesh.setColorAt(i, it.tint);
+      /* trail: two additive segments behind the hull — bright head
+       * (0..L/2) + dim tail (L/2..L), re-set every frame (same
+       * per-slot invariant as the drones) */
+      const L = it.trailLen, W = v.trailW;
+      const hx = it.px - (it.axis === 0 ? 0 : it.dir * L * 0.25);
+      const hz = it.pz - (it.axis === 0 ? it.dir * L * 0.25 : 0);
+      TRAFFIC._vp.set(hx, it.py, hz);
+      TRAFFIC._vs.set(
+        it.axis === 0 ? W : L / 2, W * 0.6, it.axis === 0 ? L / 2 : W);
+      TRAFFIC._vm.compose(TRAFFIC._vp, TRAFFIC._vqI, TRAFFIC._vs);
+      tmesh.setMatrixAt(i * 2, TRAFFIC._vm);
+      tmesh.setColorAt(i * 2, it.tint);
+      const tx = it.px - (it.axis === 0 ? 0 : it.dir * L * 0.75);
+      const tz = it.pz - (it.axis === 0 ? it.dir * L * 0.75 : 0);
+      TRAFFIC._vp.set(tx, it.py, tz);
+      TRAFFIC._vm.compose(TRAFFIC._vp, TRAFFIC._vqI, TRAFFIC._vs);
+      tmesh.setMatrixAt(i * 2 + 1, TRAFFIC._vm);
+      TRAFFIC._vtint.setRGB(
+        it.tint.r * 0.45, it.tint.g * 0.45, it.tint.b * 0.45);
+      tmesh.setColorAt(i * 2 + 1, TRAFFIC._vtint);
+    }
+    vmesh.count = TRAFFIC.vcount;
+    tmesh.count = TRAFFIC.vcount * 2;
+    if (TRAFFIC.vcount > 0) {
+      vmesh.instanceMatrix.needsUpdate = true;
+      if (vmesh.instanceColor) vmesh.instanceColor.needsUpdate = true;
+      tmesh.instanceMatrix.needsUpdate = true;
+      if (tmesh.instanceColor) tmesh.instanceColor.needsUpdate = true;
     }
   },
 
@@ -2356,12 +2519,60 @@ const TRAFFIC = {
     TRAFFIC.pool.release(it);
   },
 
+  /* spawn a sky vehicle on a ring-road avenue line: the avenue
+   * centerlines are at 120k + 12 m (block 0 is an avenue, 24 m
+   * blocks — the exact grid WORLD._skipBlock keeps clear), so pick a
+   * lane index k whose line lies inside the hold radius, then spawn on
+   * the far side of the player so the vehicle flies across the player's
+   * view before it is released. */
+  _spawnVehicle(it) {
+    const v = CFG.traffic.vehicle;
+    const r = TRAFFIC._rng;
+    const p = CAMERA.pos;
+    const axis = r() < 0.5 ? 0 : 1;
+    const c = axis === 0 ? p.x : p.z;
+    const lo = Math.ceil((c - v.radius - 12) / 120);
+    const hi = Math.floor((c + v.radius - 12) / 120);
+    if (hi < lo) { TRAFFIC.vpool.release(it); return; }  // try next tick
+    const lane = 120 * (lo + Math.floor(r() * (hi - lo + 1))) + 12;
+    const dir = r() < 0.5 ? 1 : -1;
+    const alt = v.altitudes[(r() * v.altitudes.length) | 0];
+    const s = (axis === 0 ? p.z : p.x) - dir * v.radius * (0.65 + r() * 0.35);
+    it.axis = axis; it.lane = lane; it.dir = dir; it.alt = alt;
+    it.px = axis === 0 ? lane : s;
+    it.py = alt;
+    it.pz = axis === 0 ? s : lane;
+    it.speed = v.speed[0] + r() * (v.speed[1] - v.speed[0]);
+    it.size = v.size * (0.8 + r() * 0.5);
+    it.trailLen = v.trailLen[0] + r() * (v.trailLen[1] - v.trailLen[0]);
+    it.phase = r() * 6.2831853;
+    const roll = r();
+    it.tint.setHex(roll < 0.6 ? 0x6fe3ff : roll < 0.9 ? 0xffc46b : 0xff7bd0);
+    TRAFFIC._vLive[TRAFFIC.vcount++] = it;
+  },
+
+  _vReleaseAt(i) {
+    const it = TRAFFIC._vLive[i];
+    const m = --TRAFFIC.vcount;
+    if (i !== m) TRAFFIC._vLive[i] = TRAFFIC._vLive[m];
+    TRAFFIC._vLive[m] = undefined;
+    TRAFFIC.vpool.release(it);
+  },
+
   dispose() {
     for (let i = TRAFFIC.count - 1; i >= 0; i--) TRAFFIC._releaseAt(i);
+    for (let i = TRAFFIC.vcount - 1; i >= 0; i--) TRAFFIC._vReleaseAt(i);
     if (TRAFFIC.mesh) {
       scene.remove(TRAFFIC.mesh);
       TRAFFIC.mesh.geometry.dispose();
       TRAFFIC.mesh.material.dispose();
+    }
+    for (const m of [TRAFFIC.vmesh, TRAFFIC.tmesh]) {
+      if (m) {
+        scene.remove(m);
+        m.geometry.dispose();
+        m.material.dispose();
+      }
     }
   },
 };

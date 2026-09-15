@@ -1,11 +1,12 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-09-15T10:31:49.179Z._
+_Auto-generated. Last updated 2026-09-15T12:53:51.581Z._
 
 - [entity-system-m5](pages/entity-system-m5.md) — category: decision | tags: [entity, m5, creature, instancing] | ENTITY is the 6th system in the fixed boot order (INPUT → CAMERA → KIT → WORLD → **ENTITY** → HUD), registered between WORLD and HUD in `ind
 - [m2-material-kit](pages/m2-material-kit.md) — category: decision | tags: [kit, materials, draw-calls, three] | M2's `KIT` system is the shared foundation every later visual milestone builds on:
 - [m61-object-pool](pages/m61-object-pool.md) — category: decision | tags: [pool, traffic, m6, performance] | `POOL` (top-level module in `index.html`, exposed as `window.SIM.POOL`) is the single object-pool foundation all M6/M7 emitters (drones, veh
 - [m62-traffic-drones](pages/m62-traffic-drones.md) — category: decision | tags: [m6, traffic, pool, tier] | ## Decided
+- [m63-traffic-vehicles](pages/m63-traffic-vehicles.md) — category: decision | tags: [m6, traffic, pool, tier, vehicles] | ## Decided
 - [near-layer-detail-pass](pages/near-layer-detail-pass.md) — category: decision | tags: [m4, detail, instancing] | ## Decision
 - [pi-runner-plan-format](pages/pi-runner-plan-format.md) — category: decision | tags: [plan, pi-runner, formatting] | The `## Milestones` section of `PLAN.md` must use the same format as `.
 - [smoke-harness-dev-tooling](pages/smoke-harness-dev-tooling.md) — category: decision | tags: [testing, smoke, playwright, tooling] | The smoke harness lives in `smoke/` (dev tooling only, not part of the product): `node smoke/smoke.mjs [url]` serves the project root on :83
