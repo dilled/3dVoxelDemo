@@ -302,6 +302,30 @@ const CFG = {
       trailLen: [10, 16],                  // streak length (m)
       trailW: 1.1,                         // streak width / height (m)
     },
+    /* M6.4: steam vents — billboard sprite pool on cooling towers */
+    steam: {
+      tiers: { high: 48, med: 28, low: 12 },  // per-TIER.active() caps
+      spawnInterval: 0.12,                  // s between puff spawns
+      radius: 200,                          // source search radius (metres)
+      innerRadius: 20,                      // keep clear of the player
+      releaseFactor: 1.25,                  // release past radius*factor
+      life: [5, 8],                         // s per puff
+      rise: [2.2, 3.2],                    // m/s upward drift
+      size: [2.2, 3.8],                    // billboard size (m) at birth
+      grow: 1.6,                           // size multiplier over life
+    },
+    /* M6.4: sparks — tiny additive points on substations (brief life) */
+    spark: {
+      tiers: { high: 64, med: 36, low: 18 },  // per-TIER.active() caps
+      spawnInterval: 0.3,                   // s between spark bursts
+      radius: 170,                          // source search radius (metres)
+      innerRadius: 16,                      // keep clear of the player
+      releaseFactor: 1.25,                  // release past radius*factor
+      life: [0.35, 0.9],                   // s per spark (brief)
+      speed: [1.5, 4],                    // m/s sideways kick
+      burst: [1, 3],                     // sparks per burst
+      gravity: 3.2,                      // m/s² downward pull
+    },
   },
 };
 
@@ -1383,10 +1407,15 @@ const WORLD = {
    * Runs the EXACT seeded path of _fill (occupancy → archetype → mass)
    * into a no-op sink, so drone routes land where mass actually is.
    * Pure: no chunk state touched. `ring` must be the block's current
-   * player-relative chunk ring (occupancy depends on it, like _fill). */
+   * player-relative chunk ring (occupancy depends on it, like _fill).
+   * M6.4: `archs` / `minH` are overridable (defaults keep the drone-
+   * dock behaviour) so emitters can source other archetypes (cool,
+   * sub) at any height. */
   _sink: { add() {} },
   _sinkCh: null,   // pre-allocated sink chunk (no per-call allocation)
-  buildingAt(bx, bz, ring) {
+  buildingAt(bx, bz, ring,
+             archs = CFG.traffic.drone.dockArchetypes,
+             minH = CFG.traffic.drone.minH) {
     if (WORLD._sinkCh === null) {
       WORLD._sinkCh = {
         boxA: WORLD._sink, boxG: WORLD._sink, cyl: WORLD._sink,
@@ -1401,10 +1430,10 @@ const WORLD = {
     const zone = dist < 220 ? 'core' : dist < 520 ? 'mid' : 'outer';
     const fall = 0.35 + 0.65 * Math.exp(-dist * 0.0045);
     const arch = WORLD._pick(rng, zone);
-    if (!CFG.traffic.drone.dockArchetypes.includes(arch)) return null;
+    if (!archs.includes(arch)) return null;
     const info = WORLD._mass(rng, WORLD._sinkCh, arch,
       CFG.city.archetypes[arch], wx, wz, fall, ring);
-    if (info.h < CFG.traffic.drone.minH) return null;
+    if (info.h < minH) return null;
     return info;
   },
 
@@ -2127,6 +2156,18 @@ const POOL = {
  *  - state lives in the M6.1 pool 'traffic-vehicle' (fixed capacity =
  *    HIGH tier cap ⇒ zero `new` after init); same tier cap + farthest-
  *    release trim + hold-radius release as the drones
+ *
+ *  M6.4 — ambient emitters (steam vents + sparks), same pool pattern:
+ *  - steam: billboard sprite pool — one shared InstancedMesh of glow-
+ *    textured quads (one draw call) that always face the camera;
+ *    puffs spawn at cooling-tower vents (replayed M3 seed, 'cool'),
+ *    rise, sway, grow and fade in/out over 5–8 s
+ *  - sparks: tiny additive Points (one draw call, warm glow texture);
+ *    1–3 spark bursts every 0.3 s at substation roofs (arch 'sub'),
+ *    brief ballistic life (0.35–0.9 s) with flicker and fade
+ *  - state lives in the M6.1 pools 'traffic-steam' / 'traffic-spark'
+ *    (fixed capacity = HIGH tier cap ⇒ zero `new` after init); same
+ *    tier cap + farthest-release trim + source-radius release
  * --------------------------------------------------------------------- */
 const TRAFFIC = {
   name: 'TRAFFIC',
@@ -2158,6 +2199,27 @@ const TRAFFIC = {
   _vqI: new THREE.Quaternion(),
   _vs: new THREE.Vector3(1, 1, 1),
   _vtint: new THREE.Color(),
+  /* M6.4 steam + sparks (zero per-frame allocation) */
+  smesh: null,                 // steam billboard quads (one draw call)
+  spoints: null,               // spark points (one draw call)
+  spool: null,                 // M6.1 pool 'traffic-steam'
+  ppool: null,                 // M6.1 pool 'traffic-spark'
+  scount: 0,                   // live puffs (= smesh.count)
+  pcount: 0,                   // live sparks (= Points drawRange)
+  _sLive: null,
+  _pLive: null,
+  _sCap: 48,
+  _pCap: 64,
+  _sSpawnTimer: 0,
+  _pSpawnTimer: 0,
+  _sm: new THREE.Matrix4(),
+  _sp: new THREE.Vector3(),
+  _ss: new THREE.Vector3(1, 1, 1),
+  _sq: new THREE.Quaternion(),
+  _sqX: new THREE.Quaternion(),
+  _sqY: new THREE.Quaternion(),
+  _stint: new THREE.Color(),
+  _x: new THREE.Vector3(1, 0, 0),
 
   init() {
     /* drone body: merged voxel quad — chassis + 4 rotors + sensor nub
@@ -2243,6 +2305,59 @@ const TRAFFIC = {
       tint: new THREE.Color(0x6fe3ff),
     }));
 
+    /* ---- M6.4: steam vents (billboard sprite pool, cooling towers) ----
+     * One shared InstancedMesh of glow-textured quads: the whole plume
+     * field costs one draw call. The quad is billboarded to the camera
+     * every frame (orientation = camera yaw/pitch); per-instance color
+     * = tint × fade (additive blending ⇒ color IS the alpha). */
+    TRAFFIC.smesh = new THREE.InstancedMesh(
+      new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({
+        map: KIT.tex.glow.tex, color: 0xffffff, transparent: true,
+        depthWrite: false, blending: THREE.AdditiveBlending,
+      }), 48);
+    TRAFFIC.smesh.count = 0;
+    TRAFFIC.smesh.frustumCulled = false;
+    TRAFFIC.smesh.name = 'steam-vents';
+    scene.add(TRAFFIC.smesh);
+    TRAFFIC._sLive = new Array(48);
+    TRAFFIC.spool = POOL.make('traffic-steam', 48, () => ({
+      px: 0, py: 0, pz: 0,     // current puff position (metres)
+      sx: 0, sy: 0, sz: 0,    // vent origin (metres)
+      vy: 2.5, age: 0, life: 6,
+      size0: 2.5, ph: 0,
+      cR: 0.62, cG: 0.72, cB: 0.82,   // vapor tint (× fade per frame)
+    }));
+
+    /* ---- M6.4: sparks (tiny additive points, substations) ----
+     * One Points cloud with per-vertex color = flash × fade; only the
+     * first pcount vertices are drawn (setDrawRange), so an idle spark
+     * emitter costs zero draw calls. */
+    const nP = 64;
+    const sGeo = new THREE.BufferGeometry();
+    sGeo.setAttribute('position',
+      new THREE.BufferAttribute(new Float32Array(nP * 3), 3));
+    sGeo.setAttribute('color',
+      new THREE.BufferAttribute(new Float32Array(nP * 3), 3));
+    TRAFFIC.spoints = new THREE.Points(sGeo, new THREE.PointsMaterial({
+      size: 1.1, sizeAttenuation: true,
+      map: KIT.makeGlowTexture(64, '255,225,170').tex,
+      transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, vertexColors: true,
+    }));
+    sGeo.setDrawRange(0, 0);
+    TRAFFIC.spoints.frustumCulled = false;
+    TRAFFIC.spoints.name = 'sparks';
+    scene.add(TRAFFIC.spoints);
+    TRAFFIC._pLive = new Array(64);
+    TRAFFIC.ppool = POOL.make('traffic-spark', 64, () => ({
+      px: 0, py: 0, pz: 0,     // current position (metres)
+      sx: 0, sy: 0, sz: 0,    // substation origin (metres)
+      vx: 0, vy: 0, vz: 0,
+      age: 0, life: 0.5, ph: 0,
+      cR: 1, cG: 0.85, cB: 0.55,     // hot white-amber (× fade per frame)
+    }));
+
     /* persistent rng: spawn planning is deterministic per page load
      * (seeded once; every call draws from the same stream) */
     TRAFFIC._rng = mulberry32(CFG.city.seed ^ 0x5d37);
@@ -2250,6 +2365,10 @@ const TRAFFIC = {
     TRAFFIC._vSpawnTimer = 0;
     TRAFFIC._cap = CFG.traffic.drone.tiers[TIER.name];
     TRAFFIC._vCap = CFG.traffic.vehicle.tiers[TIER.name];
+    TRAFFIC._sCap = CFG.traffic.steam.tiers[TIER.name];
+    TRAFFIC._pCap = CFG.traffic.spark.tiers[TIER.name];
+    TRAFFIC._sSpawnTimer = 0;
+    TRAFFIC._pSpawnTimer = 0;
   },
 
   update(dt, t) {
@@ -2409,6 +2528,134 @@ const TRAFFIC = {
       tmesh.instanceMatrix.needsUpdate = true;
       if (tmesh.instanceColor) tmesh.instanceColor.needsUpdate = true;
     }
+
+    /* ---- M6.4: steam vents (cooling towers) ---- */
+    const st = CFG.traffic.steam;
+    /* keep the source lists fresh (both emitters share them) */
+    TRAFFIC._srcTimer += dt;
+    if (TRAFFIC._srcTimer >= 4 ||
+        TRAFFIC._coolList.length === 0 || TRAFFIC._subList.length === 0) {
+      TRAFFIC._refreshSources();
+    }
+    /* tier cap: trim the farthest puffs down to the tier limit */
+    TRAFFIC._sCap = st.tiers[TIER.name];
+    while (TRAFFIC.scount > TRAFFIC._sCap) {
+      let fi = 0, fd = -1;
+      for (let i = 0; i < TRAFFIC.scount; i++) {
+        const it = TRAFFIC._sLive[i];
+        const dist2 =
+          (it.px - CAMERA.pos.x) * (it.px - CAMERA.pos.x) +
+          (it.pz - CAMERA.pos.z) * (it.pz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      TRAFFIC._sReleaseAt(fi);
+    }
+
+    /* spawn attempts (persistent rng — zero allocations). Timer
+     * accumulates the frame remainder (while, not if-reset) so the
+     * rate is frame-rate independent — at 17 fps a 0.12 s interval
+     * must still average 8.3 spawns/s, not one per 3 frames. */
+    TRAFFIC._sSpawnTimer -= dt;
+    while (TRAFFIC._sSpawnTimer <= 0 && TRAFFIC.scount < TRAFFIC._sCap) {
+      TRAFFIC._sSpawnTimer += st.spawnInterval;
+      const r = TRAFFIC._rng;
+      const src = TRAFFIC._findSource(r, 'cool', st.radius, st.innerRadius);
+      const it = src ? TRAFFIC.spool.acquire() : null;
+      if (it) TRAFFIC._spawnSteam(it, src);
+      else break;   // no source in range — retry on the next interval
+    }
+
+    /* per-frame drift: rise + sway, grow, fade in/out. Billboard =
+     * camera orientation: the plane's +Z faces the camera for the
+     * current yaw/pitch (orbit mode is transient — close enough). */
+    const smesh = TRAFFIC.smesh;
+    TRAFFIC._sqY.setFromAxisAngle(TRAFFIC._y, CAMERA.yaw);
+    TRAFFIC._sqX.setFromAxisAngle(TRAFFIC._x, CAMERA.pitch);
+    TRAFFIC._sq.copy(TRAFFIC._sqY).multiply(TRAFFIC._sqX);
+    const sR2 = st.radius * st.releaseFactor * st.radius * st.releaseFactor;
+    for (let i = TRAFFIC.scount - 1; i >= 0; i--) {
+      const it = TRAFFIC._sLive[i];
+      it.age += dt;
+      const drx = it.sx - CAMERA.pos.x, drz = it.sz - CAMERA.pos.z;
+      if (it.age >= it.life ||
+          drx * drx + drz * drz > sR2) { TRAFFIC._sReleaseAt(i); continue; }
+      const u = it.age / it.life;
+      it.py += it.vy * dt;
+      it.px += Math.sin(t * 0.9 + it.ph) * 0.4 * dt;   // gentle sway drift
+      it.pz += Math.cos(t * 0.7 + it.ph) * 0.3 * dt;
+      const size = it.size0 * (1 + st.grow * u);
+      TRAFFIC._sp.set(it.px, it.py, it.pz);
+      TRAFFIC._ss.set(size, size, size);
+      TRAFFIC._sm.compose(TRAFFIC._sp, TRAFFIC._sq, TRAFFIC._ss);
+      smesh.setMatrixAt(i, TRAFFIC._sm);
+      /* fade in/out: 0 → tint → 0 over life (additive ⇒ color IS alpha) */
+      const a = Math.sin(u * Math.PI) * 0.30;
+      TRAFFIC._stint.setRGB(it.cR * a, it.cG * a, it.cB * a);
+      smesh.setColorAt(i, TRAFFIC._stint);
+    }
+    smesh.count = TRAFFIC.scount;
+    if (TRAFFIC.scount > 0) {
+      smesh.instanceMatrix.needsUpdate = true;
+      if (smesh.instanceColor) smesh.instanceColor.needsUpdate = true;
+    }
+
+    /* ---- M6.4: sparks (substations) ---- */
+    const sp = CFG.traffic.spark;
+    /* tier cap: trim the farthest sparks down to the tier limit */
+    TRAFFIC._pCap = sp.tiers[TIER.name];
+    while (TRAFFIC.pcount > TRAFFIC._pCap) {
+      let fi = 0, fd = -1;
+      for (let i = 0; i < TRAFFIC.pcount; i++) {
+        const it = TRAFFIC._pLive[i];
+        const dist2 =
+          (it.px - CAMERA.pos.x) * (it.px - CAMERA.pos.x) +
+          (it.pz - CAMERA.pos.z) * (it.pz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      TRAFFIC._pReleaseAt(fi);
+    }
+
+    /* burst attempts (persistent rng — zero allocations), same
+     * frame-rate-independent timer pattern as the steam spawner */
+    TRAFFIC._pSpawnTimer -= dt;
+    while (TRAFFIC._pSpawnTimer <= 0 && TRAFFIC.pcount < TRAFFIC._pCap) {
+      TRAFFIC._pSpawnTimer += sp.spawnInterval;
+      const r = TRAFFIC._rng;
+      const n = sp.burst[0] + Math.floor(r() * (sp.burst[1] - sp.burst[0] + 1));
+      const src = TRAFFIC._findSource(r, 'sub', sp.radius, sp.innerRadius);
+      if (!src) break;   // no source in range — retry on the next interval
+      for (let k = 0; k < n; k++) {
+        const it = TRAFFIC.ppool.acquire();
+        if (!it) break;
+        TRAFFIC._spawnSpark(it, src);
+      }
+    }
+
+    /* per-frame: brief ballistic life, flicker, fade to zero. Only the
+     * first pcount vertices are drawn (setDrawRange) — per-slot buffers,
+     * re-set every frame (swap-remove moves items between slots). */
+    const spts = TRAFFIC.spoints;
+    const sPos = spts.geometry.attributes.position.array;
+    const sCol = spts.geometry.attributes.color.array;
+    const pR2 = sp.radius * sp.releaseFactor * sp.radius * sp.releaseFactor;
+    for (let i = TRAFFIC.pcount - 1; i >= 0; i--) {
+      const it = TRAFFIC._pLive[i];
+      it.age += dt;
+      const drx = it.sx - CAMERA.pos.x, drz = it.sz - CAMERA.pos.z;
+      if (it.age >= it.life ||
+          drx * drx + drz * drz > pR2) { TRAFFIC._pReleaseAt(i); continue; }
+      const u = it.age / it.life;
+      it.vy -= sp.gravity * dt;
+      it.px += it.vx * dt; it.py += it.vy * dt; it.pz += it.vz * dt;
+      sPos[i * 3] = it.px; sPos[i * 3 + 1] = it.py; sPos[i * 3 + 2] = it.pz;
+      const fl = 0.75 + 0.25 * Math.sin(t * 42 + it.ph);
+      const a = (1 - u) * fl;
+      sCol[i * 3] = it.cR * a; sCol[i * 3 + 1] = it.cG * a;
+      sCol[i * 3 + 2] = it.cB * a;
+    }
+    spts.geometry.setDrawRange(0, TRAFFIC.pcount);
+    spts.geometry.attributes.position.needsUpdate = true;
+    spts.geometry.attributes.color.needsUpdate = true;
   },
 
   /* write the instance matrix for drone `it` into TRAFFIC._m */
@@ -2559,15 +2806,129 @@ const TRAFFIC = {
     TRAFFIC.vpool.release(it);
   },
 
+  /* M6.4 — source search for the ambient emitters. A 200 m radius holds
+   * only ~10 source blocks, so blind random-block draws would starve the
+   * emitters (per-draw hit rate ~5%). Instead: a small live list of the
+   * source buildings near the player, rebuilt every few seconds from the
+   * same seeded buildingAt path (planning-time allocations only), and a
+   * uniform random pick from it filtered to [inner, radius]. */
+  _coolList: [],
+  _subList: [],
+  _srcTimer: 0,
+
+  _refreshSources() {
+    const R = 210;                       // covers both radii (200 / 170)
+    const B = WORLD.BLOCK;
+    const pcx = Math.floor(CAMERA.pos.x / B);
+    const pcz = Math.floor(CAMERA.pos.z / B);
+    const cool = [], subs = [];
+    const n = Math.ceil(R / B);
+    for (let bx = pcx - n; bx <= pcx + n; bx++) {
+      for (let bz = pcz - n; bz <= pcz + n; bz++) {
+        const ring = TRAFFIC._ringFor(bx, bz);
+        const c = WORLD.buildingAt(bx, bz, ring, ['cool'], 0);
+        if (c) cool.push(c);
+        const s = WORLD.buildingAt(bx, bz, ring, ['sub'], 0);
+        if (s) subs.push(s);
+      }
+    }
+    TRAFFIC._coolList = cool;
+    TRAFFIC._subList = subs;
+    TRAFFIC._srcTimer = 0;
+  },
+
+  _findSource(r, arch, radius, inner) {
+    const list = arch === 'cool' ? TRAFFIC._coolList : TRAFFIC._subList;
+    for (let i = 0; i < 12; i++) {
+      if (list.length === 0) break;
+      const b = list[(r() * list.length) | 0];
+      const dx = b.x - CAMERA.pos.x;
+      const dz = b.z - CAMERA.pos.z;
+      const d = Math.hypot(dx, dz);
+      if (d <= radius && d >= inner) return b;
+    }
+    return null;
+  },
+
+  /* spawn one steam puff at a cooling-tower vent (replayed seed: the
+   * puff always rises from where mass actually is) */
+  _spawnSteam(it, src) {
+    const st = CFG.traffic.steam;
+    const r = TRAFFIC._rng;
+    it.sx = src.x; it.sy = src.hTop; it.sz = src.z;
+    const a = r() * 6.2831853, rr = r() * src.r * 0.5;
+    it.px = src.x + Math.cos(a) * rr;
+    it.py = src.hTop + 0.3 + r() * 0.8;
+    it.pz = src.z + Math.sin(a) * rr;
+    it.vy = st.rise[0] + r() * (st.rise[1] - st.rise[0]);
+    it.size0 = st.size[0] + r() * (st.size[1] - st.size[0]);
+    it.age = 0;
+    it.life = st.life[0] + r() * (st.life[1] - st.life[0]);
+    it.ph = r() * 6.2831853;
+    /* cool bluish-white vapor, slight per-puff variation */
+    const b = 0.85 + r() * 0.3;
+    it.cR = 0.62 * b; it.cG = 0.72 * b; it.cB = 0.82 * b;
+    TRAFFIC._sLive[TRAFFIC.scount++] = it;
+  },
+
+  /* spawn one spark at a substation roof (brief ballistic life) */
+  _spawnSpark(it, src) {
+    const sp = CFG.traffic.spark;
+    const r = TRAFFIC._rng;
+    it.sx = src.x; it.sy = src.hTop; it.sz = src.z;
+    it.px = src.x + (r() - 0.5) * src.w * 0.5;
+    it.py = src.hTop + 0.2 + r() * 1.2;
+    it.pz = src.z + (r() - 0.5) * src.w * 0.35;
+    const a = r() * 6.2831853;
+    const v = sp.speed[0] + r() * (sp.speed[1] - sp.speed[0]);
+    it.vx = Math.cos(a) * v;
+    it.vz = Math.sin(a) * v;
+    it.vy = 0.5 + r() * 1.5;
+    it.age = 0;
+    it.life = sp.life[0] + r() * (sp.life[1] - sp.life[0]);
+    it.ph = r() * 6.2831853;
+    /* hot white-amber flash, slight per-spark variation */
+    const b = 0.85 + r() * 0.3;
+    it.cR = b; it.cG = 0.85 * b; it.cB = 0.55 * b;
+    TRAFFIC._pLive[TRAFFIC.pcount++] = it;
+  },
+
+  _sReleaseAt(i) {
+    const it = TRAFFIC._sLive[i];
+    const m = --TRAFFIC.scount;
+    if (i !== m) TRAFFIC._sLive[i] = TRAFFIC._sLive[m];
+    TRAFFIC._sLive[m] = undefined;
+    TRAFFIC.spool.release(it);
+  },
+
+  _pReleaseAt(i) {
+    const it = TRAFFIC._pLive[i];
+    const m = --TRAFFIC.pcount;
+    if (i !== m) TRAFFIC._pLive[i] = TRAFFIC._pLive[m];
+    TRAFFIC._pLive[m] = undefined;
+    TRAFFIC.ppool.release(it);
+  },
+
   dispose() {
     for (let i = TRAFFIC.count - 1; i >= 0; i--) TRAFFIC._releaseAt(i);
     for (let i = TRAFFIC.vcount - 1; i >= 0; i--) TRAFFIC._vReleaseAt(i);
+    for (let i = TRAFFIC.scount - 1; i >= 0; i--) TRAFFIC._sReleaseAt(i);
+    for (let i = TRAFFIC.pcount - 1; i >= 0; i--) TRAFFIC._pReleaseAt(i);
     if (TRAFFIC.mesh) {
       scene.remove(TRAFFIC.mesh);
       TRAFFIC.mesh.geometry.dispose();
       TRAFFIC.mesh.material.dispose();
     }
     for (const m of [TRAFFIC.vmesh, TRAFFIC.tmesh]) {
+      if (m) {
+        scene.remove(m);
+        m.geometry.dispose();
+        m.material.dispose();
+      }
+    }
+    /* steam/spark meshes: dispose own geometry + material only — the
+     * glow textures are shared KIT assets */
+    for (const m of [TRAFFIC.smesh, TRAFFIC.spoints]) {
       if (m) {
         scene.remove(m);
         m.geometry.dispose();

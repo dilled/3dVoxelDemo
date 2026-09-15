@@ -53,7 +53,7 @@ smoke-test evidence.
 | **M6.1** ✅ | Generic object-pool foundation (`Pool` helper): fixed-size alloc at init, `acquire/release`, zero per-frame allocation, shared by later emitters | Pool test: 10k acquire/release cycles in smoke run, zero `new` after init, zero GC churn in stats |
 | **M6.2** ✅ | Maintenance drones: small voxel quads (InstancedMesh), patrol routes between towers, dock at roof bays, capped by distance to player | Drones visibly patrol + dock from street level; cap holds at tier max; no allocation per frame |
 | **M6.3** ✅ | Sky vehicles: light trails (additive sprite streak) on ring roads at 3 altitudes, capped like drones | Trails readable from all 3 altitudes; count never exceeds tier cap |
-| **M6.4** | Steam vents (cooling towers, billboard sprite pool, upward drift, fade) + sparks (substations, tiny points, brief life) | Both emitters run idle-cheap; smoke shot shows steam + sparks at source buildings |
+| **M6.4** ✅ | Steam vents (cooling towers, billboard sprite pool, upward drift, fade) + sparks (substations, tiny points, brief life) | Both emitters run idle-cheap; smoke shot shows steam + sparks at source buildings |
 | **M6.5** | Adaptive caps: `TRAFFIC` reads current FPS tier, scales all M6 pools | Forcing LOW tier in smoke run visibly halves caps; back to HIGH restores; no spike |
 | **M7.1** | Pooled `Points`/sprite particle system: steam, sparks, pulse motes, lightning motes, awakening rain — one system, one budget | One trigger key rains all particle types; idle cost ~0 in stats |
 | **M7.2** | `FX.pulse(origin, radius, color)`: expanding instanced ring mesh + light-intensity ramp (+ audio hook once M11 lands) | Manual key fires a visible pulse; nothing allocated; idle = zero draw calls added |
@@ -261,11 +261,37 @@ smoke-test evidence.
   break the < 10 KIT-only gate).
 
 #### M6.4 — Steam vents + sparks
-- [ ] Steam vents from cooling towers (billboard sprite pool, upward
+- [x] Steam vents from cooling towers (billboard sprite pool, upward
       drift, fade); sparks from substations (tiny points, brief life).
 - **Test:** smoke screenshot shows steam + sparks at their source
       buildings; both emitters idle-cheap in stats.
 - **Commit when:** screenshot + idle-cost check pass.
+- **Verified:** smoke M6.4 section green — steam pool
+  (`traffic-steam`, HIGH cap 48) + spark pool (`traffic-spark`, HIGH cap
+  64) registered on the M6.1 `POOL` (fixed capacity, every live puff/
+  spark a pre-created pool item ⇒ zero `new` after init); the steam
+  field saturates the cap (spawn rate × life > cap ⇒ the fixed pool is
+  the gate, one billboard InstancedMesh + one additive Points); every
+  live puff verified above a cooling-tower vent and every spark above a
+  substation by replaying the seeded M3 block seeds (the same
+  `buildingAt` path the emitters use); steam visibly rises (upward
+  drift, sway, grow, sin-fade) and sparks age out (brief ballistic
+  life, continuous bursts); JS heap flat across the live-emitter window
+  (min-of-3-sample churn ≤ 2 MB); sampled counts never exceeded the tier
+  caps; `TIER.set('low')` trims both emitters (steam 48→12, excess
+  released to the pools, pool inUse === count), `TIER.set('high')`
+  regrows the full field; idle-cheap stats: exactly 1 steam + 1 spark
+  draw call (additive blending, Points `setDrawRange` tracks the live
+  count ⇒ 0 live items cost 0 draw calls); street-level screenshot
+  `smoke/shots/m64-steam-sparks-street.png` with the pose chosen by an
+  analytic line-of-sight check against the instanced building boxes
+  (puff above a resolvable vent 50–170 m out, live spark at a
+  substation ≤ 70 m from the vent, both in frame), retry loop while the
+  emitters cycle. Sources are picked from a small live list of the
+  nearby source buildings (rebuilt every 4 s from the seeded path) —
+  blind random-block draws starve the emitters (a 200 m radius holds
+  only ~10 source blocks); spawn timers accumulate the frame remainder
+  (while-loop, not if-reset) so the rate is frame-rate independent.
 
 #### M6.5 — Adaptive caps by FPS tier
 - [ ] `TRAFFIC` reads current FPS tier and scales all M6 pool sizes.

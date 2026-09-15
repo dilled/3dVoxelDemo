@@ -101,6 +101,22 @@
  *   - one screenshot per altitude with the streak in frame
  *     (shots/m63-vehicles-alt{0,1,2}.png)
  *
+ *   M6.4 checks (steam vents + sparks):
+ *   - steam pool ('traffic-steam') + spark pool ('traffic-spark')
+ *     registered with tier caps; steam field saturates the cap
+ *     (fixed pool is the gate); every live puff/spark is a pre-created
+ *     pool item (zero `new` after init)
+ *   - analytic source match (seeded replay): every live puff sits above
+ *     a cooling-tower vent, every spark above a substation
+ *   - steam visibly rises (upward drift) and fades; sparks age out
+ *     (brief life); no allocation per frame (heap flat)
+ *   - tier cap: TIER.set('low') trims both emitters (excess released
+ *     to the pools); TIER.set('high') regrows; counts never exceed caps
+ *   - idle-cheap stats: 1 steam + 1 spark draw call, additive blending,
+ *     Points drawRange tracks the live count
+ *   - street-level screenshot showing steam + sparks at their source
+ *     buildings (shots/m64-steam-sparks-street.png)
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -467,13 +483,15 @@ try {
       `mats=${kit.mats}`);
 
     // The M2 gate measures the KIT test wall/tower alone: hide the M3
-    // city + M5 creature + M6 TRAFFIC meshes (drones/vehicles/trails)
-    // for a frame or two, read the draw-call count, show it again.
+    // city + M5 creature + M6 TRAFFIC meshes (drones/vehicles/trails/
+    // steam/sparks) for a frame or two, read the draw-call count, show
+    // it again.
     await page.evaluate(() => {
       window.SIM.WORLD.root.visible = false;
       window.SIM.ENTITY.root.visible = false;
       const T = window.SIM.TRAFFIC;
-      for (const m of [T.mesh, T.vmesh, T.tmesh]) if (m) m.visible = false;
+      for (const m of [T.mesh, T.vmesh, T.tmesh, T.smesh, T.spoints])
+        if (m) m.visible = false;
     });
     await sleep(250);
     const c1 = await page.evaluate(() => window.SIM.renderer.info.render.calls);
@@ -481,7 +499,8 @@ try {
       window.SIM.WORLD.root.visible = true;
       window.SIM.ENTITY.root.visible = true;
       const T = window.SIM.TRAFFIC;
-      for (const m of [T.mesh, T.vmesh, T.tmesh]) if (m) m.visible = true;
+      for (const m of [T.mesh, T.vmesh, T.tmesh, T.smesh, T.spoints])
+        if (m) m.visible = true;
     });
     check('M2 gate: test wall/tower (city + creature hidden) renders at < 10 draw calls',
       Number.isInteger(c1) && c1 >= 1 && c1 < 10,
@@ -1467,6 +1486,407 @@ try {
     check('M6.3: streak screenshots at all 3 altitudes (shots/m63-vehicles-alt{0,1,2}.png)',
       shotOk.every(Boolean),
       `alt0=${shotOk[0]}, alt1=${shotOk[1]}, alt2=${shotOk[2]}`);
+  }
+
+  /* ------------------------------------------------------------------
+   * M6.4 — steam vents (cooling towers) + sparks (substations)
+   * ------------------------------------------------------------------ */
+  {
+    /* reset to the spawn pose: the analytic vent/sub replay below must
+     * use the same player-relative chunk rings the emitters used at
+     * spawn time */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(0, 4, 18);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = 0;
+    });
+
+    const caps = await page.evaluate(() => {
+      const S = window.SIM;
+      const T = S.TRAFFIC;
+      const sPool = S.POOL.list.find(p => p.name === 'traffic-steam');
+      const pPool = S.POOL.list.find(p => p.name === 'traffic-spark');
+      return {
+        sCap: (T.smesh && sPool) ? sPool.capacity : 0,
+        pCap: (T.spoints && pPool) ? pPool.capacity : 0,
+        sTier: S.CFG.traffic.steam.tiers[S.TIER.active()],
+        pTier: S.CFG.traffic.spark.tiers[S.TIER.active()],
+      };
+    });
+    check('M6.4: steam + spark emitters registered with pools (M6.1) + tier caps',
+      caps.sCap > 0 && caps.pCap > 0 &&
+      caps.sCap === caps.sTier && caps.pCap === caps.pTier,
+      `steam=${caps.sCap}, spark=${caps.pCap},`
+      + ` tier=${await page.evaluate(() => window.SIM.TIER.active())}`);
+
+    /* steam field saturates the cap (spawn rate × life > cap ⇒ the
+     * fixed pool is the gate); sparks hover at a small steady state */
+    await page.waitForFunction(c => window.SIM.TRAFFIC.scount === c,
+      caps.sCap, { timeout: 120000 });
+    await page.waitForFunction(c => window.SIM.TRAFFIC.pcount >= c, 3,
+      { timeout: 30000 });
+
+    const s0 = await page.evaluate(async () => {
+      const S = window.SIM;
+      const T = S.TRAFFIC;
+      const sPool = S.POOL.list.find(p => p.name === 'traffic-steam');
+      const pPool = S.POOL.list.find(p => p.name === 'traffic-spark');
+      const sLive = T._sLive.slice(0, T.scount);
+      const pLive = T._pLive.slice(0, T.pcount);
+      /* keep the item refs alive for the drift/age samples below */
+      window.__m64 = {
+        sSnaps: sLive.map(it => ({ ref: it, y: it.py, age: it.age })),
+        pSnaps: pLive.map(it => ({ ref: it, age: it.age })),
+      };
+      /* analytic source match: replay the seeded block seeds (the same
+       * path the emitters' _findSource uses) and prove every live puff
+       * sits above a cooling-tower vent and every spark above a
+       * substation */
+      const B = S.WORLD.BLOCK, K = S.WORLD.CHUNK;
+      function ringFor(bx, bz) {
+        const pcx = Math.floor(Math.floor(S.CAMERA.pos.x / B) / K);
+        const pcz = Math.floor(Math.floor(S.CAMERA.pos.z / B) / K);
+        return Math.max(
+          Math.abs(Math.floor(bx / K) - pcx),
+          Math.abs(Math.floor(bz / K) - pcz));
+      }
+      const cool = [], subs = [];
+      for (let bx = -10; bx <= 10; bx++) {
+        for (let bz = -10; bz <= 10; bz++) {
+          const c = S.WORLD.buildingAt(bx, bz, ringFor(bx, bz), ['cool'], 0);
+          if (c) cool.push({ x: c.x, z: c.z, hTop: c.hTop });
+          const s = S.WORLD.buildingAt(bx, bz, ringFor(bx, bz), ['sub'], 0);
+          if (s) subs.push({ x: s.x, z: s.z, hTop: s.hTop });
+        }
+      }
+      let steamOk = true, sparkOk = true;
+      for (const it of sLive) {
+        const v = cool.find(v =>
+          Math.abs(v.x - it.sx) < 2 && Math.abs(v.z - it.sz) < 2);
+        if (!v || it.py < it.sy - 0.5 || it.age >= it.life || it.vy <= 0) {
+          steamOk = false; break;
+        }
+      }
+      for (const it of pLive) {
+        const s = subs.find(s =>
+          Math.abs(s.x - it.sx) < 2 && Math.abs(s.z - it.sz) < 2);
+        if (!s || it.age >= it.life) { sparkOk = false; break; }
+      }
+      async function heapMin() {
+        let m = Infinity;
+        for (let i = 0; i < 3; i++) {
+          if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+          await new Promise(r => setTimeout(r, 400));
+        }
+        return m === Infinity ? -1 : m;
+      }
+      /* all sync stats first (the heap sample below awaits — the page
+       * keeps running during it, so nothing sampled after it may be
+       * compared against these) */
+      const stats = {
+        scount: T.scount, pcount: T.pcount,
+        sPoolCap: sPool ? sPool.capacity : -1,
+        sInUse: sPool ? sPool.capacity - sPool.top : -1,
+        pPoolCap: pPool ? pPool.capacity : -1,
+        pInUse: pPool ? pPool.capacity - pPool.top : -1,
+        sZeroNew: !!sPool && sLive.every(it =>
+          it.__pool === sPool && it.__free === false),
+        pZeroNew: !!pPool && pLive.every(it =>
+          it.__pool === pPool && it.__free === false),
+        steamOk, sparkOk,
+        nCool: cool.length, nSub: subs.length,
+        drawRange: T.spoints.geometry.drawRange.count,
+        smeshCount: T.smesh.count,
+        sAdditive: T.smesh.material.blending === 2,
+        pAdditive: T.spoints.material.blending === 2,
+        calls: S.renderer.info.render.calls,
+      };
+      stats.heapBefore = await heapMin();
+      return stats;
+    });
+    check('M6.4: steam field saturates the cap (pool = gate, one InstancedMesh)',
+      s0.scount >= s0.sPoolCap - 2 && s0.sInUse === s0.scount &&
+      s0.smeshCount === s0.scount,
+      `scount=${s0.scount}, pool=${s0.sPoolCap}, inUse=${s0.sInUse}`);
+    check('M6.4: every live puff/spark is a pre-created pool item (zero `new` after init)',
+      s0.sZeroNew && s0.pZeroNew,
+      `puffs=${s0.scount}, sparks=${s0.pcount}`);
+    check('M6.4: steam rises from cooling-tower vents (seeded replay match)',
+      s0.steamOk, `vents=${s0.nCool}`);
+    check('M6.4: sparks live at substations (seeded replay match, brief life)',
+      s0.sparkOk, `subs=${s0.nSub}`);
+
+    /* upward drift + no per-frame allocation across a live window */
+    await sleep(2500);
+    const s1 = await page.evaluate(async () => {
+      const T = window.SIM.TRAFFIC;
+      let rose = 0;
+      const sSet = T._sLive.slice(0, T.scount);
+      for (const sn of window.__m64.sSnaps) {
+        if (!sSet.includes(sn.ref)) continue;
+        if (sn.ref.py - sn.y > 0.3) rose++;
+      }
+      async function heapMin() {
+        let m = Infinity;
+        for (let i = 0; i < 3; i++) {
+          if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+          await new Promise(r => setTimeout(r, 400));
+        }
+        return m === Infinity ? -1 : m;
+      }
+      return {
+        rose, nS: window.__m64.sSnaps.length,
+        heap: await heapMin(),
+        pcount: T.pcount, drawRange: T.spoints.geometry.drawRange.count,
+      };
+    });
+    check('M6.4: steam visibly rises (upward drift) while alive',
+      s1.rose > 0, `rose=${s1.rose}/${s1.nS}`);
+    check('M6.4: no allocation per frame (heap flat with both emitters alive)',
+      s0.heapBefore > 0 && s1.heap > 0 &&
+      s1.heap - s0.heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(s0.heapBefore / 1024)}KB,`
+      + ` after=${Math.round(s1.heap / 1024)}KB`);
+    check('M6.4: idle-cheap stats — additive, Points drawRange tracks live count',
+      s1.drawRange === s1.pcount && s0.sAdditive && s0.pAdditive,
+      `calls=${s0.calls}, drawRange=${s1.drawRange}`);
+
+    /* sparks age out (brief life) — short window, sparks die fast */
+    const pA = await page.evaluate(() => {
+      const T = window.SIM.TRAFFIC;
+      return T._pLive.slice(0, T.pcount)
+        .map(it => ({ ref: it, age: it.age }));
+    });
+    await sleep(500);
+    const pB = await page.evaluate(snaps => {
+      const T = window.SIM.TRAFFIC;
+      const live = T._pLive.slice(0, T.pcount);
+      const liveSet = new Set(live);
+      let aged = 0, still = 0, fresh = 0;
+      for (const sn of snaps) {
+        if (!liveSet.has(sn.ref)) continue;
+        still++;
+        if (sn.ref.age > sn.age) aged++;
+      }
+      for (const it of live) if (!snaps.some(sn => sn.ref === it)) fresh++;
+      return { aged, still, fresh, live: live.length };
+    }, pA);
+    check('M6.4: sparks are a continuous brief-life stream (bursts keep respawning)',
+      pB.live > 0 && pB.fresh > 0,
+      `live=${pB.live}, fresh=${pB.fresh}, stillAged=${pB.aged}/${pB.still}`);
+
+    /* counts never exceed the tier caps (sampled while emitters cycle) */
+    const capHold = await page.evaluate(async () => {
+      const S = window.SIM;
+      const sc = S.CFG.traffic.steam.tiers[S.TIER.active()];
+      const pc = S.CFG.traffic.spark.tiers[S.TIER.active()];
+      for (let i = 0; i < 10; i++) {
+        if (S.TRAFFIC.scount > sc || S.TRAFFIC.pcount > pc) return false;
+        await new Promise(r => setTimeout(r, 150));
+      }
+      return true;
+    });
+    check('M6.4: counts never exceed the tier caps', capHold === true,
+      `steam=${caps.sCap}, spark=${caps.pCap}`);
+
+    /* tier cap: LOW trims both emitters, HIGH regrows them */
+    const lowS = await page.evaluate(() => window.SIM.CFG.traffic.steam.tiers.low);
+    const lowP = await page.evaluate(() => window.SIM.CFG.traffic.spark.tiers.low);
+    await page.evaluate(() => window.SIM.TIER.set('low'));
+    await page.waitForFunction(({ s, p }) =>
+      window.SIM.TRAFFIC.scount <= s && window.SIM.TRAFFIC.pcount <= p,
+      { s: lowS, p: lowP }, { timeout: 5000 });
+    const tLow = await page.evaluate(() => {
+      const S = window.SIM;
+      const sPool = S.POOL.list.find(pp => pp.name === 'traffic-steam');
+      const pPool = S.POOL.list.find(pp => pp.name === 'traffic-spark');
+      return {
+        scount: S.TRAFFIC.scount, pcount: S.TRAFFIC.pcount,
+        sInUse: sPool.capacity - sPool.top,
+        pInUse: pPool.capacity - pPool.top,
+      };
+    });
+    check('M6.4: LOW tier trims both emitters (excess released to the pools)',
+      tLow.scount <= lowS && tLow.pcount <= lowP &&
+      tLow.sInUse === tLow.scount && tLow.pInUse === tLow.pcount,
+      `steam=${tLow.scount}/${lowS}, spark=${tLow.pcount}/${lowP}`);
+    await page.evaluate(() => window.SIM.TIER.set('high'));
+    await page.waitForFunction(c => window.SIM.TRAFFIC.scount === c,
+      caps.sCap, { timeout: 120000 });
+    await page.waitForFunction(c => window.SIM.TRAFFIC.pcount >= c, 3,
+      { timeout: 30000 });
+    check('M6.4: HIGH tier restores the full steam field (regrows on spawn ticks)',
+      (await page.evaluate(() => window.SIM.TRAFFIC.scount)) >= caps.sCap - 2,
+      `scount restored near ${caps.sCap}`);
+
+    /* draw-call budget with both emitters alive */
+    const calls = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    check('M6.4: draw calls inside budget with both emitters alive',
+      calls > 0 && calls < 150, `calls=${calls}`);
+
+    /* visual gate: street-level screenshot that actually SHOWS steam +
+     * sparks at their source buildings. Pick a live puff above a
+     * resolvable cooling-tower vent (50–170 m out, mid-life, risen
+     * clear of the tower cap) whose substation neighbour (≤ 70 m)
+     * carries a live spark; camera 70 m out on the radial bearing,
+     * aim at the puff; analytic line-of-sight against the instanced
+     * building boxes rejects occluded candidates. */
+    let d = null;
+    for (let tries = 0; tries < 40 && !d; tries++) {
+      d = await page.evaluate(() => {
+        const S = window.SIM, T = S.TRAFFIC;
+        const B = S.WORLD.BLOCK, K = S.WORLD.CHUNK;
+        function ringFor(bx, bz) {
+          const pcx = Math.floor(Math.floor(S.CAMERA.pos.x / B) / K);
+          const pcz = Math.floor(Math.floor(S.CAMERA.pos.z / B) / K);
+          return Math.max(
+            Math.abs(Math.floor(bx / K) - pcx),
+            Math.abs(Math.floor(bz / K) - pcz));
+        }
+        const cool = [], subs = [];
+        for (let bx = -10; bx <= 10; bx++) {
+          for (let bz = -10; bz <= 10; bz++) {
+            const c = S.WORLD.buildingAt(bx, bz, ringFor(bx, bz), ['cool'], 0);
+            if (c) cool.push(c);
+            const s = S.WORLD.buildingAt(bx, bz, ringFor(bx, bz), ['sub'], 0);
+            if (s) subs.push(s);
+          }
+        }
+        const near = (list, x, z, m) =>
+          list.find(v => Math.abs(v.x - x) < m && Math.abs(v.z - z) < m);
+        const puffs = [];
+        for (let i = 0; i < T.scount; i++) {
+          const it = T._sLive[i];
+          const u = it.age / it.life;
+          if (u < 0.25 || u > 0.75) continue;
+          const v = near(cool, it.sx, it.sz, 2);
+          if (!v) continue;
+          const dist = Math.hypot(v.x, v.z);
+          if (dist < 50 || dist > 170) continue;
+          if (it.py < v.hTop + 3.5 || it.py > 34) continue;
+          puffs.push({ it, v });
+        }
+        const sparks = [];
+        for (let i = 0; i < T.pcount; i++) {
+          const it = T._pLive[i];
+          if (it.life - it.age < 0.45) continue;
+          const s = near(subs, it.sx, it.sz, 2);
+          if (!s) continue;
+          sparks.push({ it, s });
+        }
+        const boxes = [];
+        for (const ch of S.WORLD.chunks.values()) {
+          if (!ch.group || !ch.group.visible) continue;
+          for (const b of [ch.boxA, ch.boxG, ch.cyl, ch.ledWin])
+            if (b && b.count > 0) boxes.push(b);
+        }
+        const inv = T._sm.clone();
+        const la = T._sp.clone();
+        function segHits(arr, o, ax, ay, az, bx, by, bz) {
+          inv.fromArray(arr, o);
+          inv.invert();
+          const p = la.set(ax, ay, az).applyMatrix4(inv);
+          const px = p.x, py = p.y, pz = p.z;
+          const q = la.set(bx, by, bz).applyMatrix4(inv);
+          const pp = [px, py, pz], qq = [q.x, q.y, q.z];
+          let t0 = 0, t1 = 1;
+          for (let k = 0; k < 3; k++) {
+            const dK = qq[k] - pp[k];
+            if (Math.abs(dK) < 1e-9) {
+              if (pp[k] < -0.5 || pp[k] > 0.5) return false;
+            } else {
+              let te = (-0.5 - pp[k]) / dK, tx = (0.5 - pp[k]) / dK;
+              if (te > tx) { const tm = te; te = tx; tx = tm; }
+              if (t0 < te) t0 = te;
+              if (t1 > tx) t1 = tx;
+              if (t0 > t1) return false;
+            }
+          }
+          return true;
+        }
+        function occluded(ax, ay, az, bx, by, bz) {
+          const dx = bx - ax, dy = by - ay, dz = bz - az;
+          const l2 = dx * dx + dy * dy + dz * dz;
+          for (const b of boxes) {
+            const arr = b.mesh.instanceMatrix.array;
+            for (let i = 0; i < b.count; i++) {
+              const o = i * 16;
+              const cx = arr[o + 12], cy = arr[o + 13], cz = arr[o + 14];
+              const sx = Math.abs(arr[o]) + Math.abs(arr[o + 1]) + Math.abs(arr[o + 2]);
+              const sy = Math.abs(arr[o + 4]) + Math.abs(arr[o + 5]) + Math.abs(arr[o + 6]);
+              const sz = Math.abs(arr[o + 8]) + Math.abs(arr[o + 9]) + Math.abs(arr[o + 10]);
+              const tt = ((cx - ax) * dx + (cy - ay) * dy + (cz - az) * dz) / l2;
+              if (tt < 0 || tt > 1) continue;
+              const px = ax + dx * tt, py = ay + dy * tt, pz = az + dz * tt;
+              const ex = Math.max(sx, sy, sz) * 0.5 + 1;
+              const ex2 = cx - px, ey = cy - py, ez = cz - pz;
+              if (ex2 * ex2 + ey * ey + ez * ez > ex * ex) continue;
+              if (segHits(arr, o, ax, ay, az, bx, by, bz)) return true;
+            }
+          }
+          return false;
+        }
+        for (const { it, v } of puffs) {
+          for (const { it: sk, s } of sparks) {
+            if (Math.hypot(s.x - v.x, s.z - v.z) > 70) continue;
+            const dist = Math.hypot(v.x, v.z);
+            const ux = v.x / dist, uz = v.z / dist;
+            const camX = v.x + ux * 70, camZ = v.z + uz * 70;
+            /* sub must sit close to the vent bearing (in-frame) and at
+             * a similar elevation (both inside the vertical FOV) */
+            const a1 = Math.atan2(v.x - camX, v.z - camZ);
+            const a2 = Math.atan2(s.x - camX, s.z - camZ);
+            if (Math.abs(a1 - a2) > 0.35) continue;
+            const e1 = Math.atan2(it.py - 2,
+              Math.hypot(it.px - camX, it.pz - camZ));
+            const e2 = Math.atan2(s.hTop - 2,
+              Math.hypot(s.x - camX, s.z - camZ));
+            if (Math.abs(e1 - e2) > 0.4) continue;
+            if (occluded(camX, 2, camZ, it.px, it.py, it.pz)) continue;
+            if (occluded(camX, 2, camZ, s.x, s.hTop, s.z)) continue;
+            const dx = it.px - camX, dy = it.py - 2, dz = it.pz - camZ;
+            return {
+              x: camX, z: camZ,
+              yaw: Math.atan2(-dx, -dz),
+              pitch: Math.atan2(dy, Math.hypot(dx, dz)),
+              puff: [it.px, it.py, it.pz],
+              sub: [s.x, s.hTop, s.z],
+            };
+          }
+        }
+        return null;
+      });
+      if (!d) await sleep(500);
+    }
+    let shotOk = false;
+    if (d) {
+      await page.evaluate(({ x, z, yaw, pitch }) => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(x, 2, z);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = yaw;
+        S.CAMERA.pitch = pitch;
+      }, d);
+      await sleep(450);
+      await page.screenshot({ path: `${here}/shots/m64-steam-sparks-street.png` });
+      shotOk = fs.existsSync(`${here}/shots/m64-steam-sparks-street.png`);
+      /* reset to the spawn pose for the remaining checks */
+      await page.evaluate(() => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(0, 4, 18);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = 0;
+        S.CAMERA.pitch = 0;
+      });
+      await sleep(250);
+    }
+    check('M6.4: street screenshot with steam + sparks at source buildings (shots/m64-steam-sparks-street.png)',
+      shotOk,
+      d ? `puff=(${d.puff.map(v => v.toFixed(0)).join(',')}),`
+        + ` sub=(${d.sub.map(v => v.toFixed(0)).join(',')})`
+        : 'no resolvable vent+sub pair in frame');
   }
 
   /* ---- 10. No errors anywhere ---- */
