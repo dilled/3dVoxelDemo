@@ -57,7 +57,7 @@ smoke-test evidence.
 | **M6.5** ✅ | Adaptive caps: `TRAFFIC` reads current FPS tier, scales all M6 pools | Forcing LOW tier in smoke run visibly halves caps; back to HIGH restores; no spike |
 | **M7.1** ✅ | Pooled `Points`/sprite particle system: steam, sparks, pulse motes, lightning motes, awakening rain — one system, one budget | One trigger key rains all particle types; idle cost ~0 in stats |
 | **M7.2** ✅ | `FX.pulse(origin, radius, color)`: expanding instanced ring mesh + light-intensity ramp (+ audio hook once M11 lands) | Manual key fires a visible pulse; nothing allocated; idle = zero draw calls added |
-| **M7.3** | Animated electrical arcs: Line segments regenerated every N frames between anchors (substation→substation, creature→ring) | Manual key sparks arcs between two substations and creature→ring; regen is frame-cheap |
+| **M7.3** ✅ | Animated electrical arcs: Line segments regenerated every N frames between anchors (substation→substation, creature→ring) | Manual key sparks arcs between two substations and creature→ring; regen is frame-cheap |
 | **M7.4** | Screen-space flash: overlay-scene additive plane (or DOM div) driven by `FX.flash(intensity)` | Manual key flashes screen; decays to zero; costs nothing idle |
 | **M7.5** | Camera shake: impulse-decay system consumed by `CAMERA` | Manual key shakes camera with clean decay to still; never accumulates |
 | **M8.1** | Night sky: gradient sky dome (big sphere, canvas/shader texture), stars, faint aurora band | Night mood readable from street level; dome correct from street, orbit, and far fly |
@@ -364,12 +364,27 @@ pools never allocate per frame.
   straight-down at GROUND max height). Audio thump deliberately deferred
   to M11.3 (seam: the `pulse()` call site).
 
-#### M7.3 — Animated electrical arcs
-- [ ] Line segments regenerated every N frames between anchor points
+#### M7.3 — Animated electrical arcs ✅
+- [x] Line segments regenerated every N frames between anchor points
       (substation → substation, creature → ring).
 - **Test:** manual key sparks arcs between two substations and
       creature→ring; regeneration cost stays frame-cheap.
 - **Commit when:** arcs verified at both anchor types.
+- **Verified:** smoke M7.3 section green — arcs live on the M6.1 pool
+  `fx-arc` (capacity = HIGH tier cap 8 ⇒ every live arc a pre-created
+  pool item, zero `new` after init) and render through ONE shared
+  `LineSegments` with pre-allocated buffers (bolt = 12-seg jittered main
+  + 3 forks = 21 segs = 42 verts); Key T sparks BOTH anchor types — the
+  two nearest live substations (endpoints on the real roofs) and
+  antenna tip → ring lane at a random vehicle altitude — with exactly
+  +1 draw call (the shared mesh); regeneration re-jitters every
+  `N = 3` frames (tick hits 0 exactly 4× and the position-buffer hash
+  changes exactly 4× over 12 rAF frames) and stays frame-cheap (rAF
+  deltas ≤ 2× baseline); idle = zero added draw calls (the mesh is
+  hidden at 0 live — three r160 does not skip drawRange-0 lines);
+  LOW trims 8 fired arcs to 3, HIGH holds all 8; heap flat; screenshot
+  `smoke/shots/m73-arcs.png` with all four live endpoints asserted
+  in-frame (deterministic pose: seeded city + fixed camera + fov reset).
 
 #### M7.4 — Screen-space flash
 - [ ] Full-screen additive plane in a small overlay scene (or DOM div)

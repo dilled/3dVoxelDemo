@@ -167,6 +167,26 @@
  *   - heap flat across the pulse sequence; draw calls inside budget
  *   - screenshot with the ring in frame (shots/m72-pulse-ring.png)
  *
+ *   M7.3 checks (animated electrical arcs — regenerated line segments):
+ *   - FX arcs registered: pool 'fx-arc' (capacity = HIGH tier cap), ONE
+ *     LineSegments with pre-allocated position+color buffers, idle 0
+ *     live / drawRange 0 / 0 pool inUse
+ *   - idle = zero added draw calls (shared LineSegments hidden at 0
+ *     live — three r160 does not skip drawRange-0 objects)
+ *   - manual key T sparks BOTH anchor types: substation→substation
+ *     (endpoints on two distinct live substations) + creature→ring road
+ *     (antenna tip → a ring-road lane point at a vehicle altitude);
+ *     exactly +1 draw call (the one LineSegments); every live arc a
+ *     pre-created pool item (zero `new` after init)
+ *   - regeneration: position buffer stable between ticks and re-jittered
+ *     exactly every N frames (N = CFG.fx.arcs.regenFrames); regen is
+ *     frame-cheap (rAF delta window with arcs alive stays within 2× the
+ *     baseline max frame, 100 ms floor)
+ *   - tier cap: LOW trims 8 fired arcs to the LOW cap; HIGH holds the
+ *     full cap (8 live, no trim); draw calls inside budget
+ *   - arcs resolve clean (0 live, drawRange 0, pool drained); heap flat
+ *   - screenshot with both anchor types in frame (shots/m73-arcs.png)
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -545,7 +565,7 @@ try {
       const P = window.SIM.PARTS;
       for (const m of [T.mesh, T.vmesh, T.tmesh,
         P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh,
-        window.SIM.FX.ring])
+        window.SIM.FX.ring, window.SIM.FX.arcs])
         if (m) m.visible = false;
     });
     await sleep(250);
@@ -557,7 +577,7 @@ try {
       const P = window.SIM.PARTS;
       for (const m of [T.mesh, T.vmesh, T.tmesh,
         P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh,
-        window.SIM.FX.ring])
+        window.SIM.FX.ring, window.SIM.FX.arcs])
         if (m) m.visible = true;
     });
     check('M2 gate: test wall/tower (city + creature hidden) renders at < 10 draw calls',
@@ -2645,18 +2665,329 @@ try {
       S.FX.pulse({ x: 0, y: 0.5, z: 18 }, 20, null);
     });
     await sleep(800);
-    await page.screenshot({ path: `${here}/shots/m72-pulse-ring.png` });
+    /* read the state BEFORE the screenshot: at u ≥ 0.5 the light is at
+     * its sin² peak (5000), and the screenshot (≈0.1–0.5 s later) still
+     * catches the ring at full size / near-peak brightness */
     const shotSt = await page.evaluate(() => ({
       count: window.SIM.FX.count,
       scale: window.SIM.FX._s.x,
       light: window.SIM.FX._lights[0].intensity,
     }));
+    await page.screenshot({ path: `${here}/shots/m72-pulse-ring.png` });
     check('M7.2: pulse screenshot with the ring + light peak in frame (shots/m72-pulse-ring.png)',
       fs.existsSync(`${here}/shots/m72-pulse-ring.png`) &&
       shotSt.count === 1 && shotSt.scale > 10 && shotSt.light > 4000,
       `count=${shotSt.count}, scale=${shotSt.scale.toFixed(1)},` +
       ` light=${shotSt.light.toFixed(0)}`);
     await page.waitForFunction(() => window.SIM.FX.count === 0,
+      { timeout: 10000 });
+  }
+
+  /* ------------------------------------------------------------------
+   * M7.3 — animated electrical arcs: line segments regenerated every
+   *        N frames between anchor points
+   *
+   *  One shared LineSegments (pre-allocated position + color buffers,
+   *  additive vertex colors — the color IS the light). State lives in
+   *  the M6.1 pool 'fx-arc' (capacity = HIGH tier cap ⇒ zero `new`
+   *  after init). 0 live ⇒ drawRange 0 ⇒ 0 draw calls added. Bolt =
+   *  main 12-segment jittered polyline + 3 forks; the whole slot is
+   *  re-jittered every CFG.fx.arcs.regenFrames frames. Dev trigger:
+   *  Key T sparks substation→substation + creature→ring road.
+   * ------------------------------------------------------------------ */
+  {
+    /* registered + pre-allocated: pool, one LineSegments, buffers */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM;
+      const p = S.POOL.list.find(pp => pp.name === 'fx-arc');
+      const g = S.FX.arcs.geometry;
+      return {
+        hasArcs: !!S.FX.arcs,
+        cap: p ? p.capacity : -1,
+        hi: S.CFG.fx.arcs.tiers.high,
+        lo: S.CFG.fx.arcs.tiers.low,
+        type: S.FX.arcs.type,
+        inScene: S.scene.children.includes(S.FX.arcs),
+        posLen: g.attributes.position.array.length,
+        colLen: g.attributes.color.array.length,
+        verts: S.FX._arcVerts,
+        drawRange: g.drawRange.count,
+        arcCount: S.FX.arcCount,
+        inUse: p ? p.capacity - p.top : -1,
+        additive: S.FX._arcMat.blending === 2, // THREE.AdditiveBlending
+        vertexColors: S.FX._arcMat.vertexColors === true,
+      };
+    });
+    check('M7.3: FX arcs registered — fx-arc pool (capacity = HIGH tier cap), one LineSegments with pre-allocated buffers, idle 0 live / drawRange 0',
+      reg.hasArcs && reg.cap === reg.hi && reg.lo < reg.hi &&
+      reg.type === 'LineSegments' && reg.inScene &&
+      reg.posLen === reg.cap * reg.verts * 3 && reg.colLen === reg.posLen &&
+      reg.drawRange === 0 && reg.arcCount === 0 && reg.inUse === 0 &&
+      reg.additive && reg.vertexColors,
+      `cap=${reg.cap}, verts=${reg.verts}, drawRange=${reg.drawRange}`);
+
+    /* idle cost zero: at 0 live the shared LineSegments is hidden ⇒
+     * 0 draw calls added (three r160 does not skip drawRange-0
+     * objects), and the call count is stable */
+    const parity = await page.evaluate(async () => {
+      const S = window.SIM;
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      const sample = async n => {
+        const a = [];
+        await sleep(150);
+        for (let i = 0; i < n; i++) {
+          a.push(S.renderer.info.render.calls);
+          await sleep(120);
+        }
+        return a;
+      };
+      const P = S.PARTS;
+      P.smesh.visible = false;            // ambient with variable calls
+      P.spoints.visible = false;
+      const zero = await sample(4);
+      const hidden = S.FX.arcs.visible === false;
+      P.smesh.visible = true;
+      P.spoints.visible = true;
+      return { zero, hidden };
+    });
+    const stable = a => a.every(v => v === a[0]);
+    check('M7.3: idle = zero added draw calls (arcs hidden at 0 live, stable calls)',
+      stable(parity.zero) && parity.hidden,
+      `zero=${parity.zero.join()}, hidden=${parity.hidden}`);
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const maxDelta = n => page.evaluate(async n2 => {
+      let last = performance.now(), m = 0;
+      for (let i = 0; i < n2; i++) {
+        await new Promise(r => requestAnimationFrame(r));
+        const now = performance.now();
+        if (now - last > m) m = now - last;
+        last = now;
+      }
+      return m;
+    }, n);
+
+    const heapBefore = await heapMin();
+    const base = parity.zero[0];
+    const baseDelta = await maxDelta(40);
+
+    /* manual key T sparks BOTH anchor types: substation→substation
+     * (two distinct live substations) + creature→ring road (antenna
+     * tip → ring-road lane point at a vehicle altitude); exactly +1
+     * draw call (the one shared LineSegments) */
+    await page.keyboard.press('t');
+    await page.waitForFunction(() => window.SIM.FX.arcCount === 2,
+      { timeout: 5000 });
+    const a0 = await page.evaluate(async () => {
+      const S = window.SIM, F = S.FX;
+      const P = S.PARTS;
+      P.smesh.visible = false;
+      P.spoints.visible = false;
+      await new Promise(r => setTimeout(r, 120));
+      const calls = S.renderer.info.render.calls;
+      P.smesh.visible = true;
+      P.spoints.visible = true;
+      const s = F._arcLive[0], c = F._arcLive[1];
+      const list = P._subList;
+      const onSub = (x, y, z) => list.some(e =>
+        e.x === x && e.z === z && Math.abs(e.hTop + 0.5 - y) < 0.6);
+      const e1 = onSub(s.ax, s.ay, s.az), e2 = onSub(s.bx, s.by, s.bz);
+      const m1 = list.filter(e => e.x === s.ax && e.z === s.az);
+      const m2 = list.filter(e => e.x === s.bx && e.z === s.bz);
+      const distinct = m1.length === 1 && m2.length === 1 &&
+        !(m1[0].x === m2[0].x && m1[0].z === m2[0].z);
+      /* creature→ring: A at the antenna tip (root at origin ⇒ local
+       * is world), B on the ring-road lane at a vehicle altitude */
+      const g = S.ENTITY.parts.antenna1.position;
+      const aOk = Math.abs(c.ax - g.x) < 0.1 &&
+        Math.abs(c.ay - (g.y + 12.4)) < 0.1 && Math.abs(c.az - g.z) < 0.1;
+      const alts = S.CFG.traffic.vehicle.altitudes;
+      const bOk = Math.abs(c.bx) === S.CFG.fx.arcs.ringLane &&
+        alts.includes(c.by) && Math.abs(c.bz) <= S.CFG.fx.arcs.ringZ + 1;
+      const pp = S.POOL.list.find(q => q.name === 'fx-arc');
+      return {
+        count: F.arcCount, calls,
+        zeroNew: F._arcLive.slice(0, F.arcCount).every(it =>
+          it.__pool && it.__pool.name === 'fx-arc' && it.__free === false),
+        inUse: pp.capacity - pp.top,
+        subEnds: e1 && e2, distinct, aOk, bOk,
+      };
+    });
+    check('M7.3: key T sparks BOTH anchor types — substation↔substation (two distinct live substations) + creature→ring road (antenna tip → ring-road lane)',
+      a0.count === 2 && a0.subEnds && a0.distinct && a0.aOk && a0.bOk,
+      `count=${a0.count}, sub=${a0.subEnds}/${a0.distinct},` +
+      ` aOk=${a0.aOk}, bOk=${a0.bOk}`);
+    check('M7.3: key T adds exactly +1 draw call (the one shared LineSegments)',
+      a0.calls === base + 1,
+      `calls=${a0.calls} (idle=${base})`);
+    check('M7.3: every live arc is a pre-created pool item (zero `new` after init)',
+      a0.zeroNew && a0.inUse === a0.count, `inUse=${a0.inUse}`);
+
+    /* regeneration: position buffer stable between ticks and re-
+     * jittered exactly every N frames (1 change per N-frame cycle) */
+    const regen = await page.evaluate(async () => {
+      const S = window.SIM, F = S.FX;
+      const N = S.CFG.fx.arcs.regenFrames;
+      const p = F.arcs.geometry.attributes.position.array;
+      const hash = () => {
+        let h = 0;
+        for (let i = 0; i < p.length; i += 31)
+          h = (h * 31 + Math.round(p[i] * 1000) +
+            Math.round(p[i + 1] * 1000)) | 0;
+        return h;
+      };
+      const rows = [];
+      for (let i = 0; i < 12; i++) {
+        await new Promise(r => requestAnimationFrame(r));
+        rows.push({ tick: F._arcTick, h: hash() });
+      }
+      let changes = 0;
+      for (let i = 1; i < rows.length; i++)
+        if (rows[i].h !== rows[i - 1].h) changes++;
+      const zeros = rows.filter(r => r.tick === 0).length;
+      return { changes, zeros, N, arcCount: F.arcCount };
+    });
+    check('M7.3: bolts regenerate exactly every N frames (stable between ticks, 1 change per N-frame cycle)',
+      regen.arcCount === 2 &&
+      regen.zeros === 12 / regen.N && regen.changes === 12 / regen.N,
+      `N=${regen.N}, zeros=${regen.zeros}, changes=${regen.changes}`);
+
+    /* regen is frame-cheap: rAF delta window with the 2 live bolts
+     * re-jittering every N frames stays within 2× the baseline max
+     * frame (100 ms floor — headless rAF jitter tolerance) */
+    const liveDelta = await maxDelta(60);
+    check('M7.3: regeneration is frame-cheap (rAF deltas with live arcs within 2× baseline, 100 ms floor)',
+      liveDelta <= Math.max(2 * baseDelta, 100),
+      `live=${liveDelta.toFixed(1)}ms, base=${baseDelta.toFixed(1)}ms`);
+
+    /* tier cap: 8 fired arcs trim to the LOW cap, HIGH restores */
+    await page.waitForFunction(() => window.SIM.FX.arcCount === 0,
+      { timeout: 10000 });
+    await page.evaluate(() => {
+      const F = window.SIM.FX;
+      for (let i = 0; i < 8; i++)
+        F.arc({ x: i * 5, y: 10, z: -40 - i },
+              { x: i * 5 + 3, y: 14, z: -46 - i }, null);
+    });
+    await page.waitForFunction(() => window.SIM.FX.arcCount === 8,
+      { timeout: 5000 });
+    await page.evaluate(() => window.SIM.TIER.set('low'));
+    await page.waitForFunction(() => window.SIM.FX.arcCount === 3,
+      { timeout: 5000 });
+    const low = await page.evaluate(() => {
+      const S = window.SIM;
+      const p = S.POOL.list.find(pp => pp.name === 'fx-arc');
+      return { count: S.FX.arcCount, inUse: p.capacity - p.top };
+    });
+    check('M7.3: LOW tier trims 8 fired arcs to the LOW cap (excess released)',
+      low.count === 3 && low.inUse === 3,
+      `count=${low.count}, inUse=${low.inUse}`);
+    /* HIGH tier holds the full cap: fire 5 more while the 3 survivors
+     * are still alive ⇒ all 8 stay live (no trim at the HIGH cap) */
+    await page.evaluate(() => window.SIM.TIER.set('high'));
+    await page.waitForFunction(() => window.SIM.FX.arcCount === 3,
+      { timeout: 5000 });
+    await page.evaluate(() => {
+      const F = window.SIM.FX;
+      for (let i = 0; i < 5; i++)
+        F.arc({ x: 40 + i * 5, y: 10, z: -40 - i },
+              { x: 43 + i * 5, y: 14, z: -46 - i }, null);
+    });
+    await page.waitForFunction(() => window.SIM.FX.arcCount === 8,
+      { timeout: 5000 });
+    const cap = await page.evaluate(() => {
+      const S = window.SIM;
+      return { count: S.FX.arcCount, calls: S.renderer.info.render.calls };
+    });
+    check('M7.3: HIGH tier holds the full arc cap (8 live, no trim); draw calls inside budget',
+      cap.count === 8 && cap.calls > 0 && cap.calls < 150,
+      `count=${cap.count}, calls=${cap.calls}`);
+
+    /* arcs resolve clean: 0 live, drawRange 0, pool drained */
+    await page.waitForFunction(() => window.SIM.FX.arcCount === 0,
+      { timeout: 10000 });
+    const resolved = await page.evaluate(() => {
+      const S = window.SIM, F = S.FX;
+      const p = S.POOL.list.find(pp => pp.name === 'fx-arc');
+      return {
+        count: F.arcCount,
+        drawRange: F.arcs.geometry.drawRange.count,
+        inUse: p.capacity - p.top,
+      };
+    });
+    check('M7.3: arcs resolve clean — 0 live, drawRange 0, pool drained',
+      resolved.count === 0 && resolved.drawRange === 0 && resolved.inUse === 0,
+      `drawRange=${resolved.drawRange}, inUse=${resolved.inUse}`);
+
+    /* heap flat across the whole arc sequence */
+    const heapAfter = await heapMin();
+    check('M7.3: no allocation per regen (heap flat across the arc sequence)',
+      heapBefore > 0 && heapAfter > 0 &&
+      heapAfter - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,` +
+      ` after=${Math.round(heapAfter / 1024)}KB`);
+
+    /* visual gate: both anchor types in frame — street-level view
+     * from the NE corner: the substation↔substation bolt across the
+     * right half + the creature→ring-road bolt over the city. The
+     * pose is empirical (city layout is seeded ⇒ stable): all four
+     * live arc endpoints project inside 900×600, and the check below
+     * asserts that projection, so a pose that misses fails the gate */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(-180, 40, 180);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.fov = 60;                  // reset wheel zoom ⇒ deterministic pose
+      S.CAMERA.yaw = 2.22;               // NE corner, over the plaza
+      S.CAMERA.pitch = -0.35;
+    });
+    await sleep(4500);                   // let PARTS._subList refresh
+    await page.keyboard.press('t');
+    await page.waitForFunction(() => window.SIM.FX.arcCount === 2,
+      { timeout: 5000 });
+    await sleep(550);                    // u≈0.25 ⇒ sin-fade ≈ 0.7
+    await page.screenshot({ path: `${here}/shots/m73-arcs.png` });
+    const shotSt = await page.evaluate(() => {
+      const S = window.SIM, F = S.FX;
+      const g = S.ENTITY.parts.antenna1.position;
+      const c = F._arcLive[1];
+      const v = F._arcVa;
+      const proj = p => {
+        v.set(p.x, p.y, p.z).project(S.camera);
+        return [(v.x + 1) * 450, (1 - v.y) * 300];
+      };
+      const pts = [];
+      for (let i = 0; i < F.arcCount; i++) {
+        const a = F._arcLive[i];
+        pts.push(proj({ x: a.ax, y: a.ay, z: a.az }),
+                 proj({ x: a.bx, y: a.by, z: a.bz }));
+      }
+      return {
+        count: F.arcCount,
+        fade: Math.sin((F._arcLive[0].age / F._arcLive[0].life) * Math.PI),
+        aOk: Math.abs(c.ax - g.x) < 0.1 &&
+          Math.abs(c.ay - (g.y + 12.4)) < 0.1,
+        drawRange: F.arcs.geometry.drawRange.count,
+        inFrame: pts.every(p => p[0] >= 0 && p[0] <= 900 &&
+                          p[1] >= 0 && p[1] <= 600),
+      };
+    });
+    check('M7.3: screenshot with both anchor types in frame (shots/m73-arcs.png)',
+      fs.existsSync(`${here}/shots/m73-arcs.png`) &&
+      shotSt.count === 2 && shotSt.fade > 0.5 && shotSt.aOk &&
+      shotSt.inFrame &&
+      shotSt.drawRange === 2 * shotSt.count * 21,
+      `count=${shotSt.count}, fade=${shotSt.fade.toFixed(2)},` +
+      ` inFrame=${shotSt.inFrame}`);
+    await page.waitForFunction(() => window.SIM.FX.arcCount === 0,
       { timeout: 10000 });
   }
 

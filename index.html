@@ -385,6 +385,21 @@ const CFG = {
       color: 0x66e0ff,                    // default tint (data-cyan)
       light: { intensity: 5000, distance: 90, decay: 2 },
     },
+    /* M7.3: electrical arcs — line segments regenerated every N frames
+     * between anchor points (substation→substation, creature→ring road).
+     * One shared LineSegments; 0 live ⇒ drawRange 0 ⇒ 0 draw calls. */
+    arcs: {
+      tiers: { high: 8, med: 5, low: 3 },  // simultaneous live arcs
+      life: 2.2,                           // s per discharge
+      regenFrames: 3,                      // re-jitter the bolts every N frames
+      color: 0xbfe6ff,                    // bolt tint (electric pale cyan)
+      mainSegs: 12,                       // main-bolt subdivisions
+      branches: 3,                        // forks per bolt
+      branchSegs: 3,                      // subdivisions per fork
+      jitter: 2.2,                        // m max perpendicular offset
+      ringLane: 132,                      // ring-road lane for creature→ring (120+12)
+      ringZ: 60,                          // max lane offset along the road (m)
+    },
   },
 };
 
@@ -535,6 +550,7 @@ const INPUT = {
   modeSwitch: false,           // V / gamepad A-button edge
   rainTrigger: false,         // P edge — dev trigger: rain all particles
   pulseTrigger: false,        // R edge — dev trigger: FX.pulse ahead
+  arcTrigger: false,          // T edge — dev trigger: FX arcs (sub↔sub, creature→ring)
 
   pad: {
     connected: false,
@@ -551,6 +567,7 @@ const INPUT = {
       if (e.code === 'KeyV' && !e.repeat) INPUT.modeSwitch = true;
       if (e.code === 'KeyP' && !e.repeat) INPUT.rainTrigger = true;
       if (e.code === 'KeyR' && !e.repeat) INPUT.pulseTrigger = true;
+      if (e.code === 'KeyT' && !e.repeat) INPUT.arcTrigger = true;
       INPUT.keys.add(e.code);
       if (e.code === 'Space') e.preventDefault();
     });
@@ -3475,20 +3492,31 @@ const PARTS = {
 };
 
 /* ==================================================================== *
- * FX — pulse (M7.2); later: arcs (M7.3), flash (M7.4), shake (M7.5)
+ * FX — pulse (M7.2) + electrical arcs (M7.3); later: flash (M7.4),
+ *     shake (M7.5)
  *
  *  - FX.pulse(origin, radius, color): expanding ground ring on ONE
  *    shared InstancedMesh (per-instance color = tint × fade on the
  *    shared additive MATS.pulseGlow — the color IS the light) plus a
  *    light-intensity ramp (one pooled PointLight per live pulse,
  *    invisible while idle ⇒ no light slot cost at rest)
- *  - state lives in the M6.1 pool 'fx-pulse' (fixed capacity = HIGH
- *    tier cap ⇒ zero `new` after init); tier cap =
- *    CFG.fx.pulse.tiers[TIER.name], same farthest-release trim as the
+ *  - FX.arc(a, b, color): electrical bolt between two anchor points on
+ *    ONE shared LineSegments — main polyline (perpendicular jitter,
+ *    zero at the anchors) + 3 short forks; the whole slot is re-jittered
+ *    (REGENERATED) every CFG.fx.arcs.regenFrames frames ⇒ the bolt
+ *    flickers. Per-vertex color = tint × sin-fade (forks dimmer)
+ *  - state lives in the M6.1 pools 'fx-pulse' / 'fx-arc' (fixed
+ *    capacity = HIGH tier cap ⇒ zero `new` after init); tier caps =
+ *    CFG.fx.<kind>.tiers[TIER.name], same farthest-release trim as the
  *    M6/M7 fleets
- *  - 0 live ⇒ ring count 0 + all lights invisible ⇒ 0 draw calls added
- *  - dev trigger: Key R fires a pulse ahead of the player
- *  - audio thump: wired in M11.3 (seam: the pulse() call site)
+ *  - 0 live ⇒ ring count 0 + lights invisible + arc drawRange 0
+ *    ⇒ 0 draw calls added
+ *  - dev trigger: Key R fires a pulse ahead of the player; Key T
+ *    sparks arcs — substation→substation (two nearest live
+ *    substations) + creature→ring road (antenna tip → a ring-road
+ *    lane point at a vehicle altitude)
+ *  - audio thump/crackle: wired in M11.3 (seam: the pulse()/arc()
+ *    call sites)
  * --------------------------------------------------------------------- */
 const FX = {
   name: 'FX',
@@ -3498,6 +3526,20 @@ const FX = {
   _live: null,
   _lights: [],
   _cap: 0,
+  /* M7.3: electrical arcs */
+  arcs: null,            // shared LineSegments (one draw call)
+  arcCount: 0,           // live arcs (= drawRange / verts per arc)
+  _arcPool: null,
+  _arcLive: null,
+  _arcCap: 0,
+  _arcTick: 0,           // regen counter (regen on wrap to 0)
+  _arcVerts: 0,          // line vertices per arc (segs × 2)
+  _arcPos: null,         // pre-allocated position buffer
+  _arcCol: null,         // pre-allocated color buffer
+  _arcMat: null,
+  _arcPts: new Float32Array(13 * 3),  // main-bolt points scratch
+  _arcVa: new THREE.Vector3(),
+  _arcCap2: 0,
   /* scratch (zero per-frame allocation) */
   _m: new THREE.Matrix4(),
   _p: new THREE.Vector3(),
@@ -3536,6 +3578,36 @@ const FX = {
       FX._lights[i] = p;
     }
     FX._cap = CFG.fx.pulse.tiers[TIER.name];
+    /* M7.3: electrical arcs — one shared LineSegments with pre-
+     * allocated position + color buffers (zero `new` after init);
+     * drawRange tracks the live count ⇒ 0 live = 0 draw calls. */
+    const acf = CFG.fx.arcs;
+    const segs = acf.mainSegs + acf.branches * acf.branchSegs;
+    FX._arcVerts = segs * 2;
+    FX._arcCap2 = acf.mainSegs * 2;      // fork vertices start here
+    const hiA = acf.tiers.high;
+    FX._arcPos = new Float32Array(hiA * FX._arcVerts * 3);
+    FX._arcCol = new Float32Array(hiA * FX._arcVerts * 3);
+    const ag = new THREE.BufferGeometry();
+    ag.setAttribute('position', new THREE.BufferAttribute(FX._arcPos, 3));
+    ag.setAttribute('color', new THREE.BufferAttribute(FX._arcCol, 3));
+    ag.setDrawRange(0, 0);
+    FX._arcMat = new THREE.LineBasicMaterial({
+      vertexColors: true, transparent: true,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    FX.arcs = new THREE.LineSegments(ag, FX._arcMat);
+    FX.arcs.frustumCulled = false;
+    FX.arcs.name = 'fx-arcs';
+    scene.add(FX.arcs);
+    FX._arcLive = new Array(hiA);
+    FX._arcPool = POOL.make('fx-arc', hiA, () => ({
+      ax: 0, ay: 0, az: 0, bx: 0, by: 0, bz: 0,  // anchors (metres)
+      age: 0, life: 2.2,
+      cR: 0.75, cG: 0.9, cB: 1,                  // tint (× fade per frame)
+      j: new Float32Array(48),                  // regen jitter scratch
+    }));
+    FX._arcCap = acf.tiers[TIER.name];
   },
 
   /* public API — M9.4 plaza pulse, M13.2 data pulse, dev trigger Key R.
@@ -3561,6 +3633,155 @@ const FX = {
     FX._live[FX.count++] = it;
     /* audio thump: wired in M11.3 */
     return it;
+  },
+
+  /* public API — M9.4 substation cascade, M13.4 EM discharge, dev
+   * trigger Key T. a/b: Vector3-like {x,y,z} anchors. Returns the pool
+   * item (null = cap hit, nothing allocated, nothing thrown). */
+  arc(a, b, color) {
+    const it = FX._arcPool.acquire();
+    if (!it) return null;
+    it.ax = a.x; it.ay = a.y; it.az = a.z;
+    it.bx = b.x; it.by = b.y; it.bz = b.z;
+    it.age = 0;
+    it.life = CFG.fx.arcs.life;
+    if (color && color.isColor) {
+      it.cR = color.r; it.cG = color.g; it.cB = color.b;
+    } else if (typeof color === 'number') {
+      FX._c.setHex(color);
+      it.cR = FX._c.r; it.cG = FX._c.g; it.cB = FX._c.b;
+    } else {
+      FX._c.setHex(CFG.fx.arcs.color);
+      it.cR = FX._c.r; it.cG = FX._c.g; it.cB = FX._c.b;
+    }
+    FX._arcLive[FX.arcCount++] = it;
+    FX._regenArc(FX.arcCount - 1);
+    FX.arcs.geometry.setDrawRange(0, FX.arcCount * FX._arcVerts);
+    FX.arcs.geometry.attributes.position.needsUpdate = true;
+    /* audio crackle: wired in M11.3 */
+    return it;
+  },
+
+  /* rebuild one arc slot: refill the jitter scratch with fresh randoms
+   * and re-emit the bolt polyline (main + forks) into the pre-
+   * allocated buffers — this IS the "regenerated every N frames" step,
+   * zero allocation. */
+  _regenArc(i) {
+    const it = FX._arcLive[i];
+    const cf = CFG.fx.arcs;
+    const j = it.j;
+    for (let k = 0; k < 46; k++) j[k] = Math.random();
+    /* unit direction + perpendicular basis (p1, p2) */
+    const dx0 = it.bx - it.ax, dy0 = it.by - it.ay, dz0 = it.bz - it.az;
+    const dl = Math.hypot(dx0, dy0, dz0) || 1;
+    const dx = dx0 / dl, dy = dy0 / dl, dz = dz0 / dl;
+    let p1x = -dz, p1z = dx;                 // cross(dir, up), y = 0
+    const pl = Math.hypot(p1x, p1z);
+    if (pl < 0.001) { p1x = 1; p1z = 0; }
+    else { p1x /= pl; p1z /= pl; }
+    const p2x = dy * p1z, p2y = dz * p1x - dx * p1z, p2z = -dy * p1x;
+    /* main bolt: jittered polyline, zero offset at both anchors */
+    const pts = FX._arcPts;
+    for (let m = 0; m <= cf.mainSegs; m++) {
+      const t = m / cf.mainSegs;
+      let px = it.ax + dx * t * dl;
+      let py = it.ay + dy * t * dl;
+      let pz = it.az + dz * t * dl;
+      if (m > 0 && m < cf.mainSegs) {
+        const amp = Math.sin(t * Math.PI) * cf.jitter;
+        const th = j[2 * m - 2] * 6.2831853;
+        const rr = (0.3 + 0.7 * j[2 * m - 1]) * amp;
+        px += p1x * Math.cos(th) * rr + p2x * Math.sin(th) * rr;
+        py += p2y * Math.sin(th) * rr;
+        pz += p1z * Math.cos(th) * rr + p2z * Math.sin(th) * rr;
+      }
+      pts[m * 3] = px; pts[m * 3 + 1] = py; pts[m * 3 + 2] = pz;
+    }
+    /* emit the slot: main segments, then the forks (dimmer) */
+    const pos = FX._arcPos, col = FX._arcCol;
+    const v0 = i * FX._arcVerts;
+    let v = v0;
+    const put = (x1, y1, z1, x2, y2, z2, br) => {
+      pos[v] = x1; pos[v + 1] = y1; pos[v + 2] = z1;
+      pos[v + 3] = x2; pos[v + 4] = y2; pos[v + 5] = z2;
+      col[v] = it.cR * br; col[v + 1] = it.cG * br; col[v + 2] = it.cB * br;
+      col[v + 3] = it.cR * br; col[v + 4] = it.cG * br; col[v + 5] = it.cB * br;
+      v += 6;
+    };
+    for (let m = 0; m < cf.mainSegs; m++) {
+      put(pts[m * 3], pts[m * 3 + 1], pts[m * 3 + 2],
+          pts[m * 3 + 3], pts[m * 3 + 4], pts[m * 3 + 5], 1.0);
+    }
+    for (let k = 0; k < cf.branches; k++) {
+      const jo = 22 + 8 * k;
+      const a = 3 + 3 * k;                   // fork attaches at main pt 3/6/9
+      const mx = pts[a * 3], my = pts[a * 3 + 1], mz = pts[a * 3 + 2];
+      const phi = j[jo] * 6.2831853;
+      const tilt = j[jo + 1] * 1.2 - 0.6;
+      const s = 0.7 + 0.6 * j[jo + 2];
+      let fx = p1x * Math.cos(phi) + p2x * Math.sin(phi) + dx * tilt;
+      let fy = p2y * Math.sin(phi) + dy * tilt;
+      let fz = p1z * Math.cos(phi) + p2z * Math.sin(phi) + dz * tilt;
+      const fl = Math.hypot(fx, fy, fz) || 1;
+      fx /= fl; fy /= fl; fz /= fl;
+      let px = mx, py = my, pz = mz;
+      for (let m2 = 1; m2 <= cf.branchSegs; m2++) {
+        const step = 2.6 * s;
+        const th2 = j[jo + 3 + (m2 - 1) * 2] * 6.2831853;
+        const rr2 = j[jo + 4 + (m2 - 1) * 2] * 1.0;
+        put(px, py, pz,
+            px + fx * step + Math.cos(th2) * rr2,
+            py + fy * step + Math.sin(th2) * rr2 * 0.5,
+            pz + fz * step + Math.sin(th2 * 2) * rr2, 0.55);
+        px += fx * step; py += fy * step; pz += fz * step;
+      }
+    }
+  },
+
+  _regenAll() {
+    for (let i = 0; i < FX.arcCount; i++) FX._regenArc(i);
+    FX.arcs.geometry.attributes.position.needsUpdate = true;
+  },
+
+  /* dev trigger (Key T): one substation→substation bolt (the two
+   * nearest live substations) + one creature→ring-road bolt (antenna
+   * tip → a ring-road lane point at a vehicle altitude) */
+  _fireArcs() {
+    const cf = CFG.fx.arcs;
+    const p = CAMERA.pos;
+    const list = PARTS._subList;
+    if (list.length >= 2) {
+      let a = -1, b = -1, da = Infinity, db = Infinity;
+      for (let i = 0; i < list.length; i++) {
+        const s = list[i];
+        const d = Math.hypot(s.x - p.x, s.z - p.z);
+        if (d < da) { db = da; b = a; a = i; da = d; }
+        else if (d < db) { db = d; b = i; }
+      }
+      const s1 = list[a], s2 = list[b];
+      FX.arc({ x: s1.x, y: s1.hTop + 0.5, z: s1.z },
+             { x: s2.x, y: s2.hTop + 0.5, z: s2.z });
+    }
+    const tip = ENTITY.parts.antenna1;
+    tip.getWorldPosition(FX._arcVa);
+    FX._arcVa.y += 12.4;              // mast top + tip box
+    const alts = CFG.traffic.vehicle.altitudes;
+    const alt = alts[(Math.random() * alts.length) | 0];
+    FX.arc(FX._arcVa,
+           { x: cf.ringLane, y: alt, z: (Math.random() * 2 - 1) * cf.ringZ });
+  },
+
+  _arcReleaseAt(i) {
+    const it = FX._arcLive[i];
+    const m = --FX.arcCount;
+    if (i !== m) {
+      FX._arcLive[i] = FX._arcLive[m];
+      FX._regenArc(i);                // the moved arc keeps its slot
+    }
+    FX._arcLive[m] = undefined;
+    FX._arcPool.release(it);
+    FX.arcs.geometry.setDrawRange(0, FX.arcCount * FX._arcVerts);
+    FX.arcs.geometry.attributes.position.needsUpdate = true;
   },
 
   update(dt, t) {
@@ -3628,6 +3849,59 @@ const FX = {
       L.visible = on;
       if (!on) L.intensity = 0;
     }
+
+    /* ---- M7.3: electrical arcs ---- */
+    if (INPUT.arcTrigger) {
+      INPUT.arcTrigger = false;
+      FX._fireArcs();
+    }
+    if (FX.arcCount > 0) {
+      const acf = CFG.fx.arcs;
+      /* tier cap: trim the farthest arcs down to the tier limit */
+      FX._arcCap = acf.tiers[TIER.name];
+      while (FX.arcCount > FX._arcCap) {
+        let fi = 0, fd = -1;
+        for (let i = 0; i < FX.arcCount; i++) {
+          const it = FX._arcLive[i];
+          const mx = (it.ax + it.bx) * 0.5 - CAMERA.pos.x;
+          const mz = (it.az + it.bz) * 0.5 - CAMERA.pos.z;
+          const dist2 = mx * mx + mz * mz;
+          if (dist2 > fd) { fd = dist2; fi = i; }
+        }
+        FX._arcReleaseAt(fi);
+      }
+      /* age + release expired discharges */
+      for (let i = FX.arcCount - 1; i >= 0; i--) {
+        const it = FX._arcLive[i];
+        it.age += dt;
+        if (it.age >= it.life) FX._arcReleaseAt(i);
+      }
+      /* REGENERATE: re-jitter every bolt every N frames (frame-cheap —
+       * ≤ 8 × 42 vertices of pre-allocated buffer writes) */
+      FX._arcTick = (FX._arcTick + 1) % acf.regenFrames;
+      if (FX._arcTick === 0) FX._regenAll();
+      /* per-frame sin-fade on the vertex colors (forks dimmer) */
+      const col = FX._arcCol;
+      for (let i = 0; i < FX.arcCount; i++) {
+        const it = FX._arcLive[i];
+        const u = it.age / it.life;
+        const f = Math.sin(u * Math.PI);
+        const v0 = i * FX._arcVerts;
+        for (let v2 = 0; v2 < FX._arcVerts; v2 += 2) {
+          const br = v2 >= FX._arcCap2 ? 0.55 : 1.0;
+          const c = v0 + v2;
+          col[c * 3] = it.cR * f * br;
+          col[c * 3 + 1] = it.cG * f * br;
+          col[c * 3 + 2] = it.cB * f * br;
+        }
+      }
+      if (FX.arcCount > 0) {
+        FX.arcs.geometry.attributes.color.needsUpdate = true;
+      }
+    }
+    /* 0 live ⇒ the shared LineSegments is hidden ⇒ 0 draw calls added
+     * (three r160 does not skip drawRange-0 objects) */
+    FX.arcs.visible = FX.arcCount > 0;
   },
 
   _releaseAt(i) {
@@ -3640,12 +3914,18 @@ const FX = {
 
   dispose() {
     for (let i = FX.count - 1; i >= 0; i--) FX._releaseAt(i);
+    for (let i = FX.arcCount - 1; i >= 0; i--) FX._arcReleaseAt(i);
     if (FX.ring) {
       scene.remove(FX.ring);
       FX.ring.geometry.dispose();
       /* material = shared MATS.pulseGlow (M4) — not disposed here */
     }
     for (const L of FX._lights) scene.remove(L);
+    if (FX.arcs) {
+      scene.remove(FX.arcs);
+      FX.arcs.geometry.dispose();
+      FX._arcMat.dispose();
+    }
   },
 };
 
@@ -4122,7 +4402,7 @@ const HUD = {
     HUD.hintEl.textContent =
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
       'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
-      'P particles · R pulse';
+      'P particles · R pulse · T arcs';
   },
 
   update(dt) {
