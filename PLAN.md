@@ -56,7 +56,7 @@ smoke-test evidence.
 | **M6.4** ✅ | Steam vents (cooling towers, billboard sprite pool, upward drift, fade) + sparks (substations, tiny points, brief life) | Both emitters run idle-cheap; smoke shot shows steam + sparks at source buildings |
 | **M6.5** ✅ | Adaptive caps: `TRAFFIC` reads current FPS tier, scales all M6 pools | Forcing LOW tier in smoke run visibly halves caps; back to HIGH restores; no spike |
 | **M7.1** ✅ | Pooled `Points`/sprite particle system: steam, sparks, pulse motes, lightning motes, awakening rain — one system, one budget | One trigger key rains all particle types; idle cost ~0 in stats |
-| **M7.2** | `FX.pulse(origin, radius, color)`: expanding instanced ring mesh + light-intensity ramp (+ audio hook once M11 lands) | Manual key fires a visible pulse; nothing allocated; idle = zero draw calls added |
+| **M7.2** ✅ | `FX.pulse(origin, radius, color)`: expanding instanced ring mesh + light-intensity ramp (+ audio hook once M11 lands) | Manual key fires a visible pulse; nothing allocated; idle = zero draw calls added |
 | **M7.3** | Animated electrical arcs: Line segments regenerated every N frames between anchors (substation→substation, creature→ring) | Manual key sparks arcs between two substations and creature→ring; regen is frame-cheap |
 | **M7.4** | Screen-space flash: overlay-scene additive plane (or DOM div) driven by `FX.flash(intensity)` | Manual key flashes screen; decays to zero; costs nothing idle |
 | **M7.5** | Camera shake: impulse-decay system consumed by `CAMERA` | Manual key shakes camera with clean decay to still; never accumulates |
@@ -336,12 +336,33 @@ pools never allocate per frame.
   sections now read them from `S.PARTS`/`S.CFG.parts` and pass unchanged;
   the M2 gate also hides the five PARTS meshes.
 
-#### M7.2 — `FX.pulse`
-- [ ] `FX.pulse(origin, radius, color)`: expanding instanced ring mesh +
+#### M7.2 — `FX.pulse` ✅
+- [x] `FX.pulse(origin, radius, color)`: expanding instanced ring mesh +
       light-intensity ramp (+ audio thump once M11.3 lands).
 - **Test:** manual key fires a visible pulse; zero allocation; zero
       added draw calls while idle.
 - **Commit when:** pulse verified on key press.
+- **Verified:** smoke M7.2 section green — `FX` registered in fixed order
+  (…PARTS, FX, HUD); state on the M6.1 pool `fx-pulse` (fixed capacity =
+  HIGH tier cap 6 ⇒ every live pulse a pre-created pool item, zero `new`
+  after init); the ring is ONE shared InstancedMesh (RingGeometry 0.92–1.0
+  on the ground plane, XZ instance scale = radius, shared additive
+  `MATS.pulseGlow` ⇒ per-instance color = tint × sin-fade IS the light)
+  plus one pooled PointLight per live pulse (slot i ⇔ live[i],
+  intensity = 5000 × sin²(u·π), hidden while idle); idle = zero added
+  draw calls (call count identical with the ring hidden vs shown at 0
+  live); Key R fires a pulse 32 m ahead of the player ⇒ exactly +1 draw
+  call (the ring) with the pooled light on; ring visibly expands tracking
+  the eased-out radius (24.6 → 35.3 m, want 35.3); light intensity tracks
+  the sin² peak (5000, want 5000); pulse resolves clean (0 live, ring
+  count 0, lights hidden + intensity 0, pool drained); `FX.pulse`
+  honours radius + color args (sRGB → working space, defaults honoured);
+  LOW trims 6 fired pulses to the LOW cap 2 (excess released, inUse ===
+  count), HIGH restores 6 (draw calls 53 < 150); heap flat across the
+  whole pulse sequence (min-of-3-sample churn ≤ 2 MB); screenshot
+  `smoke/shots/m72-pulse-ring.png` (ring + light peak in frame, camera
+  straight-down at GROUND max height). Audio thump deliberately deferred
+  to M11.3 (seam: the `pulse()` call site).
 
 #### M7.3 — Animated electrical arcs
 - [ ] Line segments regenerated every N frames between anchor points

@@ -372,6 +372,20 @@ const CFG = {
       burst: { steam: 10, spark: 14, pulse: 24, light: 14 },
     },
   },
+
+  /* ---- M7.2: FX — pulse (arcs M7.3, flash M7.4, shake M7.5) ----
+   * FX.pulse(origin, radius, color): expanding ground ring (one shared
+   * InstancedMesh) + a light-intensity ramp (one pooled PointLight per
+   * live pulse). 0 live ⇒ 0 instances + hidden lights ⇒ 0 draw calls. */
+  fx: {
+    pulse: {
+      tiers: { high: 6, med: 4, low: 2 },  // simultaneous live pulses
+      radius: 40,                          // default target radius (m)
+      life: 1.6,                           // s per pulse
+      color: 0x66e0ff,                    // default tint (data-cyan)
+      light: { intensity: 5000, distance: 90, decay: 2 },
+    },
+  },
 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -520,6 +534,7 @@ const INPUT = {
   sprint: false,
   modeSwitch: false,           // V / gamepad A-button edge
   rainTrigger: false,         // P edge — dev trigger: rain all particles
+  pulseTrigger: false,        // R edge — dev trigger: FX.pulse ahead
 
   pad: {
     connected: false,
@@ -535,6 +550,7 @@ const INPUT = {
       if (BOOT.state !== 'RUNNING') return;
       if (e.code === 'KeyV' && !e.repeat) INPUT.modeSwitch = true;
       if (e.code === 'KeyP' && !e.repeat) INPUT.rainTrigger = true;
+      if (e.code === 'KeyR' && !e.repeat) INPUT.pulseTrigger = true;
       INPUT.keys.add(e.code);
       if (e.code === 'Space') e.preventDefault();
     });
@@ -3459,6 +3475,181 @@ const PARTS = {
 };
 
 /* ==================================================================== *
+ * FX — pulse (M7.2); later: arcs (M7.3), flash (M7.4), shake (M7.5)
+ *
+ *  - FX.pulse(origin, radius, color): expanding ground ring on ONE
+ *    shared InstancedMesh (per-instance color = tint × fade on the
+ *    shared additive MATS.pulseGlow — the color IS the light) plus a
+ *    light-intensity ramp (one pooled PointLight per live pulse,
+ *    invisible while idle ⇒ no light slot cost at rest)
+ *  - state lives in the M6.1 pool 'fx-pulse' (fixed capacity = HIGH
+ *    tier cap ⇒ zero `new` after init); tier cap =
+ *    CFG.fx.pulse.tiers[TIER.name], same farthest-release trim as the
+ *    M6/M7 fleets
+ *  - 0 live ⇒ ring count 0 + all lights invisible ⇒ 0 draw calls added
+ *  - dev trigger: Key R fires a pulse ahead of the player
+ *  - audio thump: wired in M11.3 (seam: the pulse() call site)
+ * --------------------------------------------------------------------- */
+const FX = {
+  name: 'FX',
+  ring: null,            // shared InstancedMesh (one draw call)
+  count: 0,              // live pulses (= ring.count)
+  _pool: null,
+  _live: null,
+  _lights: [],
+  _cap: 0,
+  /* scratch (zero per-frame allocation) */
+  _m: new THREE.Matrix4(),
+  _p: new THREE.Vector3(),
+  _s: new THREE.Vector3(1, 1, 1),
+  _q: new THREE.Quaternion(),
+  _c: new THREE.Color(),
+  _fire: new THREE.Vector3(),
+
+  init() {
+    const hi = CFG.fx.pulse.tiers.high;
+    /* expanding ring: flat annulus whose outer edge is 1.0 ⇒ the
+     * instance XZ scale IS the ring radius. Ground-plane (normal +Y),
+     * shared additive material ⇒ per-instance color IS the light. */
+    const geo = new THREE.RingGeometry(0.92, 1.0, 48);
+    geo.rotateX(-Math.PI / 2);
+    FX.ring = new THREE.InstancedMesh(geo, MATS.pulseGlow, hi);
+    FX.ring.count = 0;
+    FX.ring.frustumCulled = false;
+    FX.ring.name = 'fx-pulse-ring';
+    scene.add(FX.ring);
+    FX._live = new Array(hi);
+    FX._pool = POOL.make('fx-pulse', hi, () => ({
+      ox: 0, oy: 0, oz: 0,   // origin (metres)
+      R: 40,                // target radius (metres)
+      age: 0, life: 1.6,
+      cR: 0.4, cG: 0.88, cB: 1,   // tint (× fade per frame)
+    }));
+    /* light-intensity ramp: one pooled PointLight per live pulse
+     * (slot i ⇔ _live[i] every frame; invisible while idle) */
+    const L = CFG.fx.pulse.light;
+    FX._lights = new Array(hi);
+    for (let i = 0; i < hi; i++) {
+      const p = new THREE.PointLight(0xffffff, 0, L.distance, L.decay);
+      p.visible = false;
+      scene.add(p);
+      FX._lights[i] = p;
+    }
+    FX._cap = CFG.fx.pulse.tiers[TIER.name];
+  },
+
+  /* public API — M9.4 plaza pulse, M13.2 data pulse, dev trigger Key R.
+   * origin: Vector3-like {x,y,z}; radius: target radius (m, default
+   * CFG.fx.pulse.radius); color: THREE.Color or hex. Returns the pool
+   * item (null = cap hit, nothing allocated, nothing thrown). */
+  pulse(origin, radius, color) {
+    const it = FX._pool.acquire();
+    if (!it) return null;
+    it.ox = origin.x; it.oy = origin.y; it.oz = origin.z;
+    it.R = radius > 0 ? radius : CFG.fx.pulse.radius;
+    it.age = 0;
+    it.life = CFG.fx.pulse.life;
+    if (color && color.isColor) {
+      it.cR = color.r; it.cG = color.g; it.cB = color.b;
+    } else if (typeof color === 'number') {
+      FX._c.setHex(color);
+      it.cR = FX._c.r; it.cG = FX._c.g; it.cB = FX._c.b;
+    } else {
+      FX._c.setHex(CFG.fx.pulse.color);
+      it.cR = FX._c.r; it.cG = FX._c.g; it.cB = FX._c.b;
+    }
+    FX._live[FX.count++] = it;
+    /* audio thump: wired in M11.3 */
+    return it;
+  },
+
+  update(dt, t) {
+    /* dev trigger (Key R edge from INPUT): pulse ahead of the player */
+    if (INPUT.pulseTrigger) {
+      INPUT.pulseTrigger = false;
+      const p = CAMERA.pos;
+      const sy = Math.sin(CAMERA.yaw), cy = Math.cos(CAMERA.yaw);
+      const d = CFG.fx.pulse.radius * 0.8;   // 32 m ahead on the ground
+      FX.pulse(
+        FX._fire.set(p.x - sy * d, 0.5, p.z - cy * d),
+        CFG.fx.pulse.radius, CFG.fx.pulse.color);
+    }
+
+    const cf = CFG.fx.pulse;
+    /* tier cap: trim the farthest pulses down to the tier limit */
+    FX._cap = cf.tiers[TIER.name];
+    while (FX.count > FX._cap) {
+      let fi = 0, fd = -1;
+      for (let i = 0; i < FX.count; i++) {
+        const it = FX._live[i];
+        const dist2 =
+          (it.ox - CAMERA.pos.x) * (it.ox - CAMERA.pos.x) +
+          (it.oz - CAMERA.pos.z) * (it.oz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      FX._releaseAt(fi);
+    }
+
+    /* per-frame: ease-out expansion to the requested radius, sin-fade
+     * color, and the light-intensity ramp (sharp sin² peak). Only the
+     * first FX.count instances are drawn. */
+    const ring = FX.ring;
+    for (let i = FX.count - 1; i >= 0; i--) {
+      const it = FX._live[i];
+      it.age += dt;
+      if (it.age >= it.life) { FX._releaseAt(i); continue; }
+      const u = it.age / it.life;
+      const e = 1 - Math.pow(1 - u, 3);      // ease-out expansion
+      const R = 2 + (it.R - 2) * e;           // grows out of 2 m
+      FX._p.set(it.ox, it.oy + 0.35, it.oz);
+      FX._s.set(R, 1, R);
+      FX._m.compose(FX._p, FX._q, FX._s);
+      ring.setMatrixAt(i, FX._m);
+      const a = Math.sin(u * Math.PI) * 0.9;
+      FX._c.setRGB(it.cR * a, it.cG * a, it.cB * a);
+      ring.setColorAt(i, FX._c);
+      /* light-intensity ramp: peak around mid-life, zero at both ends */
+      const L = FX._lights[i];
+      L.position.set(it.ox, it.oy + 6, it.oz);
+      L.color.setRGB(it.cR, it.cG, it.cB);
+      const k = Math.sin(u * Math.PI);
+      L.intensity = cf.light.intensity * k * k;
+    }
+    ring.count = FX.count;
+    if (FX.count > 0) {
+      ring.instanceMatrix.needsUpdate = true;
+      if (ring.instanceColor) ring.instanceColor.needsUpdate = true;
+    }
+    /* the light pool tracks the live list: slot i ⇔ _live[i]; a hidden
+     * light always sits at intensity 0 (no stale ramp value) */
+    for (let i = 0; i < FX._lights.length; i++) {
+      const L = FX._lights[i];
+      const on = i < FX.count;
+      L.visible = on;
+      if (!on) L.intensity = 0;
+    }
+  },
+
+  _releaseAt(i) {
+    const it = FX._live[i];
+    const m = --FX.count;
+    if (i !== m) FX._live[i] = FX._live[m];
+    FX._live[m] = undefined;
+    FX._pool.release(it);
+  },
+
+  dispose() {
+    for (let i = FX.count - 1; i >= 0; i--) FX._releaseAt(i);
+    if (FX.ring) {
+      scene.remove(FX.ring);
+      FX.ring.geometry.dispose();
+      /* material = shared MATS.pulseGlow (M4) — not disposed here */
+    }
+    for (const L of FX._lights) scene.remove(L);
+  },
+};
+
+/* ==================================================================== *
  * ENTITY — the Qwen machine-creature, DORMANT (M5)
  *
  *  - central plaza (WORLD keeps ±2 blocks clear): darkened mega-core
@@ -3908,6 +4099,7 @@ const ENTITY = {
  * Subsystems — FIXED BOOT ORDER = registration order.
  * M0: HUD   M1: INPUT, CAMERA   M2: KIT   M3: WORLD   M5: ENTITY
  * M6.2: TRAFFIC   (registered after ENTITY, before HUD)
+ * M7.2: FX   (registered after PARTS, before HUD)
  * ------------------------------------------------------------------ */
 const systems = [];
 function registerSystem(sys) {
@@ -3929,7 +4121,8 @@ const HUD = {
     HUD.hintEl = document.getElementById('hint');
     HUD.hintEl.textContent =
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
-      'MOUSE look · WHEEL zoom · MMB drag orbit · V camera · P particles';
+      'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
+      'P particles · R pulse';
   },
 
   update(dt) {
@@ -3961,6 +4154,7 @@ registerSystem(WORLD);
 registerSystem(ENTITY);
 registerSystem(TRAFFIC);
 registerSystem(PARTS);
+registerSystem(FX);
 registerSystem(HUD);
 for (const s of systems) if (s.init) s.init();
 
@@ -4026,6 +4220,7 @@ window.SIM = {
   ENTITY,
   TRAFFIC,
   PARTS,
+  FX,
   TIER,
   HUD,
   CFG,

@@ -149,6 +149,24 @@
  *   - heap flat across the whole LOW→HIGH switch (no allocation), draw
  *     calls inside budget at the restored HIGH caps
  *
+ *   M7.2 checks (FX.pulse — expanding instanced ring + light ramp):
+ *   - FX registered (fixed order …PARTS, FX, HUD); pool 'fx-pulse'
+ *     capacity = HIGH tier cap; idle = 0 live, ring count 0, all
+ *     pooled lights hidden, 0 pool inUse
+ *   - idle cost zero: draw calls identical with the FX ring hidden vs
+ *     shown while 0 live (0 instances ⇒ 0 draw calls added)
+ *   - manual key R fires a visible pulse: every live pulse a
+ *     pre-created pool item (zero `new` after init), pooled light on
+ *   - ring visibly expands (instance scale grows, reaches the
+ *     requested radius); light intensity ramps up then decays to 0
+ *   - pulse resolves clean: back to 0 live, ring count 0, lights
+ *     hidden, intensity 0 (no leftover state)
+ *   - explicit API FX.pulse(origin, radius, color) honours its args
+ *     (radius + color on the pool item)
+ *   - tier cap: LOW trims 6 fired pulses to the LOW cap, HIGH restores
+ *   - heap flat across the pulse sequence; draw calls inside budget
+ *   - screenshot with the ring in frame (shots/m72-pulse-ring.png)
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -350,13 +368,13 @@ try {
   }
 
   /* ---- 6a. Fixed-order systems registry (M5 adds ENTITY after WORLD,
-   * M7.1 adds PARTS after TRAFFIC) ---- */
+   * M7.1 adds PARTS after TRAFFIC, M7.2 adds FX after PARTS) ---- */
   {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
       JSON.stringify(names) === JSON.stringify(
         ['INPUT', 'CAMERA', 'KIT', 'WORLD', 'ENTITY', 'TRAFFIC',
-         'PARTS', 'HUD']),
+         'PARTS', 'FX', 'HUD']),
       names.join(', '));
   }
 
@@ -518,15 +536,16 @@ try {
 
     // The M2 gate measures the KIT test wall/tower alone: hide the M3
     // city + M5 creature + M6 TRAFFIC meshes (drones/vehicles/trails) +
-    // M7.1 PARTS particle meshes for a frame or two, read the draw-call
-    // count, show it again.
+    // M7.1 PARTS particle meshes + M7.2 FX pulse ring for a frame or
+    // two, read the draw-call count, show it again.
     await page.evaluate(() => {
       window.SIM.WORLD.root.visible = false;
       window.SIM.ENTITY.root.visible = false;
       const T = window.SIM.TRAFFIC;
       const P = window.SIM.PARTS;
       for (const m of [T.mesh, T.vmesh, T.tmesh,
-        P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh])
+        P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh,
+        window.SIM.FX.ring])
         if (m) m.visible = false;
     });
     await sleep(250);
@@ -537,7 +556,8 @@ try {
       const T = window.SIM.TRAFFIC;
       const P = window.SIM.PARTS;
       for (const m of [T.mesh, T.vmesh, T.tmesh,
-        P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh])
+        P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh,
+        window.SIM.FX.ring])
         if (m) m.visible = true;
     });
     check('M2 gate: test wall/tower (city + creature hidden) renders at < 10 draw calls',
@@ -2372,6 +2392,272 @@ try {
       resolved.mDraw === 0 && resolved.lDraw === 0 && resolved.rCount === 0 &&
       resolved.ambient,
       `ambient steam/spark still alive=${resolved.ambient}`);
+  }
+
+  /* ------------------------------------------------------------------
+   * M7.2 — FX.pulse: expanding instanced ring + light-intensity ramp
+   *
+   *  One shared InstancedMesh (per-instance color = tint × fade on the
+   *  shared MATS.pulseGlow) + one pooled PointLight per live pulse.
+   *  State lives in the M6.1 pool 'fx-pulse' (capacity = HIGH tier
+   *  cap ⇒ zero `new` after init). 0 live ⇒ ring count 0 (three r160
+   *  skips count-0 InstancedMesh ⇒ 0 draw calls added) + lights hidden.
+   *  Dev trigger: Key R fires a pulse ahead of the player.
+   * ------------------------------------------------------------------ */
+  {
+    /* registered + pre-allocated: pool, shared ring, pooled lights */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM;
+      const p = S.POOL.list.find(pp => pp.name === 'fx-pulse');
+      return {
+        hasFX: !!S.FX,
+        cap: p ? p.capacity : -1,
+        hi: S.CFG.fx.pulse.tiers.high,
+        lo: S.CFG.fx.pulse.tiers.low,
+        ringCount: S.FX.ring.count,
+        ringType: S.FX.ring.geometry.type,
+        sharedMat: S.FX.ring.material === S.KIT.MATS.pulseGlow,
+        inScene: S.scene.children.includes(S.FX.ring),
+        lights: S.FX._lights.length,
+        lightsHidden: S.FX._lights.every(L => L.visible === false),
+        inUse: p ? p.capacity - p.top : -1,
+      };
+    });
+    check('M7.2: FX registered with fx-pulse pool (capacity = HIGH tier cap), shared ring material, idle 0 live / lights hidden',
+      reg.hasFX && reg.cap === reg.hi && reg.lo < reg.hi &&
+      reg.ringType === 'RingGeometry' && reg.sharedMat && reg.inScene &&
+      reg.ringCount === 0 && reg.lights === reg.hi && reg.lightsHidden &&
+      reg.inUse === 0,
+      `cap=${reg.cap}, lights=${reg.lights}, ring=${reg.ringCount},` +
+      ` inUse=${reg.inUse}`);
+
+    /* idle cost zero: with the one variable ambient (steam) hidden the
+     * call count is stable, and hiding vs showing the ring at 0 live
+     * changes nothing (count-0 InstancedMesh adds 0 draw calls) */
+    const parity = await page.evaluate(async () => {
+      const S = window.SIM;
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      const sample = async n => {
+        const a = [];
+        await sleep(150);                 // let the visibility change render
+        for (let i = 0; i < n; i++) {
+          a.push(S.renderer.info.render.calls);
+          await sleep(120);
+        }
+        return a;
+      };
+      const P = S.PARTS;
+      P.smesh.visible = false;              // only ambient with a variable call
+      const ringOn = await sample(4);
+      S.FX.ring.visible = false;
+      const noRing = await sample(4);
+      S.FX.ring.visible = true;
+      const ring0 = await sample(4);
+      P.smesh.visible = true;
+      return { ringOn, noRing, ring0 };
+    });
+    const stable = a => a.every(v => v === a[0]);
+    check('M7.2: idle = zero added draw calls (ring hidden vs shown at 0 live: identical calls)',
+      stable(parity.ringOn) && stable(parity.noRing) && stable(parity.ring0) &&
+      parity.ringOn[0] === parity.noRing[0] && parity.noRing[0] === parity.ring0[0],
+      `ringOn=${parity.ringOn.join()}, noRing=${parity.noRing.join()},` +
+      ` ring0=${parity.ring0.join()}`);
+
+    /* manual key R fires a visible pulse: +1 draw call (the ring),
+     * pooled light on, every live pulse a pre-created pool item */
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const heapBefore = await heapMin();
+    const base = parity.ring0[0];
+    await page.keyboard.press('r');
+    await page.waitForFunction(() => window.SIM.FX.count === 1,
+      { timeout: 5000 });
+    const p0 = await page.evaluate(async () => {
+      const S = window.SIM, F = S.FX;
+      const P = S.PARTS;
+      P.smesh.visible = false;
+      await new Promise(r => setTimeout(r, 120));
+      const calls = S.renderer.info.render.calls;
+      P.smesh.visible = true;
+      const it = F._live[0];
+      window.__m72 = { ref: it, R: it.R, scale: F._s.x };
+      return {
+        count: F.count,
+        zeroNew: F._live.slice(0, F.count).every(it2 =>
+          it2.__pool && it2.__pool.name === 'fx-pulse' &&
+          it2.__free === false),
+        inUse: S.POOL.list.find(pp => pp.name === 'fx-pulse')
+          .capacity - S.POOL.list.find(pp => pp.name === 'fx-pulse').top,
+        lightOn: F._lights[0].visible === true && F._lights[0].intensity > 0,
+        lightPos: F._lights[0].position.y,
+        scale: F._s.x,                     // scratch holds live[0]'s scale
+        calls,
+      };
+    });
+    check('M7.2: key R fires a pulse — ring live + pooled light on, exactly +1 draw call (the ring)',
+      p0.count === 1 && p0.lightOn && p0.calls === base + 1,
+      `count=${p0.count}, lightOn=${p0.lightOn},` +
+      ` calls=${p0.calls} (idle=${base})`);
+    check('M7.2: every live pulse is a pre-created pool item (zero `new` after init)',
+      p0.zeroNew && p0.inUse === p0.count,
+      `inUse=${p0.inUse}`);
+
+    /* ring visibly expands toward the requested radius (ease-out);
+     * light intensity ramps up (sin² peak) while alive */
+    await sleep(350);
+    const p1 = await page.evaluate(() => {
+      const S = window.SIM, F = S.FX;
+      const it = F._live[0];
+      const u = it.age / it.life;
+      const e = 1 - Math.pow(1 - u, 3);
+      const want = 2 + (it.R - 2) * e;
+      const L = F._lights[0];
+      const wantLight =
+        S.CFG.fx.pulse.light.intensity *
+        Math.pow(Math.sin(u * Math.PI), 2);
+      const prev = window.__m72.scale;
+      window.__m72.scale = F._s.x;
+      return {
+        scale: F._s.x, prev, want,
+        light: L.intensity, wantLight,
+        count: F.count,
+      };
+    });
+    check('M7.2: ring visibly expands (instance scale grows, tracks the eased radius)',
+      p1.count === 1 && p1.scale > p1.prev &&
+      Math.abs(p1.scale - p1.want) < 0.25,
+      `scale ${p1.prev.toFixed(1)} -> ${p1.scale.toFixed(1)}` +
+      ` (want ${p1.want.toFixed(1)})`);
+    check('M7.2: light intensity ramps (tracks the sin² peak while alive)',
+      Math.abs(p1.light - p1.wantLight) < 200 && p1.light > 0,
+      `light=${p1.light.toFixed(0)} (want ${p1.wantLight.toFixed(0)})`);
+
+    /* pulse resolves clean: 0 live, ring count 0, lights hidden + off,
+     * pool drained (no leftover state) */
+    await page.waitForFunction(() => window.SIM.FX.count === 0,
+      { timeout: 10000 });
+    const resolved = await page.evaluate(() => {
+      const S = window.SIM, F = S.FX;
+      const p = S.POOL.list.find(pp => pp.name === 'fx-pulse');
+      return {
+        count: F.count, ring: F.ring.count,
+        lightsOff: F._lights.every(L =>
+          L.visible === false && L.intensity === 0),
+        inUse: p.capacity - p.top,
+      };
+    });
+    check('M7.2: pulse resolves clean — 0 live, ring count 0, lights hidden + intensity 0',
+      resolved.count === 0 && resolved.ring === 0 &&
+      resolved.lightsOff && resolved.inUse === 0,
+      `ring=${resolved.ring}, inUse=${resolved.inUse}`);
+
+    /* explicit API FX.pulse(origin, radius, color) honours its args:
+     * radius lands on the pool item, color is converted (sRGB →
+     * working space, same pipeline as a THREE.Color) */
+    const api = await page.evaluate(() => {
+      const S = window.SIM, F = S.FX;
+      const a = F.pulse({ x: 12, y: 0.5, z: -30 }, 80, 0xff8844);
+      const b = F.pulse({ x: -12, y: 0.5, z: -30 }, 0, null);
+      return {
+        aR: a.R, aC: [a.cR, a.cG, a.cB],
+        bR: b.R, bC: [b.cR, b.cG, b.cB],
+        count: F.count,
+      };
+    });
+    /* sRGB → working (linear) via the three r160 exact sRGB EOTF:
+     * 0xff8844 ⇒ r=1, g≈0.24616, b≈0.05774; default 0x66e0ff ⇒
+     * r≈0.13287, g≈0.74539, b=1 */
+    const near = (v, w, e) => Math.abs(v - w) < e;
+    check('M7.2: FX.pulse(origin, radius, color) honours radius + color (and defaults)',
+      api.aR === 80 &&
+      near(api.aC[0], 1, 1e-3) && near(api.aC[1], 0.24616, 1e-3) &&
+      near(api.aC[2], 0.05774, 1e-3) &&
+      api.bR === 40 &&   /* default = CFG.fx.pulse.radius */
+      near(api.bC[0], 0.13287, 1e-3) && near(api.bC[1], 0.74539, 1e-3) &&
+      near(api.bC[2], 1, 1e-3),
+      `R=${api.aR}/${api.bR}, a=[${api.aC.map(v => v.toFixed(4)).join(',')}]` +
+      ` b=[${api.bC.map(v => v.toFixed(4)).join(',')}]`);
+
+    /* tier cap: 6 fired pulses trim to the LOW cap, HIGH restores */
+    await page.waitForFunction(() => window.SIM.FX.count === 0,
+      { timeout: 10000 });
+    await page.evaluate(() => window.SIM.TIER.set('low'));
+    await page.evaluate(() => {
+      const F = window.SIM.FX;
+      for (let i = 0; i < 6; i++)
+        F.pulse({ x: i * 5, y: 0.5, z: -40 - i }, 40, null);
+    });
+    await page.waitForFunction(() => window.SIM.FX.count === 2,
+      { timeout: 5000 });
+    const low = await page.evaluate(() => {
+      const S = window.SIM, F = S.FX;
+      const p = S.POOL.list.find(pp => pp.name === 'fx-pulse');
+      return { count: F.count, inUse: p.capacity - p.top };
+    });
+    check('M7.2: LOW tier trims 6 fired pulses to the LOW cap (excess released)',
+      low.count === 2 && low.inUse === 2,
+      `count=${low.count}, inUse=${low.inUse}`);
+    await page.evaluate(() => window.SIM.TIER.set('high'));
+    await page.waitForFunction(() => window.SIM.FX.count === 0,
+      { timeout: 10000 });
+    await page.evaluate(() => {
+      const F = window.SIM.FX;
+      for (let i = 0; i < 6; i++)
+        F.pulse({ x: i * 5, y: 0.5, z: -40 - i }, 40, null);
+    });
+    await page.waitForFunction(() => window.SIM.FX.count === 6,
+      { timeout: 5000 });
+    const cap = await page.evaluate(() => {
+      const S = window.SIM, F = S.FX;
+      return { count: F.count, calls: S.renderer.info.render.calls };
+    });
+    check('M7.2: HIGH tier restores the full pulse cap; draw calls inside budget',
+      cap.count === 6 && cap.calls > 0 && cap.calls < 150,
+      `count=${cap.count}, calls=${cap.calls}`);
+
+    /* heap flat across the whole pulse sequence */
+    const heapAfter = await heapMin();
+    check('M7.2: no allocation per pulse (heap flat across the sequence)',
+      heapBefore > 0 && heapAfter > 0 &&
+      heapAfter - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,` +
+      ` after=${Math.round(heapAfter / 1024)}KB`);
+
+    /* visual gate: the expanding ring + the light-intensity ramp in
+     * frame — straight-down from the GROUND camera's max height (y is
+     * clamped to 40), a 20 m pulse under the camera at peak brightness
+     * (u≈0.5 ⇒ sin-fade ≈ 1, light at its sin² peak) */
+    await page.waitForFunction(() => window.SIM.FX.count === 0,
+      { timeout: 10000 });
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(0, 40, 18);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = -1.35;
+      S.FX.pulse({ x: 0, y: 0.5, z: 18 }, 20, null);
+    });
+    await sleep(800);
+    await page.screenshot({ path: `${here}/shots/m72-pulse-ring.png` });
+    const shotSt = await page.evaluate(() => ({
+      count: window.SIM.FX.count,
+      scale: window.SIM.FX._s.x,
+      light: window.SIM.FX._lights[0].intensity,
+    }));
+    check('M7.2: pulse screenshot with the ring + light peak in frame (shots/m72-pulse-ring.png)',
+      fs.existsSync(`${here}/shots/m72-pulse-ring.png`) &&
+      shotSt.count === 1 && shotSt.scale > 10 && shotSt.light > 4000,
+      `count=${shotSt.count}, scale=${shotSt.scale.toFixed(1)},` +
+      ` light=${shotSt.light.toFixed(0)}`);
+    await page.waitForFunction(() => window.SIM.FX.count === 0,
+      { timeout: 10000 });
   }
 
   /* ---- 10. No errors anywhere ---- */
