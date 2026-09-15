@@ -55,7 +55,7 @@ smoke-test evidence.
 | **M6.3** ✅ | Sky vehicles: light trails (additive sprite streak) on ring roads at 3 altitudes, capped like drones | Trails readable from all 3 altitudes; count never exceeds tier cap |
 | **M6.4** ✅ | Steam vents (cooling towers, billboard sprite pool, upward drift, fade) + sparks (substations, tiny points, brief life) | Both emitters run idle-cheap; smoke shot shows steam + sparks at source buildings |
 | **M6.5** ✅ | Adaptive caps: `TRAFFIC` reads current FPS tier, scales all M6 pools | Forcing LOW tier in smoke run visibly halves caps; back to HIGH restores; no spike |
-| **M7.1** | Pooled `Points`/sprite particle system: steam, sparks, pulse motes, lightning motes, awakening rain — one system, one budget | One trigger key rains all particle types; idle cost ~0 in stats |
+| **M7.1** ✅ | Pooled `Points`/sprite particle system: steam, sparks, pulse motes, lightning motes, awakening rain — one system, one budget | One trigger key rains all particle types; idle cost ~0 in stats |
 | **M7.2** | `FX.pulse(origin, radius, color)`: expanding instanced ring mesh + light-intensity ramp (+ audio hook once M11 lands) | Manual key fires a visible pulse; nothing allocated; idle = zero draw calls added |
 | **M7.3** | Animated electrical arcs: Line segments regenerated every N frames between anchors (substation→substation, creature→ring) | Manual key sparks arcs between two substations and creature→ring; regen is frame-cheap |
 | **M7.4** | Screen-space flash: overlay-scene additive plane (or DOM div) driven by `FX.flash(intensity)` | Manual key flashes screen; decays to zero; costs nothing idle |
@@ -304,12 +304,37 @@ pools never allocate per frame.
 
 ### M7 — Particle & FX system
 
-#### M7.1 — Pooled particle system
-- [ ] One pooled `Points`/sprite system covering: steam, sparks, pulse
+#### M7.1 — Pooled particle system ✅
+- [x] One pooled `Points`/sprite system covering: steam, sparks, pulse
       motes, lightning motes, rain-of-energy (awakening).
 - **Test:** one dev trigger key rains all particle types; idle cost ~0
       in stats.
 - **Commit when:** trigger key works and idle cost verified.
+- **Verified:** smoke M7.1 section green — `PARTS` owns every particle in
+  the demo on five M6.1 pools (`parts-steam`/`parts-spark`/`parts-pulse`/
+  `parts-light`/`parts-rain`, fixed capacity = HIGH tier cap 48/64/48/40/80
+  ⇒ zero `new` after init); the one budget is `CFG.parts.tiers` {high:280,
+  med:160, low:72} = the exact sum of the five per-type tier caps at every
+  tier (asserted in smoke); idle cost ~0 — pulse/light/rain 0 live with 0
+  drawRange/count and 0 pool inUse (0 draw calls) while the ambient
+  steam/spark keep running; the dev trigger (Key `P`, INPUT edge →
+  `PARTS.rainAll()`) rains ALL five types (one-time bursts + streak/mote
+  trickles for 5 s around the player): every type observed live, every
+  live particle a pre-created pool item (zero-`new` identity across all
+  five pools, inUse === live count), rain streaks visibly fall (downward
+  drift on live refs), sampled counts never exceed the tier caps (rain
+  peaked 78/80), JS heap flat across the rain window (min-of-3-sample
+  churn ≤ 2 MB), draw calls 44 (< 150) with the rain at cap; screenshot
+  `smoke/shots/m71-particles-rain.png` (streaks in frame, camera tilted
+  up at the 70–100 m spawn band); `TIER.set('low')` caps the trigger rain
+  (rain 20/20, pulse 12/12, light 10/10), `TIER.set('high')` regrows past
+  the LOW cap; the rain resolves clean — event types back to 0 live with
+  drawRange/count 0 (no leftover state) while the ambient emitters keep
+  running. The M6.4 steam/spark emitters moved from TRAFFIC into PARTS
+  (config `CFG.traffic.steam/spark` → `CFG.parts.steam/spark`, pools
+  `traffic-*` → `parts-*`, source lists on `PARTS`); M6.4/M6.5 smoke
+  sections now read them from `S.PARTS`/`S.CFG.parts` and pass unchanged;
+  the M2 gate also hides the five PARTS meshes.
 
 #### M7.2 — `FX.pulse`
 - [ ] `FX.pulse(origin, radius, color)`: expanding instanced ring mesh +

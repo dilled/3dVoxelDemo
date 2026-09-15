@@ -15,7 +15,7 @@
  *
  *   M1 checks:
  *   - systems registry boots in fixed order
- *     (INPUT, CAMERA, KIT, WORLD, ENTITY, TRAFFIC, HUD)
+ *     (INPUT, CAMERA, KIT, WORLD, ENTITY, TRAFFIC, PARTS, HUD)
  *   - no gamepad: loop stays clean, camera holds still, nothing throws
  *   - fake gamepad: left-stick forward moves the camera
  *   - keyboard: W moves forward, Space rises, Shift sprints (no throw)
@@ -101,8 +101,8 @@
  *   - one screenshot per altitude with the streak in frame
  *     (shots/m63-vehicles-alt{0,1,2}.png)
  *
- *   M6.4 checks (steam vents + sparks):
- *   - steam pool ('traffic-steam') + spark pool ('traffic-spark')
+ *   M6.4 checks (steam vents + sparks — moved to PARTS in M7.1):
+ *   - steam pool ('parts-steam') + spark pool ('parts-spark')
  *     registered with tier caps; steam field saturates the cap
  *     (fixed pool is the gate); every live puff/spark is a pre-created
  *     pool item (zero `new` after init)
@@ -119,7 +119,25 @@
  *
  *   M6.5 checks (adaptive caps by FPS tier — integrated switch):
  *   - all four M6 fleets saturated at the HIGH caps first (drone 16,
- *     vehicle 12, steam 48, spark stream alive)
+ *     vehicle 12, steam 48 (now on PARTS), spark stream alive)
+ *
+ *   M7.1 checks (pooled particle system — one system, one budget):
+ *   - PARTS registered with 5 pools ('parts-steam' / 'parts-spark' /
+ *     'parts-pulse' / 'parts-light' / 'parts-rain', fixed capacity =
+ *     HIGH tier cap); CFG.parts.tiers = exact sum of the per-type tier
+ *     caps at every tier (the one shared budget)
+ *   - idle cost ~0: pulse/light/rain 0 live with 0 drawRange/count and
+ *     0 pool inUse (0 draw calls for the event types)
+ *   - one dev trigger key (P) rains ALL five particle types: every type
+ *     observed live, every live item a pre-created pool item (zero `new`
+ *     after init), rain streaks visibly fall, counts never exceed the
+ *     tier caps (sampled), heap flat across the rain window
+ *   - rain screenshot with the streaks in frame
+ *     (shots/m71-particles-rain.png)
+ *   - rain resolves clean: after the trigger duration pulse/light/rain
+ *     return to 0 live (no leftover state), drawRange back to 0
+ *   - LOW tier caps the trigger rain (rcount ≤ LOW rain cap), HIGH
+ *     restores; draw calls inside budget with the rain at cap
  *   - LOW caps are visibly lower than HIGH caps in config (each ≤ 1/2)
  *   - TIER.set('low') trims ALL four fleets to their LOW caps in one
  *     switch; excess items land back in the pools (inUse === live
@@ -331,12 +349,14 @@ try {
     }));
   }
 
-  /* ---- 6a. Fixed-order systems registry (M5 adds ENTITY after WORLD) ---- */
+  /* ---- 6a. Fixed-order systems registry (M5 adds ENTITY after WORLD,
+   * M7.1 adds PARTS after TRAFFIC) ---- */
   {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
       JSON.stringify(names) === JSON.stringify(
-        ['INPUT', 'CAMERA', 'KIT', 'WORLD', 'ENTITY', 'TRAFFIC', 'HUD']),
+        ['INPUT', 'CAMERA', 'KIT', 'WORLD', 'ENTITY', 'TRAFFIC',
+         'PARTS', 'HUD']),
       names.join(', '));
   }
 
@@ -497,14 +517,16 @@ try {
       `mats=${kit.mats}`);
 
     // The M2 gate measures the KIT test wall/tower alone: hide the M3
-    // city + M5 creature + M6 TRAFFIC meshes (drones/vehicles/trails/
-    // steam/sparks) for a frame or two, read the draw-call count, show
-    // it again.
+    // city + M5 creature + M6 TRAFFIC meshes (drones/vehicles/trails) +
+    // M7.1 PARTS particle meshes for a frame or two, read the draw-call
+    // count, show it again.
     await page.evaluate(() => {
       window.SIM.WORLD.root.visible = false;
       window.SIM.ENTITY.root.visible = false;
       const T = window.SIM.TRAFFIC;
-      for (const m of [T.mesh, T.vmesh, T.tmesh, T.smesh, T.spoints])
+      const P = window.SIM.PARTS;
+      for (const m of [T.mesh, T.vmesh, T.tmesh,
+        P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh])
         if (m) m.visible = false;
     });
     await sleep(250);
@@ -513,7 +535,9 @@ try {
       window.SIM.WORLD.root.visible = true;
       window.SIM.ENTITY.root.visible = true;
       const T = window.SIM.TRAFFIC;
-      for (const m of [T.mesh, T.vmesh, T.tmesh, T.smesh, T.spoints])
+      const P = window.SIM.PARTS;
+      for (const m of [T.mesh, T.vmesh, T.tmesh,
+        P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh])
         if (m) m.visible = true;
     });
     check('M2 gate: test wall/tower (city + creature hidden) renders at < 10 draw calls',
@@ -1504,6 +1528,7 @@ try {
 
   /* ------------------------------------------------------------------
    * M6.4 — steam vents (cooling towers) + sparks (substations)
+   * (emitters moved to PARTS in M7.1 — same checks, new home)
    * ------------------------------------------------------------------ */
   {
     /* reset to the spawn pose: the analytic vent/sub replay below must
@@ -1519,14 +1544,14 @@ try {
 
     const caps = await page.evaluate(() => {
       const S = window.SIM;
-      const T = S.TRAFFIC;
-      const sPool = S.POOL.list.find(p => p.name === 'traffic-steam');
-      const pPool = S.POOL.list.find(p => p.name === 'traffic-spark');
+      const P = S.PARTS;
+      const sPool = S.POOL.list.find(p => p.name === 'parts-steam');
+      const pPool = S.POOL.list.find(p => p.name === 'parts-spark');
       return {
-        sCap: (T.smesh && sPool) ? sPool.capacity : 0,
-        pCap: (T.spoints && pPool) ? pPool.capacity : 0,
-        sTier: S.CFG.traffic.steam.tiers[S.TIER.active()],
-        pTier: S.CFG.traffic.spark.tiers[S.TIER.active()],
+        sCap: (P.smesh && sPool) ? sPool.capacity : 0,
+        pCap: (P.spoints && pPool) ? pPool.capacity : 0,
+        sTier: S.CFG.parts.steam.tiers[S.TIER.active()],
+        pTier: S.CFG.parts.spark.tiers[S.TIER.active()],
       };
     });
     check('M6.4: steam + spark emitters registered with pools (M6.1) + tier caps',
@@ -1537,18 +1562,18 @@ try {
 
     /* steam field saturates the cap (spawn rate × life > cap ⇒ the
      * fixed pool is the gate); sparks hover at a small steady state */
-    await page.waitForFunction(c => window.SIM.TRAFFIC.scount === c,
+    await page.waitForFunction(c => window.SIM.PARTS.scount === c,
       caps.sCap, { timeout: 120000 });
-    await page.waitForFunction(c => window.SIM.TRAFFIC.pcount >= c, 3,
+    await page.waitForFunction(c => window.SIM.PARTS.pcount >= c, 3,
       { timeout: 30000 });
 
     const s0 = await page.evaluate(async () => {
       const S = window.SIM;
-      const T = S.TRAFFIC;
-      const sPool = S.POOL.list.find(p => p.name === 'traffic-steam');
-      const pPool = S.POOL.list.find(p => p.name === 'traffic-spark');
-      const sLive = T._sLive.slice(0, T.scount);
-      const pLive = T._pLive.slice(0, T.pcount);
+      const P = S.PARTS;
+      const sPool = S.POOL.list.find(p => p.name === 'parts-steam');
+      const pPool = S.POOL.list.find(p => p.name === 'parts-spark');
+      const sLive = P._sLive.slice(0, P.scount);
+      const pLive = P._pLive.slice(0, P.pcount);
       /* keep the item refs alive for the drift/age samples below */
       window.__m64 = {
         sSnaps: sLive.map(it => ({ ref: it, y: it.py, age: it.age })),
@@ -1600,7 +1625,7 @@ try {
        * keeps running during it, so nothing sampled after it may be
        * compared against these) */
       const stats = {
-        scount: T.scount, pcount: T.pcount,
+        scount: P.scount, pcount: P.pcount,
         sPoolCap: sPool ? sPool.capacity : -1,
         sInUse: sPool ? sPool.capacity - sPool.top : -1,
         pPoolCap: pPool ? pPool.capacity : -1,
@@ -1611,10 +1636,10 @@ try {
           it.__pool === pPool && it.__free === false),
         steamOk, sparkOk,
         nCool: cool.length, nSub: subs.length,
-        drawRange: T.spoints.geometry.drawRange.count,
-        smeshCount: T.smesh.count,
-        sAdditive: T.smesh.material.blending === 2,
-        pAdditive: T.spoints.material.blending === 2,
+        drawRange: P.spoints.geometry.drawRange.count,
+        smeshCount: P.smesh.count,
+        sAdditive: P.smesh.material.blending === 2,
+        pAdditive: P.spoints.material.blending === 2,
         calls: S.renderer.info.render.calls,
       };
       stats.heapBefore = await heapMin();
@@ -1635,9 +1660,9 @@ try {
     /* upward drift + no per-frame allocation across a live window */
     await sleep(2500);
     const s1 = await page.evaluate(async () => {
-      const T = window.SIM.TRAFFIC;
+      const P = window.SIM.PARTS;
       let rose = 0;
-      const sSet = T._sLive.slice(0, T.scount);
+      const sSet = P._sLive.slice(0, P.scount);
       for (const sn of window.__m64.sSnaps) {
         if (!sSet.includes(sn.ref)) continue;
         if (sn.ref.py - sn.y > 0.3) rose++;
@@ -1653,7 +1678,7 @@ try {
       return {
         rose, nS: window.__m64.sSnaps.length,
         heap: await heapMin(),
-        pcount: T.pcount, drawRange: T.spoints.geometry.drawRange.count,
+        pcount: P.pcount, drawRange: P.spoints.geometry.drawRange.count,
       };
     });
     check('M6.4: steam visibly rises (upward drift) while alive',
@@ -1669,14 +1694,14 @@ try {
 
     /* sparks age out (brief life) — short window, sparks die fast */
     const pA = await page.evaluate(() => {
-      const T = window.SIM.TRAFFIC;
-      return T._pLive.slice(0, T.pcount)
+      const P = window.SIM.PARTS;
+      return P._pLive.slice(0, P.pcount)
         .map(it => ({ ref: it, age: it.age }));
     });
     await sleep(500);
     const pB = await page.evaluate(snaps => {
-      const T = window.SIM.TRAFFIC;
-      const live = T._pLive.slice(0, T.pcount);
+      const P = window.SIM.PARTS;
+      const live = P._pLive.slice(0, P.pcount);
       const liveSet = new Set(live);
       let aged = 0, still = 0, fresh = 0;
       for (const sn of snaps) {
@@ -1694,10 +1719,10 @@ try {
     /* counts never exceed the tier caps (sampled while emitters cycle) */
     const capHold = await page.evaluate(async () => {
       const S = window.SIM;
-      const sc = S.CFG.traffic.steam.tiers[S.TIER.active()];
-      const pc = S.CFG.traffic.spark.tiers[S.TIER.active()];
+      const sc = S.CFG.parts.steam.tiers[S.TIER.active()];
+      const pc = S.CFG.parts.spark.tiers[S.TIER.active()];
       for (let i = 0; i < 10; i++) {
-        if (S.TRAFFIC.scount > sc || S.TRAFFIC.pcount > pc) return false;
+        if (S.PARTS.scount > sc || S.PARTS.pcount > pc) return false;
         await new Promise(r => setTimeout(r, 150));
       }
       return true;
@@ -1706,18 +1731,18 @@ try {
       `steam=${caps.sCap}, spark=${caps.pCap}`);
 
     /* tier cap: LOW trims both emitters, HIGH regrows them */
-    const lowS = await page.evaluate(() => window.SIM.CFG.traffic.steam.tiers.low);
-    const lowP = await page.evaluate(() => window.SIM.CFG.traffic.spark.tiers.low);
+    const lowS = await page.evaluate(() => window.SIM.CFG.parts.steam.tiers.low);
+    const lowP = await page.evaluate(() => window.SIM.CFG.parts.spark.tiers.low);
     await page.evaluate(() => window.SIM.TIER.set('low'));
     await page.waitForFunction(({ s, p }) =>
-      window.SIM.TRAFFIC.scount <= s && window.SIM.TRAFFIC.pcount <= p,
+      window.SIM.PARTS.scount <= s && window.SIM.PARTS.pcount <= p,
       { s: lowS, p: lowP }, { timeout: 5000 });
     const tLow = await page.evaluate(() => {
       const S = window.SIM;
-      const sPool = S.POOL.list.find(pp => pp.name === 'traffic-steam');
-      const pPool = S.POOL.list.find(pp => pp.name === 'traffic-spark');
+      const sPool = S.POOL.list.find(pp => pp.name === 'parts-steam');
+      const pPool = S.POOL.list.find(pp => pp.name === 'parts-spark');
       return {
-        scount: S.TRAFFIC.scount, pcount: S.TRAFFIC.pcount,
+        scount: S.PARTS.scount, pcount: S.PARTS.pcount,
         sInUse: sPool.capacity - sPool.top,
         pInUse: pPool.capacity - pPool.top,
       };
@@ -1727,12 +1752,12 @@ try {
       tLow.sInUse === tLow.scount && tLow.pInUse === tLow.pcount,
       `steam=${tLow.scount}/${lowS}, spark=${tLow.pcount}/${lowP}`);
     await page.evaluate(() => window.SIM.TIER.set('high'));
-    await page.waitForFunction(c => window.SIM.TRAFFIC.scount === c,
+    await page.waitForFunction(c => window.SIM.PARTS.scount === c,
       caps.sCap, { timeout: 120000 });
-    await page.waitForFunction(c => window.SIM.TRAFFIC.pcount >= c, 3,
+    await page.waitForFunction(c => window.SIM.PARTS.pcount >= c, 3,
       { timeout: 30000 });
     check('M6.4: HIGH tier restores the full steam field (regrows on spawn ticks)',
-      (await page.evaluate(() => window.SIM.TRAFFIC.scount)) >= caps.sCap - 2,
+      (await page.evaluate(() => window.SIM.PARTS.scount)) >= caps.sCap - 2,
       `scount restored near ${caps.sCap}`);
 
     /* draw-call budget with both emitters alive */
@@ -1750,7 +1775,7 @@ try {
     let d = null;
     for (let tries = 0; tries < 40 && !d; tries++) {
       d = await page.evaluate(() => {
-        const S = window.SIM, T = S.TRAFFIC;
+        const S = window.SIM, T = S.PARTS;
         const B = S.WORLD.BLOCK, K = S.WORLD.CHUNK;
         function ringFor(bx, bz) {
           const pcx = Math.floor(Math.floor(S.CAMERA.pos.x / B) / K);
@@ -1906,8 +1931,9 @@ try {
   /* ------------------------------------------------------------------ *
    * M6.5 — adaptive caps by FPS tier (integrated tier switch)
    *
-   *  TRAFFIC reads CFG.traffic.*.tiers[TIER.name] every frame for all
-   *  four fleets, so one TIER switch scales every M6 pool at once.
+   *  TRAFFIC (drone/vehicle) + PARTS (steam/spark) read their
+   *  CFG.*.tiers[TIER.name] every frame, so one TIER switch scales
+   *  every M6 pool at once.
    *  Verify the whole switch end-to-end: LOW halves every cap (live
    *  counts + pools), HIGH restores all four, and the switch itself
    *  costs no frame time (rAF delta probe) and no allocation (heap).
@@ -1934,15 +1960,15 @@ try {
 
     /* baseline: all four M6 fleets saturated at the HIGH caps */
     await page.waitForFunction(() => {
-      const T = window.SIM.TRAFFIC;
+      const T = window.SIM.TRAFFIC, P = window.SIM.PARTS;
       return T.count === 16 && T.vcount === 12 &&
-        T.scount === 48 && T.pcount >= 3;
+        P.scount === 48 && P.pcount >= 3;
     }, { timeout: 120000 });
     const capsHi = await page.evaluate(() => {
-      const t = window.SIM.CFG.traffic;
+      const t = window.SIM.CFG.traffic, p = window.SIM.CFG.parts;
       return {
         drone: t.drone.tiers.high, vehicle: t.vehicle.tiers.high,
-        steam: t.steam.tiers.high, spark: t.spark.tiers.high,
+        steam: p.steam.tiers.high, spark: p.spark.tiers.high,
       };
     });
     await sleep(1000);
@@ -1967,10 +1993,10 @@ try {
 
     /* LOW caps must be visibly lower than HIGH caps (halved in config) */
     const capsLo = await page.evaluate(() => {
-      const t = window.SIM.CFG.traffic;
+      const t = window.SIM.CFG.traffic, p = window.SIM.CFG.parts;
       return {
         drone: t.drone.tiers.low, vehicle: t.vehicle.tiers.low,
-        steam: t.steam.tiers.low, spark: t.spark.tiers.low,
+        steam: p.steam.tiers.low, spark: p.spark.tiers.low,
       };
     });
     check('M6.5: LOW caps are visibly lower than HIGH caps (each ≤ 1/2)',
@@ -1986,23 +2012,23 @@ try {
     /* one switch scales ALL four fleets at once */
     await page.evaluate(() => window.SIM.TIER.set('low'));
     await page.waitForFunction(o => {
-      const T = window.SIM.TRAFFIC;
+      const T = window.SIM.TRAFFIC, P = window.SIM.PARTS;
       return T.count <= o.drone && T.vcount <= o.vehicle &&
-        T.scount <= o.steam && T.pcount <= o.spark;
+        P.scount <= o.steam && P.pcount <= o.spark;
     }, { ...capsLo }, { timeout: 15000 });
     const tLow = await page.evaluate(() => {
-      const S = window.SIM, T = S.TRAFFIC;
+      const S = window.SIM, T = S.TRAFFIC, P = S.PARTS;
       const inUse = n => {
         const p = S.POOL.list.find(pp => pp.name === n);
         return p.capacity - p.top;
       };
       return {
-        count: T.count, vcount: T.vcount, scount: T.scount,
-        pcount: T.pcount,
+        count: T.count, vcount: T.vcount, scount: P.scount,
+        pcount: P.pcount,
         droneInUse: inUse('traffic-drone'),
         vehInUse: inUse('traffic-vehicle'),
-        steamInUse: inUse('traffic-steam'),
-        sparkInUse: inUse('traffic-spark'),
+        steamInUse: inUse('parts-steam'),
+        sparkInUse: inUse('parts-spark'),
       };
     });
     check('M6.5: LOW tier trims ALL four fleets to their LOW caps',
@@ -2024,12 +2050,12 @@ try {
     /* LOW caps hold while the emitters cycle */
     const capHold = await page.evaluate(async () => {
       const S = window.SIM;
-      const t = S.CFG.traffic;
+      const t = S.CFG.traffic, p = S.CFG.parts;
       for (let i = 0; i < 10; i++) {
         if (S.TRAFFIC.count > t.drone.tiers.low ||
             S.TRAFFIC.vcount > t.vehicle.tiers.low ||
-            S.TRAFFIC.scount > t.steam.tiers.low ||
-            S.TRAFFIC.pcount > t.spark.tiers.low) return false;
+            S.PARTS.scount > p.steam.tiers.low ||
+            S.PARTS.pcount > p.spark.tiers.low) return false;
         await new Promise(r => setTimeout(r, 150));
       }
       return true;
@@ -2039,15 +2065,15 @@ try {
     /* back to HIGH: every fleet regrows to its HIGH cap */
     await page.evaluate(() => window.SIM.TIER.set('high'));
     await page.waitForFunction(o => {
-      const T = window.SIM.TRAFFIC;
+      const T = window.SIM.TRAFFIC, P = window.SIM.PARTS;
       return T.count === o.drone && T.vcount === o.vehicle &&
-        T.scount === o.steam && T.pcount >= 3;
+        P.scount === o.steam && P.pcount >= 3;
     }, { drone: capsHi.drone, vehicle: capsHi.vehicle, steam: capsHi.steam },
       { timeout: 120000 });
     const tHi = await page.evaluate(() => {
-      const T = window.SIM.TRAFFIC;
-      return { count: T.count, vcount: T.vcount, scount: T.scount,
-        pcount: T.pcount };
+      const T = window.SIM.TRAFFIC, P = window.SIM.PARTS;
+      return { count: T.count, vcount: T.vcount, scount: P.scount,
+        pcount: P.pcount };
     });
     const hiWin = await snapWin();
     check('M6.5: HIGH tier restores all four fleets (regrows on spawn ticks)',
@@ -2085,6 +2111,267 @@ try {
     /* stop the frame probe (leave the object; the pending rAF sees
      * on=false and exits — deleting it would throw in the callback) */
     await page.evaluate(() => { window.__m65.on = false; });
+  }
+
+  /* ------------------------------------------------------------------ *
+   * M7.1 — pooled particle system (one system, one budget)
+   *
+   *  PARTS owns EVERY particle in the demo: steam, sparks, pulse motes,
+   *  lightning motes, awakening rain — five M6.1 pools, one shared
+   *  budget (CFG.parts.tiers = the exact sum of the per-type tier caps).
+   *  The dev trigger (Key P) rains ALL five types; the event types
+   *  (pulse/light/rain) cost nothing while idle (0 live ⇒ 0 draw calls).
+   * ------------------------------------------------------------------ */
+  {
+    /* 5 pools, fixed capacity = HIGH tier cap; one budget = the exact
+     * sum of the per-type tier caps at EVERY tier */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM;
+      const pools = {};
+      for (const n of ['parts-steam', 'parts-spark', 'parts-pulse',
+        'parts-light', 'parts-rain'])
+        pools[n] = (S.POOL.list.find(p => p.name === n) ||
+          { capacity: -1 }).capacity;
+      const sum = tier =>
+        S.CFG.parts.steam.tiers[tier] + S.CFG.parts.spark.tiers[tier] +
+        S.CFG.parts.pulse.tiers[tier] + S.CFG.parts.light.tiers[tier] +
+        S.CFG.parts.rain.tiers[tier];
+      return {
+        pools,
+        budget: { high: S.CFG.parts.tiers.high,
+          med: S.CFG.parts.tiers.med, low: S.CFG.parts.tiers.low },
+        sum: { high: sum('high'), med: sum('med'), low: sum('low') },
+        hi: {
+          steam: S.CFG.parts.steam.tiers.high,
+          spark: S.CFG.parts.spark.tiers.high,
+          pulse: S.CFG.parts.pulse.tiers.high,
+          light: S.CFG.parts.light.tiers.high,
+          rain: S.CFG.parts.rain.tiers.high,
+        },
+      };
+    });
+    check('M7.1: PARTS registered with 5 pools (capacity = HIGH tier cap)',
+      reg.pools['parts-steam'] === reg.hi.steam &&
+      reg.pools['parts-spark'] === reg.hi.spark &&
+      reg.pools['parts-pulse'] === reg.hi.pulse &&
+      reg.pools['parts-light'] === reg.hi.light &&
+      reg.pools['parts-rain'] === reg.hi.rain,
+      `steam=${reg.pools['parts-steam']}, spark=${reg.pools['parts-spark']},`
+      + ` pulse=${reg.pools['parts-pulse']}, light=${reg.pools['parts-light']},`
+      + ` rain=${reg.pools['parts-rain']}`);
+    check('M7.1: one budget — CFG.parts.tiers = exact sum of per-type tier caps (all tiers)',
+      reg.budget.high === reg.sum.high && reg.budget.med === reg.sum.med &&
+      reg.budget.low === reg.sum.low,
+      `high=${reg.budget.high}/${reg.sum.high},`
+      + ` med=${reg.budget.med}/${reg.sum.med},`
+      + ` low=${reg.budget.low}/${reg.sum.low}`);
+
+    /* idle cost ~0: the event types (pulse/light/rain) are 0 live with
+     * 0 drawRange/count and 0 pool inUse (0 draw calls for them), while
+     * the ambient types (steam/spark) keep running */
+    const idle = await page.evaluate(() => {
+      const S = window.SIM, P = S.PARTS;
+      const inUse = n => {
+        const p = S.POOL.list.find(pp => pp.name === n);
+        return p.capacity - p.top;
+      };
+      return {
+        mcount: P.mcount, lcount: P.lcount, rcount: P.rcount,
+        mDraw: P.mpoints.geometry.drawRange.count,
+        lDraw: P.lpoints.geometry.drawRange.count,
+        rCount: P.rmesh.count,
+        mInUse: inUse('parts-pulse'), lInUse: inUse('parts-light'),
+        rInUse: inUse('parts-rain'),
+        ambient: P.scount > 0 && P.pcount > 0,
+      };
+    });
+    check('M7.1: idle cost ~0 — event types 0 live, 0 drawRange/count, 0 pool inUse (ambient keeps running)',
+      idle.mcount === 0 && idle.lcount === 0 && idle.rcount === 0 &&
+      idle.mDraw === 0 && idle.lDraw === 0 && idle.rCount === 0 &&
+      idle.mInUse === 0 && idle.lInUse === 0 && idle.rInUse === 0 &&
+      idle.ambient,
+      `m=${idle.mcount}/${idle.mDraw}, l=${idle.lcount}/${idle.lDraw},`
+      + ` r=${idle.rcount}/${idle.rCount}`);
+
+    /* one dev trigger key (P) rains ALL five particle types */
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const heapBefore = await heapMin();
+    await page.keyboard.press('p');
+    await page.waitForFunction(() => {
+      const P = window.SIM.PARTS;
+      return P.scount > 0 && P.pcount > 0 && P.mcount > 0 &&
+        P.lcount > 0 && P.rcount > 0;
+    }, { timeout: 15000 });
+    const rain0 = await page.evaluate(() => {
+      const S = window.SIM, P = S.PARTS;
+      const inUse = n => {
+        const p = S.POOL.list.find(pp => pp.name === n);
+        return p.capacity - p.top;
+      };
+      window.__m71 = P._rLive.slice(0, P.rcount)
+        .map(it => ({ ref: it, y: it.py }));
+      return {
+        scount: P.scount, pcount: P.pcount, mcount: P.mcount,
+        lcount: P.lcount, rcount: P.rcount,
+        zeroNew: [
+          ['parts-steam', P._sLive.slice(0, P.scount)],
+          ['parts-spark', P._pLive.slice(0, P.pcount)],
+          ['parts-pulse', P._mLive.slice(0, P.mcount)],
+          ['parts-light', P._lLive.slice(0, P.lcount)],
+          ['parts-rain', P._rLive.slice(0, P.rcount)],
+        ].every(([n, live]) =>
+          live.length > 0 && live.every(it =>
+            it.__pool && it.__pool.name === n && it.__free === false)),
+        inUse: {
+          s: inUse('parts-steam'), p: inUse('parts-spark'),
+          m: inUse('parts-pulse'), l: inUse('parts-light'),
+          r: inUse('parts-rain'),
+        },
+        /* keep the item refs in the page (evaluate args are serialized
+         * copies — the drift sample below needs live identity) */
+        calls: S.renderer.info.render.calls,
+      };
+    });
+    check('M7.1: trigger key P rains ALL five particle types',
+      rain0.scount > 0 && rain0.pcount > 0 && rain0.mcount > 0 &&
+      rain0.lcount > 0 && rain0.rcount > 0,
+      `steam=${rain0.scount}, spark=${rain0.pcount},`
+      + ` pulse=${rain0.mcount}, light=${rain0.lcount},`
+      + ` rain=${rain0.rcount}`);
+    check('M7.1: every live particle is a pre-created pool item (zero `new` after init)',
+      rain0.zeroNew &&
+      rain0.inUse.s === rain0.scount && rain0.inUse.p === rain0.pcount &&
+      rain0.inUse.m === rain0.mcount && rain0.inUse.l === rain0.lcount &&
+      rain0.inUse.r === rain0.rcount,
+      `inUse s=${rain0.inUse.s}, p=${rain0.inUse.p}, m=${rain0.inUse.m},`
+      + ` l=${rain0.inUse.l}, r=${rain0.inUse.r}`);
+
+    /* rain streaks visibly fall; sampled counts never exceed the tier
+     * caps; heap flat across the live-rain window */
+    await sleep(600);
+    const rain1 = await page.evaluate(async () => {
+      const S = window.SIM, P = S.PARTS;
+      let fell = 0, still = 0;
+      const live = new Set(P._rLive.slice(0, P.rcount));
+      for (const sn of window.__m71) {
+        if (!live.has(sn.ref)) continue;
+        still++;
+        if (sn.ref.py - sn.y < -0.5) fell++;
+      }
+      const t = S.TIER.active();
+      let capsOk = true;
+      for (let i = 0; i < 10; i++) {
+        if (P.scount > S.CFG.parts.steam.tiers[t] ||
+            P.pcount > S.CFG.parts.spark.tiers[t] ||
+            P.mcount > S.CFG.parts.pulse.tiers[t] ||
+            P.lcount > S.CFG.parts.light.tiers[t] ||
+            P.rcount > S.CFG.parts.rain.tiers[t]) { capsOk = false; break; }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return {
+        fell, still, capsOk, rcount: P.rcount,
+        heap: m === Infinity ? -1 : m,
+      };
+    });
+    check('M7.1: rain streaks visibly fall (downward drift) while alive',
+      rain1.fell > 0,
+      `fell=${rain1.fell}/${rain1.still}`);
+    check('M7.1: counts never exceed the tier caps (sampled while raining)',
+      rain1.capsOk === true,
+      `rain=${rain1.rcount}/${reg.hi.rain}`);
+    check('M7.1: no allocation per frame (heap flat across the rain window)',
+      heapBefore > 0 && rain1.heap > 0 &&
+      rain1.heap - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,`
+      + ` after=${Math.round(rain1.heap / 1024)}KB`);
+    check('M7.1: draw calls inside budget with the rain at cap',
+      rain0.calls > 0 && rain0.calls < 150, `calls=${rain0.calls}`);
+
+    /* visual gate: rain streaks in frame — camera tilted up, the
+     * streaks spawn 70–100 m above the player and fall through it */
+    let rshot = 0;
+    for (let tries = 0; tries < 10 && rshot === 0; tries++) {
+      rshot = await page.evaluate(() => {
+        const S = window.SIM, P = S.PARTS;
+        if (P.rcount === 0) return 0;
+        S.CAMERA.pos.set(0, 4, 18);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = 0;
+        S.CAMERA.pitch = 0.55;
+        return P.rcount;
+      });
+      if (!rshot) await sleep(250);
+    }
+    await sleep(450);
+    await page.screenshot({ path: `${here}/shots/m71-particles-rain.png` });
+    const shotOk = fs.existsSync(`${here}/shots/m71-particles-rain.png`);
+    check('M7.1: rain screenshot with the streaks in frame (shots/m71-particles-rain.png)',
+      shotOk && rshot > 0,
+      `rcount=${rshot}`);
+
+    /* LOW tier caps the trigger rain; HIGH restores it */
+    await page.evaluate(() => window.SIM.TIER.set('low'));
+    await page.keyboard.press('p');
+    await page.waitForFunction(() => {
+      const P = window.SIM.PARTS;
+      return P.rcount > 0 && P.mcount > 0 && P.lcount > 0;
+    }, { timeout: 15000 });
+    const low = await page.evaluate(() => {
+      const S = window.SIM, P = S.PARTS;
+      const t = S.CFG.parts;
+      return {
+        rcount: P.rcount, rCap: t.rain.tiers.low,
+        mcount: P.mcount, mCap: t.pulse.tiers.low,
+        lcount: P.lcount, lCap: t.light.tiers.low,
+      };
+    });
+    check('M7.1: LOW tier caps the trigger rain (event types ≤ LOW caps)',
+      low.rcount <= low.rCap && low.mcount <= low.mCap &&
+      low.lcount <= low.lCap,
+      `rain=${low.rcount}/${low.rCap}, pulse=${low.mcount}/${low.mCap},`
+      + ` light=${low.lcount}/${low.lCap}`);
+    await page.evaluate(() => window.SIM.TIER.set('high'));
+    await page.keyboard.press('p');
+    await page.waitForFunction(c => window.SIM.PARTS.rcount > c, low.rCap,
+      { timeout: 30000 });
+    check('M7.1: HIGH tier restores the full rain (regrows past the LOW cap)',
+      (await page.evaluate(() => window.SIM.PARTS.rcount)) > low.rCap,
+      `rcount > ${low.rCap}`);
+
+    /* rain resolves clean: after the trigger duration the event types
+     * return to 0 live with drawRange/count back to 0 (no leftover
+     * state) — the ambient emitters keep running */
+    await page.waitForFunction(() => {
+      const P = window.SIM.PARTS;
+      return P.mcount === 0 && P.lcount === 0 && P.rcount === 0;
+    }, { timeout: 30000 });
+    const resolved = await page.evaluate(() => {
+      const S = window.SIM, P = S.PARTS;
+      return {
+        mDraw: P.mpoints.geometry.drawRange.count,
+        lDraw: P.lpoints.geometry.drawRange.count,
+        rCount: P.rmesh.count,
+        ambient: P.scount > 0 && P.pcount > 0,
+      };
+    });
+    check('M7.1: rain resolves clean — event types back to 0 live (no leftover state)',
+      resolved.mDraw === 0 && resolved.lDraw === 0 && resolved.rCount === 0 &&
+      resolved.ambient,
+      `ambient steam/spark still alive=${resolved.ambient}`);
   }
 
   /* ---- 10. No errors anywhere ---- */

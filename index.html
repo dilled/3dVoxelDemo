@@ -302,7 +302,20 @@ const CFG = {
       trailLen: [10, 16],                  // streak length (m)
       trailW: 1.1,                         // streak width / height (m)
     },
-    /* M6.4: steam vents — billboard sprite pool on cooling towers */
+  },
+
+  /* ---- M7.1: particle system — one system, one budget ----
+   * Every particle in the demo (steam, sparks, pulse motes, lightning
+   * motes, awakening rain) is an item of a PARTS pool. The one budget
+   * is `tiers` (total live particles per tier = the exact sum of the
+   * per-type tier caps below). Ambient: steam + sparks (the M6.4
+   * emitters, moved here from TRAFFIC). Event-driven (0 live at idle):
+   * pulse (M13.2 data pulse), light (M8.4 distant lightning), rain
+   * (M9 awakening). Dev trigger: Key P rains all five types
+   * (PARTS.rainAll). */
+  parts: {
+    tiers: { high: 280, med: 160, low: 72 },   // one shared budget (total)
+    /* steam vents — billboard sprite pool on cooling towers (M6.4) */
     steam: {
       tiers: { high: 48, med: 28, low: 12 },  // per-TIER.active() caps
       spawnInterval: 0.12,                  // s between puff spawns
@@ -314,7 +327,7 @@ const CFG = {
       size: [2.2, 3.8],                    // billboard size (m) at birth
       grow: 1.6,                           // size multiplier over life
     },
-    /* M6.4: sparks — tiny additive points on substations (brief life) */
+    /* sparks — tiny additive points on substations (brief life) (M6.4) */
     spark: {
       tiers: { high: 64, med: 36, low: 18 },  // per-TIER.active() caps
       spawnInterval: 0.3,                   // s between spark bursts
@@ -325,6 +338,38 @@ const CFG = {
       speed: [1.5, 4],                    // m/s sideways kick
       burst: [1, 3],                     // sparks per burst
       gravity: 3.2,                      // m/s² downward pull
+    },
+    /* pulse motes — slow-rising cyan motes (event-driven: M13.2 data
+     * pulse + dev trigger; 0 live at idle) */
+    pulse: {
+      tiers: { high: 48, med: 24, low: 12 },  // per-TIER.active() caps
+      trickle: 0.18,                      // s between motes while raining
+      radius: 90,                         // spawn annulus outer (metres)
+      innerRadius: 30,                    // keep clear of the player
+      releaseFactor: 1.25,                // release past radius*factor
+      life: [4, 7],                       // s per mote
+      rise: [0.7, 1.4],                  // m/s upward drift
+    },
+    /* lightning motes — fast-falling white motes (event-driven: M8.4
+     * distant lightning + dev trigger; 0 live at idle) */
+    light: {
+      tiers: { high: 40, med: 24, low: 10 },  // per-TIER.active() caps
+      trickle: 0.7,                       // s between motes while raining
+      radius: [250, 450],                 // far-sky spawn annulus (metres)
+      altitude: [160, 260],               // spawn altitude (metres)
+      speed: [55, 85],                   // m/s downward
+    },
+    /* rain — falling energy streaks (event-driven: M9 awakening + dev
+     * trigger; 0 live at idle) */
+    rain: {
+      tiers: { high: 80, med: 48, low: 20 },  // per-TIER.active() caps
+      spawnInterval: 0.025,               // s between streaks while raining
+      dur: 5,                             // s the trigger rain lasts
+      radius: 90,                         // spawn radius around player (m)
+      altitude: [70, 100],                // spawn altitude (metres)
+      speed: [30, 45],                   // m/s downward
+      len: [5, 9],                       // streak length (metres)
+      burst: { steam: 10, spark: 14, pulse: 24, light: 14 },
     },
   },
 };
@@ -474,6 +519,7 @@ const INPUT = {
   zoom: 0,                     // accumulated wheel notches
   sprint: false,
   modeSwitch: false,           // V / gamepad A-button edge
+  rainTrigger: false,         // P edge — dev trigger: rain all particles
 
   pad: {
     connected: false,
@@ -488,6 +534,7 @@ const INPUT = {
     window.addEventListener('keydown', e => {
       if (BOOT.state !== 'RUNNING') return;
       if (e.code === 'KeyV' && !e.repeat) INPUT.modeSwitch = true;
+      if (e.code === 'KeyP' && !e.repeat) INPUT.rainTrigger = true;
       INPUT.keys.add(e.code);
       if (e.code === 'Space') e.preventDefault();
     });
@@ -2157,17 +2204,8 @@ const POOL = {
  *    HIGH tier cap ⇒ zero `new` after init); same tier cap + farthest-
  *    release trim + hold-radius release as the drones
  *
- *  M6.4 — ambient emitters (steam vents + sparks), same pool pattern:
- *  - steam: billboard sprite pool — one shared InstancedMesh of glow-
- *    textured quads (one draw call) that always face the camera;
- *    puffs spawn at cooling-tower vents (replayed M3 seed, 'cool'),
- *    rise, sway, grow and fade in/out over 5–8 s
- *  - sparks: tiny additive Points (one draw call, warm glow texture);
- *    1–3 spark bursts every 0.3 s at substation roofs (arch 'sub'),
- *    brief ballistic life (0.35–0.9 s) with flicker and fade
- *  - state lives in the M6.1 pools 'traffic-steam' / 'traffic-spark'
- *    (fixed capacity = HIGH tier cap ⇒ zero `new` after init); same
- *    tier cap + farthest-release trim + source-radius release
+ *  (M6.4's steam + spark emitters moved to the M7.1 PARTS particle
+ *   system — one system, one budget for every particle in the demo)
  * --------------------------------------------------------------------- */
 const TRAFFIC = {
   name: 'TRAFFIC',
@@ -2199,27 +2237,6 @@ const TRAFFIC = {
   _vqI: new THREE.Quaternion(),
   _vs: new THREE.Vector3(1, 1, 1),
   _vtint: new THREE.Color(),
-  /* M6.4 steam + sparks (zero per-frame allocation) */
-  smesh: null,                 // steam billboard quads (one draw call)
-  spoints: null,               // spark points (one draw call)
-  spool: null,                 // M6.1 pool 'traffic-steam'
-  ppool: null,                 // M6.1 pool 'traffic-spark'
-  scount: 0,                   // live puffs (= smesh.count)
-  pcount: 0,                   // live sparks (= Points drawRange)
-  _sLive: null,
-  _pLive: null,
-  _sCap: 48,
-  _pCap: 64,
-  _sSpawnTimer: 0,
-  _pSpawnTimer: 0,
-  _sm: new THREE.Matrix4(),
-  _sp: new THREE.Vector3(),
-  _ss: new THREE.Vector3(1, 1, 1),
-  _sq: new THREE.Quaternion(),
-  _sqX: new THREE.Quaternion(),
-  _sqY: new THREE.Quaternion(),
-  _stint: new THREE.Color(),
-  _x: new THREE.Vector3(1, 0, 0),
 
   init() {
     /* drone body: merged voxel quad — chassis + 4 rotors + sensor nub
@@ -2305,59 +2322,6 @@ const TRAFFIC = {
       tint: new THREE.Color(0x6fe3ff),
     }));
 
-    /* ---- M6.4: steam vents (billboard sprite pool, cooling towers) ----
-     * One shared InstancedMesh of glow-textured quads: the whole plume
-     * field costs one draw call. The quad is billboarded to the camera
-     * every frame (orientation = camera yaw/pitch); per-instance color
-     * = tint × fade (additive blending ⇒ color IS the alpha). */
-    TRAFFIC.smesh = new THREE.InstancedMesh(
-      new THREE.PlaneGeometry(1, 1),
-      new THREE.MeshBasicMaterial({
-        map: KIT.tex.glow.tex, color: 0xffffff, transparent: true,
-        depthWrite: false, blending: THREE.AdditiveBlending,
-      }), 48);
-    TRAFFIC.smesh.count = 0;
-    TRAFFIC.smesh.frustumCulled = false;
-    TRAFFIC.smesh.name = 'steam-vents';
-    scene.add(TRAFFIC.smesh);
-    TRAFFIC._sLive = new Array(48);
-    TRAFFIC.spool = POOL.make('traffic-steam', 48, () => ({
-      px: 0, py: 0, pz: 0,     // current puff position (metres)
-      sx: 0, sy: 0, sz: 0,    // vent origin (metres)
-      vy: 2.5, age: 0, life: 6,
-      size0: 2.5, ph: 0,
-      cR: 0.62, cG: 0.72, cB: 0.82,   // vapor tint (× fade per frame)
-    }));
-
-    /* ---- M6.4: sparks (tiny additive points, substations) ----
-     * One Points cloud with per-vertex color = flash × fade; only the
-     * first pcount vertices are drawn (setDrawRange), so an idle spark
-     * emitter costs zero draw calls. */
-    const nP = 64;
-    const sGeo = new THREE.BufferGeometry();
-    sGeo.setAttribute('position',
-      new THREE.BufferAttribute(new Float32Array(nP * 3), 3));
-    sGeo.setAttribute('color',
-      new THREE.BufferAttribute(new Float32Array(nP * 3), 3));
-    TRAFFIC.spoints = new THREE.Points(sGeo, new THREE.PointsMaterial({
-      size: 1.1, sizeAttenuation: true,
-      map: KIT.makeGlowTexture(64, '255,225,170').tex,
-      transparent: true, depthWrite: false,
-      blending: THREE.AdditiveBlending, vertexColors: true,
-    }));
-    sGeo.setDrawRange(0, 0);
-    TRAFFIC.spoints.frustumCulled = false;
-    TRAFFIC.spoints.name = 'sparks';
-    scene.add(TRAFFIC.spoints);
-    TRAFFIC._pLive = new Array(64);
-    TRAFFIC.ppool = POOL.make('traffic-spark', 64, () => ({
-      px: 0, py: 0, pz: 0,     // current position (metres)
-      sx: 0, sy: 0, sz: 0,    // substation origin (metres)
-      vx: 0, vy: 0, vz: 0,
-      age: 0, life: 0.5, ph: 0,
-      cR: 1, cG: 0.85, cB: 0.55,     // hot white-amber (× fade per frame)
-    }));
-
     /* persistent rng: spawn planning is deterministic per page load
      * (seeded once; every call draws from the same stream) */
     TRAFFIC._rng = mulberry32(CFG.city.seed ^ 0x5d37);
@@ -2365,10 +2329,6 @@ const TRAFFIC = {
     TRAFFIC._vSpawnTimer = 0;
     TRAFFIC._cap = CFG.traffic.drone.tiers[TIER.name];
     TRAFFIC._vCap = CFG.traffic.vehicle.tiers[TIER.name];
-    TRAFFIC._sCap = CFG.traffic.steam.tiers[TIER.name];
-    TRAFFIC._pCap = CFG.traffic.spark.tiers[TIER.name];
-    TRAFFIC._sSpawnTimer = 0;
-    TRAFFIC._pSpawnTimer = 0;
   },
 
   update(dt, t) {
@@ -2528,134 +2488,6 @@ const TRAFFIC = {
       tmesh.instanceMatrix.needsUpdate = true;
       if (tmesh.instanceColor) tmesh.instanceColor.needsUpdate = true;
     }
-
-    /* ---- M6.4: steam vents (cooling towers) ---- */
-    const st = CFG.traffic.steam;
-    /* keep the source lists fresh (both emitters share them) */
-    TRAFFIC._srcTimer += dt;
-    if (TRAFFIC._srcTimer >= 4 ||
-        TRAFFIC._coolList.length === 0 || TRAFFIC._subList.length === 0) {
-      TRAFFIC._refreshSources();
-    }
-    /* tier cap: trim the farthest puffs down to the tier limit */
-    TRAFFIC._sCap = st.tiers[TIER.name];
-    while (TRAFFIC.scount > TRAFFIC._sCap) {
-      let fi = 0, fd = -1;
-      for (let i = 0; i < TRAFFIC.scount; i++) {
-        const it = TRAFFIC._sLive[i];
-        const dist2 =
-          (it.px - CAMERA.pos.x) * (it.px - CAMERA.pos.x) +
-          (it.pz - CAMERA.pos.z) * (it.pz - CAMERA.pos.z);
-        if (dist2 > fd) { fd = dist2; fi = i; }
-      }
-      TRAFFIC._sReleaseAt(fi);
-    }
-
-    /* spawn attempts (persistent rng — zero allocations). Timer
-     * accumulates the frame remainder (while, not if-reset) so the
-     * rate is frame-rate independent — at 17 fps a 0.12 s interval
-     * must still average 8.3 spawns/s, not one per 3 frames. */
-    TRAFFIC._sSpawnTimer -= dt;
-    while (TRAFFIC._sSpawnTimer <= 0 && TRAFFIC.scount < TRAFFIC._sCap) {
-      TRAFFIC._sSpawnTimer += st.spawnInterval;
-      const r = TRAFFIC._rng;
-      const src = TRAFFIC._findSource(r, 'cool', st.radius, st.innerRadius);
-      const it = src ? TRAFFIC.spool.acquire() : null;
-      if (it) TRAFFIC._spawnSteam(it, src);
-      else break;   // no source in range — retry on the next interval
-    }
-
-    /* per-frame drift: rise + sway, grow, fade in/out. Billboard =
-     * camera orientation: the plane's +Z faces the camera for the
-     * current yaw/pitch (orbit mode is transient — close enough). */
-    const smesh = TRAFFIC.smesh;
-    TRAFFIC._sqY.setFromAxisAngle(TRAFFIC._y, CAMERA.yaw);
-    TRAFFIC._sqX.setFromAxisAngle(TRAFFIC._x, CAMERA.pitch);
-    TRAFFIC._sq.copy(TRAFFIC._sqY).multiply(TRAFFIC._sqX);
-    const sR2 = st.radius * st.releaseFactor * st.radius * st.releaseFactor;
-    for (let i = TRAFFIC.scount - 1; i >= 0; i--) {
-      const it = TRAFFIC._sLive[i];
-      it.age += dt;
-      const drx = it.sx - CAMERA.pos.x, drz = it.sz - CAMERA.pos.z;
-      if (it.age >= it.life ||
-          drx * drx + drz * drz > sR2) { TRAFFIC._sReleaseAt(i); continue; }
-      const u = it.age / it.life;
-      it.py += it.vy * dt;
-      it.px += Math.sin(t * 0.9 + it.ph) * 0.4 * dt;   // gentle sway drift
-      it.pz += Math.cos(t * 0.7 + it.ph) * 0.3 * dt;
-      const size = it.size0 * (1 + st.grow * u);
-      TRAFFIC._sp.set(it.px, it.py, it.pz);
-      TRAFFIC._ss.set(size, size, size);
-      TRAFFIC._sm.compose(TRAFFIC._sp, TRAFFIC._sq, TRAFFIC._ss);
-      smesh.setMatrixAt(i, TRAFFIC._sm);
-      /* fade in/out: 0 → tint → 0 over life (additive ⇒ color IS alpha) */
-      const a = Math.sin(u * Math.PI) * 0.30;
-      TRAFFIC._stint.setRGB(it.cR * a, it.cG * a, it.cB * a);
-      smesh.setColorAt(i, TRAFFIC._stint);
-    }
-    smesh.count = TRAFFIC.scount;
-    if (TRAFFIC.scount > 0) {
-      smesh.instanceMatrix.needsUpdate = true;
-      if (smesh.instanceColor) smesh.instanceColor.needsUpdate = true;
-    }
-
-    /* ---- M6.4: sparks (substations) ---- */
-    const sp = CFG.traffic.spark;
-    /* tier cap: trim the farthest sparks down to the tier limit */
-    TRAFFIC._pCap = sp.tiers[TIER.name];
-    while (TRAFFIC.pcount > TRAFFIC._pCap) {
-      let fi = 0, fd = -1;
-      for (let i = 0; i < TRAFFIC.pcount; i++) {
-        const it = TRAFFIC._pLive[i];
-        const dist2 =
-          (it.px - CAMERA.pos.x) * (it.px - CAMERA.pos.x) +
-          (it.pz - CAMERA.pos.z) * (it.pz - CAMERA.pos.z);
-        if (dist2 > fd) { fd = dist2; fi = i; }
-      }
-      TRAFFIC._pReleaseAt(fi);
-    }
-
-    /* burst attempts (persistent rng — zero allocations), same
-     * frame-rate-independent timer pattern as the steam spawner */
-    TRAFFIC._pSpawnTimer -= dt;
-    while (TRAFFIC._pSpawnTimer <= 0 && TRAFFIC.pcount < TRAFFIC._pCap) {
-      TRAFFIC._pSpawnTimer += sp.spawnInterval;
-      const r = TRAFFIC._rng;
-      const n = sp.burst[0] + Math.floor(r() * (sp.burst[1] - sp.burst[0] + 1));
-      const src = TRAFFIC._findSource(r, 'sub', sp.radius, sp.innerRadius);
-      if (!src) break;   // no source in range — retry on the next interval
-      for (let k = 0; k < n; k++) {
-        const it = TRAFFIC.ppool.acquire();
-        if (!it) break;
-        TRAFFIC._spawnSpark(it, src);
-      }
-    }
-
-    /* per-frame: brief ballistic life, flicker, fade to zero. Only the
-     * first pcount vertices are drawn (setDrawRange) — per-slot buffers,
-     * re-set every frame (swap-remove moves items between slots). */
-    const spts = TRAFFIC.spoints;
-    const sPos = spts.geometry.attributes.position.array;
-    const sCol = spts.geometry.attributes.color.array;
-    const pR2 = sp.radius * sp.releaseFactor * sp.radius * sp.releaseFactor;
-    for (let i = TRAFFIC.pcount - 1; i >= 0; i--) {
-      const it = TRAFFIC._pLive[i];
-      it.age += dt;
-      const drx = it.sx - CAMERA.pos.x, drz = it.sz - CAMERA.pos.z;
-      if (it.age >= it.life ||
-          drx * drx + drz * drz > pR2) { TRAFFIC._pReleaseAt(i); continue; }
-      const u = it.age / it.life;
-      it.vy -= sp.gravity * dt;
-      it.px += it.vx * dt; it.py += it.vy * dt; it.pz += it.vz * dt;
-      sPos[i * 3] = it.px; sPos[i * 3 + 1] = it.py; sPos[i * 3 + 2] = it.pz;
-      const fl = 0.75 + 0.25 * Math.sin(t * 42 + it.ph);
-      const a = (1 - u) * fl;
-      sCol[i * 3] = it.cR * a; sCol[i * 3 + 1] = it.cG * a;
-      sCol[i * 3 + 2] = it.cB * a;
-    }
-    spts.geometry.setDrawRange(0, TRAFFIC.pcount);
-    spts.geometry.attributes.position.needsUpdate = true;
-    spts.geometry.attributes.color.needsUpdate = true;
   },
 
   /* write the instance matrix for drone `it` into TRAFFIC._m */
@@ -2806,16 +2638,585 @@ const TRAFFIC = {
     TRAFFIC.vpool.release(it);
   },
 
-  /* M6.4 — source search for the ambient emitters. A 200 m radius holds
-   * only ~10 source blocks, so blind random-block draws would starve the
-   * emitters (per-draw hit rate ~5%). Instead: a small live list of the
-   * source buildings near the player, rebuilt every few seconds from the
-   * same seeded buildingAt path (planning-time allocations only), and a
-   * uniform random pick from it filtered to [inner, radius]. */
+  dispose() {
+    for (let i = TRAFFIC.count - 1; i >= 0; i--) TRAFFIC._releaseAt(i);
+    for (let i = TRAFFIC.vcount - 1; i >= 0; i--) TRAFFIC._vReleaseAt(i);
+    if (TRAFFIC.mesh) {
+      scene.remove(TRAFFIC.mesh);
+      TRAFFIC.mesh.geometry.dispose();
+      TRAFFIC.mesh.material.dispose();
+    }
+    for (const m of [TRAFFIC.vmesh, TRAFFIC.tmesh]) {
+      if (m) {
+        scene.remove(m);
+        m.geometry.dispose();
+        m.material.dispose();
+      }
+    }
+  },
+};
+
+/* ==================================================================== *
+ * PARTS — pooled particle system (M7.1): one system, one budget
+ *
+ *  - EVERY particle in the demo is an item of a PARTS M6.1 pool:
+ *    steam, sparks, pulse motes, lightning motes, awakening rain.
+ *    Five pools, one per type, fixed capacity = HIGH tier cap ⇒ zero
+ *    `new` after init; the one budget is CFG.parts.tiers (total live
+ *    particles per tier = the exact sum of the per-type tier caps),
+ *    enforced per type by the same farthest-release trim the M6
+ *    fleets use (TIER seam — auto-detect is M14.1)
+ *  - renderers (one draw call each; count 0 / drawRange 0 ⇒ 0 draw
+ *    calls, so the event types cost nothing while idle):
+ *    - steam: billboard glow-sprite InstancedMesh (AMBIENT: cooling-
+ *      tower vents — the M6.4 emitter, moved here from TRAFFIC)
+ *    - spark: tiny additive Points (AMBIENT: substation roofs — the
+ *      M6.4 emitter, moved here from TRAFFIC)
+ *    - pulse: slow-rising cyan motes (EVENT: M13.2 data pulse + dev
+ *      trigger; 0 live at idle)
+ *    - light: fast-falling white motes (EVENT: M8.4 distant lightning
+ *      + dev trigger; 0 live at idle)
+ *    - rain: falling energy streaks on the shared MATS.pulseGlow
+ *      material (EVENT: M9 awakening + dev trigger; 0 live at idle)
+ *  - dev trigger (Key P, INPUT edge): PARTS.rainAll() — one-time
+ *    bursts of every type + a streak/mote trickle for CFG.parts.rain
+ *    .dur seconds around the player
+ *  - ambient source lists (moved from TRAFFIC — the M6.4 seam): a
+ *    small live list of nearby source buildings, rebuilt every few
+ *    seconds from the same seeded WORLD.buildingAt path; spawn timers
+ *    accumulate the frame remainder (while, not if-reset) so rates are
+ *    frame-rate independent
+ * --------------------------------------------------------------------- */
+const PARTS = {
+  name: 'PARTS',
+  /* pools (M6.1): 'parts-steam' / 'parts-spark' / 'parts-pulse' /
+   * 'parts-light' / 'parts-rain' — capacity = HIGH tier cap */
+  spool: null,
+  ppool: null,
+  mpool: null,
+  lpool: null,
+  rpool: null,
+  /* live lists (pool items, swap-remove) + live counts */
+  _sLive: null,
+  _pLive: null,
+  _mLive: null,
+  _lLive: null,
+  _rLive: null,
+  scount: 0,                   // live puffs  (= smesh.count)
+  pcount: 0,                   // live sparks (= spoints drawRange)
+  mcount: 0,                   // live pulse motes (= mpoints drawRange)
+  lcount: 0,                   // live lightning motes (= lpoints drawRange)
+  rcount: 0,                   // live rain streaks (= rmesh.count)
+  /* renderers (one draw call each; 0 live ⇒ 0 draw calls) */
+  smesh: null,                 // steam billboard quads
+  spoints: null,               // spark points
+  mpoints: null,               // pulse-mote points
+  lpoints: null,               // lightning-mote points
+  rmesh: null,                 // rain streak boxes
+  /* ambient source lists (moved from TRAFFIC — M6.4 seam) */
   _coolList: [],
   _subList: [],
   _srcTimer: 0,
+  /* timers (frame remainders accumulate — not if-reset) */
+  _sSpawnTimer: 0,
+  _pSpawnTimer: 0,
+  _rainT: 0,                   // remaining trigger-rain duration (s)
+  _rainSpawnTimer: 0,
+  _pulseSpawnTimer: 0,
+  _lightSpawnTimer: 0,
+  _rng: null,
+  /* tier caps (one budget: the sum = CFG.parts.tiers[TIER.name]) */
+  _sCap: 48,
+  _pCap: 64,
+  _mCap: 48,
+  _lCap: 40,
+  _rCap: 80,
+  /* scratch (zero per-frame allocation) */
+  _sm: new THREE.Matrix4(),
+  _sp: new THREE.Vector3(),
+  _ss: new THREE.Vector3(1, 1, 1),
+  _sq: new THREE.Quaternion(),
+  _sqX: new THREE.Quaternion(),
+  _sqY: new THREE.Quaternion(),
+  _stint: new THREE.Color(),
+  _x: new THREE.Vector3(1, 0, 0),
+  _y: new THREE.Vector3(0, 1, 0),
+  _rm: new THREE.Matrix4(),
+  _rp: new THREE.Vector3(),
+  _rs: new THREE.Vector3(1, 1, 1),
+  _qI: new THREE.Quaternion(),
+  _rtint: new THREE.Color(),
 
+  init() {
+    /* ---- steam vents (billboard sprite pool, cooling towers) —
+     * moved here from TRAFFIC in M7.1 (the M6.4 emitter). One shared
+     * InstancedMesh of glow-textured quads: the whole plume field
+     * costs one draw call. The quad is billboarded to the camera
+     * every frame; per-instance color = tint × fade (additive ⇒
+     * color IS the alpha). */
+    PARTS.smesh = new THREE.InstancedMesh(
+      new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({
+        map: KIT.tex.glow.tex, color: 0xffffff, transparent: true,
+        depthWrite: false, blending: THREE.AdditiveBlending,
+      }), 48);
+    PARTS.smesh.count = 0;
+    PARTS.smesh.frustumCulled = false;
+    PARTS.smesh.name = 'steam-vents';
+    scene.add(PARTS.smesh);
+    PARTS._sLive = new Array(48);
+    PARTS.spool = POOL.make('parts-steam', 48, () => ({
+      px: 0, py: 0, pz: 0,     // current puff position (metres)
+      sx: 0, sy: 0, sz: 0,    // vent origin (metres)
+      vy: 2.5, age: 0, life: 6,
+      size0: 2.5, ph: 0,
+      cR: 0.62, cG: 0.72, cB: 0.82,   // vapor tint (× fade per frame)
+    }));
+
+    /* ---- sparks (tiny additive points, substations) — moved here
+     * from TRAFFIC in M7.1 (the M6.4 emitter). One Points cloud with
+     * per-vertex color = flash × fade; only the first pcount vertices
+     * are drawn (setDrawRange), so 0 live sparks cost 0 draw calls. */
+    const nP = 64;
+    const sGeo = new THREE.BufferGeometry();
+    sGeo.setAttribute('position',
+      new THREE.BufferAttribute(new Float32Array(nP * 3), 3));
+    sGeo.setAttribute('color',
+      new THREE.BufferAttribute(new Float32Array(nP * 3), 3));
+    PARTS._sparkTex = KIT.makeGlowTexture(64, '255,225,170');
+    PARTS.spoints = new THREE.Points(sGeo, new THREE.PointsMaterial({
+      size: 1.1, sizeAttenuation: true,
+      map: PARTS._sparkTex.tex,
+      transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, vertexColors: true,
+    }));
+    sGeo.setDrawRange(0, 0);
+    PARTS.spoints.frustumCulled = false;
+    PARTS.spoints.name = 'sparks';
+    scene.add(PARTS.spoints);
+    PARTS._pLive = new Array(64);
+    PARTS.ppool = POOL.make('parts-spark', 64, () => ({
+      px: 0, py: 0, pz: 0,     // current position (metres)
+      sx: 0, sy: 0, sz: 0,    // substation origin (metres)
+      vx: 0, vy: 0, vz: 0,
+      age: 0, life: 0.5, ph: 0,
+      cR: 1, cG: 0.85, cB: 0.55,     // hot white-amber (× fade per frame)
+    }));
+
+    /* ---- pulse motes (rising cyan points — EVENT: M13.2 data
+     * pulse + dev trigger; 0 live at idle). Shared cyan glow texture
+     * (white-base KIT asset ⇒ the per-vertex color IS the light). */
+    const nM = 48;
+    const mGeo = new THREE.BufferGeometry();
+    mGeo.setAttribute('position',
+      new THREE.BufferAttribute(new Float32Array(nM * 3), 3));
+    mGeo.setAttribute('color',
+      new THREE.BufferAttribute(new Float32Array(nM * 3), 3));
+    PARTS.mpoints = new THREE.Points(mGeo, new THREE.PointsMaterial({
+      size: 1.6, sizeAttenuation: true, map: KIT.tex.glow.tex,
+      transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, vertexColors: true,
+    }));
+    mGeo.setDrawRange(0, 0);
+    PARTS.mpoints.frustumCulled = false;
+    PARTS.mpoints.name = 'pulse-motes';
+    scene.add(PARTS.mpoints);
+    PARTS._mLive = new Array(48);
+    PARTS.mpool = POOL.make('parts-pulse', 48, () => ({
+      px: 0, py: 0, pz: 0,     // current position (metres)
+      sx: 0, sy: 0, sz: 0,    // spawn origin (metres)
+      vy: 1, age: 0, life: 5,
+      sw: 0.5, ph: 0,
+      cR: 0.4, cG: 0.85, cB: 1,     // data-cyan (× fade per frame)
+    }));
+
+    /* ---- lightning motes (fast white points — EVENT: M8.4 distant
+     * lightning + dev trigger; 0 live at idle). Own near-white glow
+     * texture (the shared one is cyan). */
+    const nL = 40;
+    const lGeo = new THREE.BufferGeometry();
+    lGeo.setAttribute('position',
+      new THREE.BufferAttribute(new Float32Array(nL * 3), 3));
+    lGeo.setAttribute('color',
+      new THREE.BufferAttribute(new Float32Array(nL * 3), 3));
+    PARTS._lightTex = KIT.makeGlowTexture(64, '215,230,255');
+    PARTS.lpoints = new THREE.Points(lGeo, new THREE.PointsMaterial({
+      size: 1.0, sizeAttenuation: true, map: PARTS._lightTex.tex,
+      transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, vertexColors: true,
+    }));
+    lGeo.setDrawRange(0, 0);
+    PARTS.lpoints.frustumCulled = false;
+    PARTS.lpoints.name = 'lightning-motes';
+    scene.add(PARTS.lpoints);
+    PARTS._lLive = new Array(40);
+    PARTS.lpool = POOL.make('parts-light', 40, () => ({
+      px: 0, py: 0, pz: 0,     // current position (metres)
+      sx: 0, sy: 0, sz: 0,    // far-sky origin (metres)
+      vy: -70, age: 0, life: 2, ph: 0,
+      cR: 0.75, cG: 0.88, cB: 1,   // white-blue (× fade per frame)
+    }));
+
+    /* ---- rain (falling energy streaks — EVENT: M9 awakening + dev
+     * trigger; 0 live at idle). Thin additive boxes on the shared
+     * MATS.pulseGlow material (white base ⇒ the per-instance color IS
+     * the light) — same pattern as the M6.3 trail streaks. */
+    PARTS.rmesh = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(1, 1, 1), MATS.pulseGlow, 80);
+    PARTS.rmesh.count = 0;
+    PARTS.rmesh.frustumCulled = false;
+    PARTS.rmesh.name = 'energy-rain';
+    scene.add(PARTS.rmesh);
+    PARTS._rLive = new Array(80);
+    PARTS.rpool = POOL.make('parts-rain', 80, () => ({
+      px: 0, py: 0, pz: 0,     // current position (metres)
+      sx: 0, sy: 0, sz: 0,    // spawn origin (metres)
+      vy: -37, age: 0, life: 2.5,
+      len: 7, ph: 0,
+      cR: 0.45, cG: 0.85, cB: 1,   // energy-cyan (× fade per frame)
+    }));
+
+    /* persistent rng: spawn planning is deterministic per page load
+     * (seeded once; every call draws from the same stream) */
+    PARTS._rng = mulberry32(CFG.city.seed ^ 0x77a1);
+    PARTS._sSpawnTimer = 0;
+    PARTS._pSpawnTimer = 0;
+    PARTS._rainT = 0;
+    PARTS._rainSpawnTimer = 0;
+    PARTS._pulseSpawnTimer = 0;
+    PARTS._lightSpawnTimer = 0;
+    PARTS._sCap = CFG.parts.steam.tiers[TIER.name];
+    PARTS._pCap = CFG.parts.spark.tiers[TIER.name];
+    PARTS._mCap = CFG.parts.pulse.tiers[TIER.name];
+    PARTS._lCap = CFG.parts.light.tiers[TIER.name];
+    PARTS._rCap = CFG.parts.rain.tiers[TIER.name];
+  },
+
+  update(dt, t) {
+    /* dev trigger (Key P edge from INPUT): rain ALL five types */
+    if (INPUT.rainTrigger) {
+      INPUT.rainTrigger = false;
+      PARTS.rainAll();
+    }
+
+    /* ---- ambient steam vents (cooling towers) — the M6.4 emitter,
+     * moved here in M7.1 (same pattern, now one of the 5 types) ---- */
+    const st = CFG.parts.steam;
+    /* keep the source lists fresh (steam + spark share them) */
+    PARTS._srcTimer += dt;
+    if (PARTS._srcTimer >= 4 ||
+        PARTS._coolList.length === 0 || PARTS._subList.length === 0) {
+      PARTS._refreshSources();
+    }
+    /* tier cap: trim the farthest puffs down to the tier limit */
+    PARTS._sCap = st.tiers[TIER.name];
+    while (PARTS.scount > PARTS._sCap) {
+      let fi = 0, fd = -1;
+      for (let i = 0; i < PARTS.scount; i++) {
+        const it = PARTS._sLive[i];
+        const dist2 =
+          (it.px - CAMERA.pos.x) * (it.px - CAMERA.pos.x) +
+          (it.pz - CAMERA.pos.z) * (it.pz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      PARTS._sReleaseAt(fi);
+    }
+
+    /* spawn attempts (persistent rng — zero allocations). Timer
+     * accumulates the frame remainder (while, not if-reset) so the
+     * rate is frame-rate independent. */
+    PARTS._sSpawnTimer -= dt;
+    while (PARTS._sSpawnTimer <= 0 && PARTS.scount < PARTS._sCap) {
+      PARTS._sSpawnTimer += st.spawnInterval;
+      const r = PARTS._rng;
+      const src = PARTS._findSource(r, 'cool', st.radius, st.innerRadius);
+      const it = src ? PARTS.spool.acquire() : null;
+      if (it) PARTS._spawnSteam(it, src);
+      else break;   // no source in range — retry on the next interval
+    }
+
+    /* per-frame drift: rise + sway, grow, fade in/out. Billboard =
+     * camera orientation (orbit mode is transient — close enough). */
+    const smesh = PARTS.smesh;
+    PARTS._sqY.setFromAxisAngle(PARTS._y, CAMERA.yaw);
+    PARTS._sqX.setFromAxisAngle(PARTS._x, CAMERA.pitch);
+    PARTS._sq.copy(PARTS._sqY).multiply(PARTS._sqX);
+    const sR2 = st.radius * st.releaseFactor * st.radius * st.releaseFactor;
+    for (let i = PARTS.scount - 1; i >= 0; i--) {
+      const it = PARTS._sLive[i];
+      it.age += dt;
+      const drx = it.sx - CAMERA.pos.x, drz = it.sz - CAMERA.pos.z;
+      if (it.age >= it.life ||
+          drx * drx + drz * drz > sR2) { PARTS._sReleaseAt(i); continue; }
+      const u = it.age / it.life;
+      it.py += it.vy * dt;
+      it.px += Math.sin(t * 0.9 + it.ph) * 0.4 * dt;   // gentle sway drift
+      it.pz += Math.cos(t * 0.7 + it.ph) * 0.3 * dt;
+      const size = it.size0 * (1 + st.grow * u);
+      PARTS._sp.set(it.px, it.py, it.pz);
+      PARTS._ss.set(size, size, size);
+      PARTS._sm.compose(PARTS._sp, PARTS._sq, PARTS._ss);
+      smesh.setMatrixAt(i, PARTS._sm);
+      /* fade in/out: 0 → tint → 0 over life (additive ⇒ color IS alpha) */
+      const a = Math.sin(u * Math.PI) * 0.30;
+      PARTS._stint.setRGB(it.cR * a, it.cG * a, it.cB * a);
+      smesh.setColorAt(i, PARTS._stint);
+    }
+    smesh.count = PARTS.scount;
+    if (PARTS.scount > 0) {
+      smesh.instanceMatrix.needsUpdate = true;
+      if (smesh.instanceColor) smesh.instanceColor.needsUpdate = true;
+    }
+
+    /* ---- ambient sparks (substations) — the M6.4 emitter, moved
+     * here in M7.1 ---- */
+    const sp = CFG.parts.spark;
+    PARTS._pCap = sp.tiers[TIER.name];
+    while (PARTS.pcount > PARTS._pCap) {
+      let fi = 0, fd = -1;
+      for (let i = 0; i < PARTS.pcount; i++) {
+        const it = PARTS._pLive[i];
+        const dist2 =
+          (it.px - CAMERA.pos.x) * (it.px - CAMERA.pos.x) +
+          (it.pz - CAMERA.pos.z) * (it.pz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      PARTS._pReleaseAt(fi);
+    }
+
+    /* burst attempts (persistent rng — zero allocations), same
+     * frame-rate-independent timer pattern as the steam spawner */
+    PARTS._pSpawnTimer -= dt;
+    while (PARTS._pSpawnTimer <= 0 && PARTS.pcount < PARTS._pCap) {
+      PARTS._pSpawnTimer += sp.spawnInterval;
+      const r = PARTS._rng;
+      const n = sp.burst[0] + Math.floor(r() * (sp.burst[1] - sp.burst[0] + 1));
+      const src = PARTS._findSource(r, 'sub', sp.radius, sp.innerRadius);
+      if (!src) break;   // no source in range — retry on the next interval
+      for (let k = 0; k < n; k++) {
+        const it = PARTS.ppool.acquire();
+        if (!it) break;
+        PARTS._spawnSpark(it, src);
+      }
+    }
+
+    /* per-frame: brief ballistic life, flicker, fade to zero. Only the
+     * first pcount vertices are drawn (setDrawRange) — per-slot buffers,
+     * re-set every frame (swap-remove moves items between slots). */
+    const spts = PARTS.spoints;
+    const sPos = spts.geometry.attributes.position.array;
+    const sCol = spts.geometry.attributes.color.array;
+    const pR2 = sp.radius * sp.releaseFactor * sp.radius * sp.releaseFactor;
+    for (let i = PARTS.pcount - 1; i >= 0; i--) {
+      const it = PARTS._pLive[i];
+      it.age += dt;
+      const drx = it.sx - CAMERA.pos.x, drz = it.sz - CAMERA.pos.z;
+      if (it.age >= it.life ||
+          drx * drx + drz * drz > pR2) { PARTS._pReleaseAt(i); continue; }
+      const u = it.age / it.life;
+      it.vy -= sp.gravity * dt;
+      it.px += it.vx * dt; it.py += it.vy * dt; it.pz += it.vz * dt;
+      sPos[i * 3] = it.px; sPos[i * 3 + 1] = it.py; sPos[i * 3 + 2] = it.pz;
+      const fl = 0.75 + 0.25 * Math.sin(t * 42 + it.ph);
+      const a = (1 - u) * fl;
+      sCol[i * 3] = it.cR * a; sCol[i * 3 + 1] = it.cG * a;
+      sCol[i * 3 + 2] = it.cB * a;
+    }
+    spts.geometry.setDrawRange(0, PARTS.pcount);
+    spts.geometry.attributes.position.needsUpdate = true;
+    spts.geometry.attributes.color.needsUpdate = true;
+
+    /* ---- pulse motes (EVENT: M13.2 data pulse + dev trigger) ---- */
+    const pu = CFG.parts.pulse;
+    PARTS._mCap = pu.tiers[TIER.name];
+    while (PARTS.mcount > PARTS._mCap) {
+      let fi = 0, fd = -1;
+      for (let i = 0; i < PARTS.mcount; i++) {
+        const it = PARTS._mLive[i];
+        const dist2 =
+          (it.sx - CAMERA.pos.x) * (it.sx - CAMERA.pos.x) +
+          (it.sz - CAMERA.pos.z) * (it.sz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      PARTS._mReleaseAt(fi);
+    }
+
+    /* trickle only while a trigger rain is active (0 live at idle) */
+    if (PARTS._rainT > 0) {
+      PARTS._pulseSpawnTimer -= dt;
+      while (PARTS._pulseSpawnTimer <= 0 && PARTS.mcount < PARTS._mCap) {
+        PARTS._pulseSpawnTimer += pu.trickle;
+        const it = PARTS.mpool.acquire();
+        if (!it) break;
+        PARTS._spawnPulse(it);
+      }
+    }
+
+    /* slow rise + gentle swirl, sin-fade over life */
+    const mpts = PARTS.mpoints;
+    const mPos = mpts.geometry.attributes.position.array;
+    const mCol = mpts.geometry.attributes.color.array;
+    const mR2 = pu.radius * pu.releaseFactor * pu.radius * pu.releaseFactor;
+    for (let i = PARTS.mcount - 1; i >= 0; i--) {
+      const it = PARTS._mLive[i];
+      it.age += dt;
+      const drx = it.sx - CAMERA.pos.x, drz = it.sz - CAMERA.pos.z;
+      if (it.age >= it.life ||
+          drx * drx + drz * drz > mR2) { PARTS._mReleaseAt(i); continue; }
+      const u = it.age / it.life;
+      it.py += it.vy * dt;
+      it.px += Math.sin(t * 0.6 + it.ph) * it.sw * dt;
+      it.pz += Math.cos(t * 0.5 + it.ph) * it.sw * dt;
+      mPos[i * 3] = it.px; mPos[i * 3 + 1] = it.py; mPos[i * 3 + 2] = it.pz;
+      const a = Math.sin(u * Math.PI) * 0.55;
+      mCol[i * 3] = it.cR * a; mCol[i * 3 + 1] = it.cG * a;
+      mCol[i * 3 + 2] = it.cB * a;
+    }
+    mpts.geometry.setDrawRange(0, PARTS.mcount);
+    mpts.geometry.attributes.position.needsUpdate = true;
+    mpts.geometry.attributes.color.needsUpdate = true;
+
+    /* ---- lightning motes (EVENT: M8.4 distant lightning + dev
+     * trigger). Fast fall from the far sky; they age out high up
+     * (no distance release — they spawn 250–450 m out on purpose). */
+    const li = CFG.parts.light;
+    PARTS._lCap = li.tiers[TIER.name];
+    while (PARTS.lcount > PARTS._lCap) {
+      let fi = 0, fd = -1;
+      for (let i = 0; i < PARTS.lcount; i++) {
+        const it = PARTS._lLive[i];
+        const dist2 =
+          (it.sx - CAMERA.pos.x) * (it.sx - CAMERA.pos.x) +
+          (it.sz - CAMERA.pos.z) * (it.sz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      PARTS._lReleaseAt(fi);
+    }
+
+    if (PARTS._rainT > 0) {
+      PARTS._lightSpawnTimer -= dt;
+      while (PARTS._lightSpawnTimer <= 0 && PARTS.lcount < PARTS._lCap) {
+        PARTS._lightSpawnTimer += li.trickle;
+        const it = PARTS.lpool.acquire();
+        if (!it) break;
+        PARTS._spawnLight(it);
+      }
+    }
+
+    const lpts = PARTS.lpoints;
+    const lPos = lpts.geometry.attributes.position.array;
+    const lCol = lpts.geometry.attributes.color.array;
+    for (let i = PARTS.lcount - 1; i >= 0; i--) {
+      const it = PARTS._lLive[i];
+      it.age += dt;
+      if (it.age >= it.life) { PARTS._lReleaseAt(i); continue; }
+      const u = it.age / it.life;
+      it.py += it.vy * dt;
+      lPos[i * 3] = it.px; lPos[i * 3 + 1] = it.py; lPos[i * 3 + 2] = it.pz;
+      const fl = 0.7 + 0.3 * Math.sin(t * 60 + it.ph);
+      const a = (1 - u) * fl;
+      lCol[i * 3] = it.cR * a; lCol[i * 3 + 1] = it.cG * a;
+      lCol[i * 3 + 2] = it.cB * a;
+    }
+    lpts.geometry.setDrawRange(0, PARTS.lcount);
+    lpts.geometry.attributes.position.needsUpdate = true;
+    lpts.geometry.attributes.color.needsUpdate = true;
+
+    /* ---- rain (EVENT: M9 awakening + dev trigger). Fast fall, slight
+     * sway, fade out over the last 20 % of life; released at the
+     * ground. Only the first rcount instances are drawn. */
+    const rn = CFG.parts.rain;
+    PARTS._rCap = rn.tiers[TIER.name];
+    while (PARTS.rcount > PARTS._rCap) {
+      let fi = 0, fd = -1;
+      for (let i = 0; i < PARTS.rcount; i++) {
+        const it = PARTS._rLive[i];
+        const dist2 =
+          (it.sx - CAMERA.pos.x) * (it.sx - CAMERA.pos.x) +
+          (it.sz - CAMERA.pos.z) * (it.sz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      PARTS._rReleaseAt(fi);
+    }
+
+    if (PARTS._rainT > 0) {
+      PARTS._rainT -= dt;
+      PARTS._rainSpawnTimer -= dt;
+      while (PARTS._rainSpawnTimer <= 0 && PARTS.rcount < PARTS._rCap) {
+        PARTS._rainSpawnTimer += rn.spawnInterval;
+        const it = PARTS.rpool.acquire();
+        if (!it) break;
+        PARTS._spawnRain(it);
+      }
+    }
+
+    const rmesh = PARTS.rmesh;
+    for (let i = PARTS.rcount - 1; i >= 0; i--) {
+      const it = PARTS._rLive[i];
+      it.age += dt;
+      if (it.age >= it.life || it.py <= 0.5) { PARTS._rReleaseAt(i); continue; }
+      const u = it.age / it.life;
+      it.py += it.vy * dt;
+      it.px += Math.sin(t * 1.3 + it.ph) * 0.5 * dt;
+      it.pz += Math.cos(t * 1.1 + it.ph) * 0.5 * dt;
+      PARTS._rp.set(it.px, it.py, it.pz);
+      PARTS._rs.set(0.4, it.len, 0.4);
+      PARTS._rm.compose(PARTS._rp, PARTS._qI, PARTS._rs);
+      rmesh.setMatrixAt(i, PARTS._rm);
+      const a = (u < 0.8 ? 1 : (1 - u) * 5) * 0.85;
+      PARTS._rtint.setRGB(it.cR * a, it.cG * a, it.cB * a);
+      rmesh.setColorAt(i, PARTS._rtint);
+    }
+    rmesh.count = PARTS.rcount;
+    if (PARTS.rcount > 0) {
+      rmesh.instanceMatrix.needsUpdate = true;
+      if (rmesh.instanceColor) rmesh.instanceColor.needsUpdate = true;
+    }
+  },
+
+  /* dev trigger (Key P) + future hooks (M9 awakening rain, M8.4
+   * lightning): rain ALL five particle types around the player for
+   * CFG.parts.rain.dur seconds — one-time bursts of every type plus
+   * the streak/mote trickles driven while _rainT > 0. */
+  rainAll() {
+    const p = CFG.parts;
+    PARTS._rainT = p.rain.dur;
+    PARTS._rainSpawnTimer = 0;
+    PARTS._pulseSpawnTimer = 0;
+    PARTS._lightSpawnTimer = 0;
+    const r = PARTS._rng;
+    /* steam burst (from the ambient vents — pool = the gate) */
+    for (let k = 0; k < p.rain.burst.steam; k++) {
+      const src = PARTS._findSource(r, 'cool',
+        p.steam.radius, p.steam.innerRadius);
+      const it = src ? PARTS.spool.acquire() : null;
+      if (it) PARTS._spawnSteam(it, src);
+    }
+    /* spark burst (from the substations) */
+    for (let k = 0; k < p.rain.burst.spark; k++) {
+      const src = PARTS._findSource(r, 'sub',
+        p.spark.radius, p.spark.innerRadius);
+      const it = src ? PARTS.ppool.acquire() : null;
+      if (it) PARTS._spawnSpark(it, src);
+    }
+    /* pulse motes rising from street level */
+    for (let k = 0; k < p.rain.burst.pulse; k++) {
+      const it = PARTS.mpool.acquire();
+      if (it) PARTS._spawnPulse(it);
+    }
+    /* lightning motes from the far sky */
+    for (let k = 0; k < p.rain.burst.light; k++) {
+      const it = PARTS.lpool.acquire();
+      if (it) PARTS._spawnLight(it);
+    }
+  },
+
+  /* source search for the ambient emitters (moved from TRAFFIC — the
+   * M6.4 seam). A 200 m radius holds only ~10 source blocks, so blind
+   * random-block draws would starve the emitters: a small live list of
+   * the source buildings near the player, rebuilt every few seconds
+   * from the same seeded buildingAt path (planning-time allocations
+   * only), and a uniform random pick filtered to [inner, radius]. */
   _refreshSources() {
     const R = 210;                       // covers both radii (200 / 170)
     const B = WORLD.BLOCK;
@@ -2825,20 +3226,32 @@ const TRAFFIC = {
     const n = Math.ceil(R / B);
     for (let bx = pcx - n; bx <= pcx + n; bx++) {
       for (let bz = pcz - n; bz <= pcz + n; bz++) {
-        const ring = TRAFFIC._ringFor(bx, bz);
+        const ring = PARTS._ringFor(bx, bz);
         const c = WORLD.buildingAt(bx, bz, ring, ['cool'], 0);
         if (c) cool.push(c);
         const s = WORLD.buildingAt(bx, bz, ring, ['sub'], 0);
         if (s) subs.push(s);
       }
     }
-    TRAFFIC._coolList = cool;
-    TRAFFIC._subList = subs;
-    TRAFFIC._srcTimer = 0;
+    PARTS._coolList = cool;
+    PARTS._subList = subs;
+    PARTS._srcTimer = 0;
+  },
+
+  /* the block's current player-relative chunk ring — must match how
+   * _fill seeds occupancy for that block (ring drives the occupancy)
+   * the same way WORLD._sync assigns chunk rings */
+  _ringFor(bx, bz) {
+    const B = WORLD.BLOCK, K = WORLD.CHUNK;
+    const pcx = Math.floor(Math.floor(CAMERA.pos.x / B) / K);
+    const pcz = Math.floor(Math.floor(CAMERA.pos.z / B) / K);
+    return Math.max(
+      Math.abs(Math.floor(bx / K) - pcx),
+      Math.abs(Math.floor(bz / K) - pcz));
   },
 
   _findSource(r, arch, radius, inner) {
-    const list = arch === 'cool' ? TRAFFIC._coolList : TRAFFIC._subList;
+    const list = arch === 'cool' ? PARTS._coolList : PARTS._subList;
     for (let i = 0; i < 12; i++) {
       if (list.length === 0) break;
       const b = list[(r() * list.length) | 0];
@@ -2853,8 +3266,8 @@ const TRAFFIC = {
   /* spawn one steam puff at a cooling-tower vent (replayed seed: the
    * puff always rises from where mass actually is) */
   _spawnSteam(it, src) {
-    const st = CFG.traffic.steam;
-    const r = TRAFFIC._rng;
+    const st = CFG.parts.steam;
+    const r = PARTS._rng;
     it.sx = src.x; it.sy = src.hTop; it.sz = src.z;
     const a = r() * 6.2831853, rr = r() * src.r * 0.5;
     it.px = src.x + Math.cos(a) * rr;
@@ -2868,13 +3281,13 @@ const TRAFFIC = {
     /* cool bluish-white vapor, slight per-puff variation */
     const b = 0.85 + r() * 0.3;
     it.cR = 0.62 * b; it.cG = 0.72 * b; it.cB = 0.82 * b;
-    TRAFFIC._sLive[TRAFFIC.scount++] = it;
+    PARTS._sLive[PARTS.scount++] = it;
   },
 
   /* spawn one spark at a substation roof (brief ballistic life) */
   _spawnSpark(it, src) {
-    const sp = CFG.traffic.spark;
-    const r = TRAFFIC._rng;
+    const sp = CFG.parts.spark;
+    const r = PARTS._rng;
     it.sx = src.x; it.sy = src.hTop; it.sz = src.z;
     it.px = src.x + (r() - 0.5) * src.w * 0.5;
     it.py = src.hTop + 0.2 + r() * 1.2;
@@ -2890,50 +3303,157 @@ const TRAFFIC = {
     /* hot white-amber flash, slight per-spark variation */
     const b = 0.85 + r() * 0.3;
     it.cR = b; it.cG = 0.85 * b; it.cB = 0.55 * b;
-    TRAFFIC._pLive[TRAFFIC.pcount++] = it;
+    PARTS._pLive[PARTS.pcount++] = it;
+  },
+
+  /* spawn one pulse mote rising from street level (or a source roof if
+   * given — the M13.2 data-pulse seam) */
+  _spawnPulse(it, src) {
+    const pu = CFG.parts.pulse;
+    const r = PARTS._rng;
+    const p = CAMERA.pos;
+    if (src) {
+      it.sx = src.x; it.sy = src.hTop; it.sz = src.z;
+    } else {
+      const a = r() * 6.2831853;
+      const rad = pu.innerRadius + r() * (pu.radius - pu.innerRadius);
+      it.sx = p.x + Math.cos(a) * rad;
+      it.sz = p.z + Math.sin(a) * rad;
+      it.sy = 1.5;
+    }
+    it.px = it.sx + (r() - 0.5) * 2;
+    it.py = it.sy + 0.2 + r() * 1.5;
+    it.pz = it.sz + (r() - 0.5) * 2;
+    it.vy = pu.rise[0] + r() * (pu.rise[1] - pu.rise[0]);
+    it.sw = 0.3 + r() * 0.6;
+    it.age = 0;
+    it.life = pu.life[0] + r() * (pu.life[1] - pu.life[0]);
+    it.ph = r() * 6.2831853;
+    /* data-cyan, slight per-mote variation */
+    const b = 0.8 + r() * 0.4;
+    it.cR = 0.4 * b; it.cG = 0.85 * b; it.cB = 1 * b;
+    PARTS._mLive[PARTS.mcount++] = it;
+  },
+
+  /* spawn one lightning mote at a far sky point (M8.4 distant-
+   * lightning seam): it falls fast and ages out high up */
+  _spawnLight(it) {
+    const li = CFG.parts.light;
+    const r = PARTS._rng;
+    const p = CAMERA.pos;
+    const a = r() * 6.2831853;
+    const rad = li.radius[0] + r() * (li.radius[1] - li.radius[0]);
+    it.sx = p.x + Math.cos(a) * rad;
+    it.sz = p.z + Math.sin(a) * rad;
+    it.sy = li.altitude[0] + r() * (li.altitude[1] - li.altitude[0]);
+    it.px = it.sx; it.py = it.sy; it.pz = it.sz;
+    const v = li.speed[0] + r() * (li.speed[1] - li.speed[0]);
+    it.vy = -v;
+    it.age = 0;
+    it.life = (it.sy - 40) / v * (0.8 + r() * 0.4);   // dies high up
+    it.ph = r() * 6.2831853;
+    /* white-blue flash, slight per-mote variation */
+    const b = 0.8 + r() * 0.4;
+    it.cR = 0.75 * b; it.cG = 0.88 * b; it.cB = 1 * b;
+    PARTS._lLive[PARTS.lcount++] = it;
+  },
+
+  /* spawn one rain streak at a sky point inside the hold radius:
+   * falls at a fixed speed, life ≈ the fall to the ground */
+  _spawnRain(it) {
+    const rn = CFG.parts.rain;
+    const r = PARTS._rng;
+    const p = CAMERA.pos;
+    const a = r() * 6.2831853;
+    const rad = r() * rn.radius;
+    it.sx = p.x + Math.cos(a) * rad;
+    it.sz = p.z + Math.sin(a) * rad;
+    it.sy = rn.altitude[0] + r() * (rn.altitude[1] - rn.altitude[0]);
+    it.px = it.sx; it.py = it.sy; it.pz = it.sz;
+    const v = rn.speed[0] + r() * (rn.speed[1] - rn.speed[0]);
+    it.vy = -v;
+    it.len = rn.len[0] + r() * (rn.len[1] - rn.len[0]);
+    it.age = 0;
+    it.life = (it.sy - 1) / v * (0.9 + r() * 0.2);
+    it.ph = r() * 6.2831853;
+    /* energy-cyan, slight per-streak variation */
+    const b = 0.7 + r() * 0.5;
+    it.cR = 0.45 * b; it.cG = 0.85 * b; it.cB = 1 * b;
+    PARTS._rLive[PARTS.rcount++] = it;
   },
 
   _sReleaseAt(i) {
-    const it = TRAFFIC._sLive[i];
-    const m = --TRAFFIC.scount;
-    if (i !== m) TRAFFIC._sLive[i] = TRAFFIC._sLive[m];
-    TRAFFIC._sLive[m] = undefined;
-    TRAFFIC.spool.release(it);
+    const it = PARTS._sLive[i];
+    const m = --PARTS.scount;
+    if (i !== m) PARTS._sLive[i] = PARTS._sLive[m];
+    PARTS._sLive[m] = undefined;
+    PARTS.spool.release(it);
   },
 
   _pReleaseAt(i) {
-    const it = TRAFFIC._pLive[i];
-    const m = --TRAFFIC.pcount;
-    if (i !== m) TRAFFIC._pLive[i] = TRAFFIC._pLive[m];
-    TRAFFIC._pLive[m] = undefined;
-    TRAFFIC.ppool.release(it);
+    const it = PARTS._pLive[i];
+    const m = --PARTS.pcount;
+    if (i !== m) PARTS._pLive[i] = PARTS._pLive[m];
+    PARTS._pLive[m] = undefined;
+    PARTS.ppool.release(it);
+  },
+
+  _mReleaseAt(i) {
+    const it = PARTS._mLive[i];
+    const m = --PARTS.mcount;
+    if (i !== m) PARTS._mLive[i] = PARTS._mLive[m];
+    PARTS._mLive[m] = undefined;
+    PARTS.mpool.release(it);
+  },
+
+  _lReleaseAt(i) {
+    const it = PARTS._lLive[i];
+    const m = --PARTS.lcount;
+    if (i !== m) PARTS._lLive[i] = PARTS._lLive[m];
+    PARTS._lLive[m] = undefined;
+    PARTS.lpool.release(it);
+  },
+
+  _rReleaseAt(i) {
+    const it = PARTS._rLive[i];
+    const m = --PARTS.rcount;
+    if (i !== m) PARTS._rLive[i] = PARTS._rLive[m];
+    PARTS._rLive[m] = undefined;
+    PARTS.rpool.release(it);
   },
 
   dispose() {
-    for (let i = TRAFFIC.count - 1; i >= 0; i--) TRAFFIC._releaseAt(i);
-    for (let i = TRAFFIC.vcount - 1; i >= 0; i--) TRAFFIC._vReleaseAt(i);
-    for (let i = TRAFFIC.scount - 1; i >= 0; i--) TRAFFIC._sReleaseAt(i);
-    for (let i = TRAFFIC.pcount - 1; i >= 0; i--) TRAFFIC._pReleaseAt(i);
-    if (TRAFFIC.mesh) {
-      scene.remove(TRAFFIC.mesh);
-      TRAFFIC.mesh.geometry.dispose();
-      TRAFFIC.mesh.material.dispose();
+    for (let i = PARTS.scount - 1; i >= 0; i--) PARTS._sReleaseAt(i);
+    for (let i = PARTS.pcount - 1; i >= 0; i--) PARTS._pReleaseAt(i);
+    for (let i = PARTS.mcount - 1; i >= 0; i--) PARTS._mReleaseAt(i);
+    for (let i = PARTS.lcount - 1; i >= 0; i--) PARTS._lReleaseAt(i);
+    for (let i = PARTS.rcount - 1; i >= 0; i--) PARTS._rReleaseAt(i);
+    if (PARTS.smesh) {
+      scene.remove(PARTS.smesh);
+      PARTS.smesh.geometry.dispose();
+      PARTS.smesh.material.dispose();   // map = shared KIT glow texture
     }
-    for (const m of [TRAFFIC.vmesh, TRAFFIC.tmesh]) {
-      if (m) {
-        scene.remove(m);
-        m.geometry.dispose();
-        m.material.dispose();
-      }
+    if (PARTS.spoints) {
+      scene.remove(PARTS.spoints);
+      PARTS.spoints.geometry.dispose();
+      PARTS.spoints.material.map.dispose();   // own warm glow texture
+      PARTS.spoints.material.dispose();
     }
-    /* steam/spark meshes: dispose own geometry + material only — the
-     * glow textures are shared KIT assets */
-    for (const m of [TRAFFIC.smesh, TRAFFIC.spoints]) {
-      if (m) {
-        scene.remove(m);
-        m.geometry.dispose();
-        m.material.dispose();
-      }
+    if (PARTS.mpoints) {
+      scene.remove(PARTS.mpoints);
+      PARTS.mpoints.geometry.dispose();
+      PARTS.mpoints.material.dispose();       // map = shared KIT texture
+    }
+    if (PARTS.lpoints) {
+      scene.remove(PARTS.lpoints);
+      PARTS.lpoints.geometry.dispose();
+      PARTS.lpoints.material.map.dispose();   // own white glow texture
+      PARTS.lpoints.material.dispose();
+    }
+    if (PARTS.rmesh) {
+      scene.remove(PARTS.rmesh);
+      PARTS.rmesh.geometry.dispose();
+      /* material = shared MATS.pulseGlow (M6.3) — not disposed here */
     }
   },
 };
@@ -3409,7 +3929,7 @@ const HUD = {
     HUD.hintEl = document.getElementById('hint');
     HUD.hintEl.textContent =
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
-      'MOUSE look · WHEEL zoom · MMB drag orbit · V camera';
+      'MOUSE look · WHEEL zoom · MMB drag orbit · V camera · P particles';
   },
 
   update(dt) {
@@ -3440,6 +3960,7 @@ registerSystem(KIT);
 registerSystem(WORLD);
 registerSystem(ENTITY);
 registerSystem(TRAFFIC);
+registerSystem(PARTS);
 registerSystem(HUD);
 for (const s of systems) if (s.init) s.init();
 
@@ -3504,6 +4025,7 @@ window.SIM = {
   POOL,
   ENTITY,
   TRAFFIC,
+  PARTS,
   TIER,
   HUD,
   CFG,
