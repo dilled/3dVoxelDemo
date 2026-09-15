@@ -15,7 +15,7 @@
  *
  *   M1 checks:
  *   - systems registry boots in fixed order
- *     (INPUT, CAMERA, KIT, WORLD, ENTITY, HUD)
+ *     (INPUT, CAMERA, KIT, WORLD, ENTITY, TRAFFIC, HUD)
  *   - no gamepad: loop stays clean, camera holds still, nothing throws
  *   - fake gamepad: left-stick forward moves the camera
  *   - keyboard: W moves forward, Space rises, Shift sprints (no throw)
@@ -72,6 +72,20 @@
  *   - exhaustion returns null (cap hit, no throw, no alloc); release is
  *     idempotent (double release counted, never corrupts the stack);
  *     pool stats stay balanced (free returns to capacity)
+ *
+ *   M6.2 checks (maintenance drones):
+ *   - TRAFFIC registered after ENTITY; one shared InstancedMesh (one draw
+ *     call) for the whole fleet; state lives in the M6.1 pool
+ *     ('traffic-drone', fixed capacity = HIGH tier cap)
+ *   - fleet grows to the tier cap; every live drone is a pre-created pool
+ *     item (zero `new` after init); JS heap stays flat with the fleet
+ *     alive (no allocation per frame)
+ *   - drones dock at spawn and patrol between towers (positions change,
+ *     docked/patrol states both observed)
+ *   - tier cap: TIER.set('low') trims the fleet to the LOW cap (excess
+ *     released back to the pool); TIER.set('high') regrows it to the
+ *     HIGH cap; draw calls stay inside budget with the fleet at cap
+ *   - street-level screenshot with drones in the air (shots/m62-*.png)
  *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
@@ -278,7 +292,7 @@ try {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
       JSON.stringify(names) === JSON.stringify(
-        ['INPUT', 'CAMERA', 'KIT', 'WORLD', 'ENTITY', 'HUD']),
+        ['INPUT', 'CAMERA', 'KIT', 'WORLD', 'ENTITY', 'TRAFFIC', 'HUD']),
       names.join(', '));
   }
 
@@ -870,10 +884,16 @@ try {
         pool.badReleases === 2 && pool.top === CAP &&
         pool.acquires === a0 + 1 && pool.releases === r0 + 1;
 
-      // Pool registry: smoke pool registered, aggregate stats sane
+      // Pool registry: smoke pool registered, aggregate stats sane.
+      // inUse must equal the sum over ALL registered pools — M6.2's
+      // drone pool is legitimately in flight while this runs.
       out.inList = P.list.some(p => p === pool);
       const agg = P.stats();
-      out.aggSane = agg.pools >= 1 && agg.capacity >= CAP && agg.inUse === 0;
+      out.aggSane =
+        agg.pools === P.list.length &&
+        agg.capacity === P.list.reduce((a, p) => a + p.capacity, 0) &&
+        agg.inUse === P.list.reduce((a, p) => a + (p.capacity - p.top), 0) &&
+        pool.top === CAP && agg.peak >= CAP;
       out.agg = agg;
       return out;
     });
@@ -900,6 +920,239 @@ try {
       `badReleases guarded`);
     check('M6.1: pools register in POOL.list with sane aggregate stats',
       m61.inList && m61.aggSane, `agg=${JSON.stringify(m61.agg)}`);
+  }
+
+  /* ------------------------------------------------------------------
+   * M6.2 — maintenance drones (TRAFFIC)
+   * ------------------------------------------------------------------ */
+  {
+    const cap = await page.evaluate(() => {
+      const S = window.SIM;
+      return (S.TRAFFIC && S.CFG.traffic.drone.tiers[S.TIER.active()]) || 0;
+    });
+    check('M6.2: TRAFFIC registered with a drone pool (M6.1) + tier cap',
+      cap > 0,
+      `tier=${await page.evaluate(() => window.SIM.TIER.active())}, cap=${cap}`);
+
+    /* fleet grows to the tier cap — spawns are gated by the fixed pool */
+    await page.waitForFunction(c => {
+      const S = window.SIM;
+      return S.TRAFFIC && S.TRAFFIC.count === c;
+    }, cap, { timeout: 120000 });
+    const a0 = await page.evaluate(async () => {
+      const S = window.SIM;
+      const T = S.TRAFFIC;
+      const pool = S.POOL.list.find(p => p.name === 'traffic-drone');
+      const live = T._live.slice(0, T.count);
+      /* keep the item refs alive for the movement sample below */
+      window.__m62 = {
+        snaps: live.map(it => ({ ref: it, x: it.px, y: it.py, z: it.pz })),
+      };
+      /* min of 3 spaced samples — GC noise, not per-frame alloc, is the
+       * thing under test (the pool pre-allocates; nothing here may grow) */
+      async function heapMin() {
+        let m = Infinity;
+        for (let i = 0; i < 3; i++) {
+          if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+          await new Promise(r => setTimeout(r, 400));
+        }
+        return m === Infinity ? -1 : m;
+      }
+      const heapBefore = await heapMin();
+      return {
+        count: T.count,
+        heapBefore,
+        poolCap: pool ? pool.capacity : -1,
+        inUse: pool ? pool.capacity - pool.top : -1,
+        /* identity proof of "zero `new` after init": every live item
+         * carries the back-ref the pool's factory stamped at make() */
+        zeroNew: !!pool && live.every(it =>
+          it.__pool === pool && it.__free === false),
+        docked: live.filter(it => it.state === 0).length,
+        airborne: live.filter(it => it.state > 0).length,
+        wpRouted: live.filter(it => it.wpCount > 0).length,
+        calls: S.renderer.info.render.calls,
+      };
+    });
+    check('M6.2: fleet grows to the tier cap (one InstancedMesh, M6.1 pool)',
+      a0.count === cap && a0.poolCap === cap && a0.inUse === a0.count,
+      `count=${a0.count}, poolCap=${a0.poolCap}, inUse=${a0.inUse}`);
+    check('M6.2: every live drone is a pre-created pool item (zero `new` after init)',
+      a0.zeroNew === true, `live=${a0.count}`);
+    check('M6.2: drones dock at towers and patrol between them',
+      a0.docked > 0 && a0.airborne > 0 && a0.wpRouted > 0,
+      `docked=${a0.docked}, airborne=${a0.airborne}, routed=${a0.wpRouted}`);
+
+    /* patrol movement + no per-frame allocation across a live-fleet window */
+    await sleep(2500);
+    const a1 = await page.evaluate(async () => {
+      const T = window.SIM.TRAFFIC;
+      let moved = 0, releasedGone = 0;
+      const liveSet = T._live.slice(0, T.count);
+      for (const s of window.__m62.snaps) {
+        if (!liveSet.includes(s.ref)) { releasedGone++; continue; }
+        const dx = s.ref.px - s.x, dy = s.ref.py - s.y, dz = s.ref.pz - s.z;
+        if (dx * dx + dy * dy + dz * dz > 0.25) moved++;
+      }
+      async function heapMin() {
+        let m = Infinity;
+        for (let i = 0; i < 3; i++) {
+          if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+          await new Promise(r => setTimeout(r, 400));
+        }
+        return m === Infinity ? -1 : m;
+      }
+      return {
+        moved,
+        releasedGone,
+        dockedNow: liveSet.filter(it => it.state === 0).length,
+        inFlightNow: liveSet.filter(it => it.state > 0).length,
+        heap: await heapMin(),
+      };
+    });
+    check('M6.2: drones visibly fly — positions change / state cycles',
+      a1.moved > 0 || (a1.dockedNow > 0 && a1.inFlightNow > 0),
+      `moved=${a1.moved}, docked=${a1.dockedNow}, inFlight=${a1.inFlightNow},` +
+      ` released=${a1.releasedGone}`);
+    check('M6.2: no allocation per frame (heap flat with the fleet alive)',
+      a0.heapBefore > 0 && a1.heap > 0 && a1.heap - a0.heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(a0.heapBefore / 1024)}KB, after=${Math.round(a1.heap / 1024)}KB`);
+
+    /* tier cap: LOW trims the fleet, HIGH regrows it */
+    const lowCap = await page.evaluate(() => window.SIM.CFG.traffic.drone.tiers.low);
+    await page.evaluate(() => window.SIM.TIER.set('low'));
+    await page.waitForFunction(c => window.SIM.TRAFFIC.count <= c, lowCap,
+      { timeout: 5000 });
+    const tLow = await page.evaluate(() => {
+      const S = window.SIM;
+      const pool = S.POOL.list.find(p => p.name === 'traffic-drone');
+      return { count: S.TRAFFIC.count, inUse: pool.capacity - pool.top };
+    });
+    check('M6.2: LOW tier trims the fleet to its cap (excess released to the pool)',
+      tLow.count <= lowCap && tLow.inUse === tLow.count,
+      `count=${tLow.count}, cap=${lowCap}, pool inUse=${tLow.inUse}`);
+    await page.evaluate(() => window.SIM.TIER.set('high'));
+    await page.waitForFunction(c => window.SIM.TRAFFIC.count === c, cap,
+      { timeout: 120000 });
+    check('M6.2: HIGH tier restores the full fleet (regrows on spawn ticks)',
+      (await page.evaluate(() => window.SIM.TRAFFIC.count)) === cap,
+      `count restored to ${cap}`);
+
+    /* draw-call budget with the fleet at cap */
+    const calls = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    check('M6.2: draw calls inside budget with the fleet at cap',
+      calls > 0 && calls < 150, `calls=${calls}`);
+
+    /* visual gate: street-level screenshot that actually SHOWS the drone.
+     * The dense core would otherwise hide the target tower, so pick the
+     * first candidate (docked drones first, then nearest) whose line of
+     * sight from the street pose (30 m out on the same bearing as the
+     * drone) is provably clear against the instanced building boxes. */
+    const d = await page.evaluate(() => {
+      const S = window.SIM, T = S.TRAFFIC;
+      const cands = [];
+      for (let i = 0; i < T.count; i++) {
+        const it = T._live[i];
+        const dist = Math.hypot(it.px, it.pz);
+        if (dist < 24 || dist > 220) continue;
+        if (it.py < 10 || it.py > 55) continue;
+        cands.push({ px: it.px, py: it.py, pz: it.pz, docked: it.state === 0 });
+      }
+      cands.sort((a, b) =>
+        (b.docked - a.docked) ||
+        (Math.hypot(a.px, a.pz) - Math.hypot(b.px, b.pz)));
+      /* instanced building boxes: unit-base geometry, so the full box is
+       * scale·center read straight from the instance matrix (planning-
+       * time only — small allocations are fine here) */
+      const boxes = [];
+      for (const ch of S.WORLD.chunks.values()) {
+        if (!ch.group || !ch.group.visible) continue;
+        for (const b of [ch.boxA, ch.boxG, ch.cyl, ch.ledWin])
+          if (b && b.count > 0) boxes.push(b);
+      }
+      const inv = T._m.clone();
+      const la = T._p.clone();
+      function segHits(arr, o, ax, ay, az, bx, by, bz) {
+        inv.fromArray(arr, o);
+        inv.invert();
+        const p = la.set(ax, ay, az).applyMatrix4(inv);
+        const px = p.x, py = p.y, pz = p.z;
+        const q = la.set(bx, by, bz).applyMatrix4(inv);
+        const pp = [px, py, pz], qq = [q.x, q.y, q.z];
+        let t0 = 0, t1 = 1;
+        for (let k = 0; k < 3; k++) {
+          const dK = qq[k] - pp[k];
+          if (Math.abs(dK) < 1e-9) {
+            if (pp[k] < -0.5 || pp[k] > 0.5) return false;
+          } else {
+            let te = (-0.5 - pp[k]) / dK, tx = (0.5 - pp[k]) / dK;
+            if (te > tx) { const tm = te; te = tx; tx = tm; }
+            if (t0 < te) t0 = te;
+            if (t1 > tx) t1 = tx;
+            if (t0 > t1) return false;
+          }
+        }
+        return true;
+      }
+      function occluded(ax, ay, az, bx, by, bz) {
+        const dx = bx - ax, dy = by - ay, dz = bz - az;
+        const l2 = dx * dx + dy * dy + dz * dz;
+        for (const b of boxes) {
+          const arr = b.mesh.instanceMatrix.array;
+          for (let i = 0; i < b.count; i++) {
+            const o = i * 16;
+            const cx = arr[o + 12], cy = arr[o + 13], cz = arr[o + 14];
+            const sx = Math.abs(arr[o]) + Math.abs(arr[o + 1]) + Math.abs(arr[o + 2]);
+            const sy = Math.abs(arr[o + 4]) + Math.abs(arr[o + 5]) + Math.abs(arr[o + 6]);
+            const sz = Math.abs(arr[o + 8]) + Math.abs(arr[o + 9]) + Math.abs(arr[o + 10]);
+            const tt = ((cx - ax) * dx + (cy - ay) * dy + (cz - az) * dz) / l2;
+            if (tt < 0 || tt > 1) continue;
+            const px = ax + dx * tt, py = ay + dy * tt, pz = az + dz * tt;
+            const ex = Math.max(sx, sy, sz) * 0.5 + 1;
+            const ex2 = cx - px, ey = cy - py, ez = cz - pz;
+            if (ex2 * ex2 + ey * ey + ez * ez > ex * ex) continue;
+            if (segHits(arr, o, ax, ay, az, bx, by, bz)) return true;
+          }
+        }
+        return false;
+      }
+      for (const c of cands) {
+        const dist = Math.hypot(c.px, c.pz);
+        /* street point 30 m further out on the same bearing */
+        const x = c.px - (c.px / dist) * 30;
+        const z = c.pz - (c.pz / dist) * 30;
+        if (occluded(x, 1.7, z, c.px, c.py, c.pz)) continue;
+        const dx = c.px - x, dz = c.pz - z;
+        return { px: c.px, py: c.py, pz: c.pz, x, z,
+          yaw: Math.atan2(-dx, -dz),
+          pitch: Math.atan2(c.py - 1.7, Math.hypot(dx, dz)) };
+      }
+      return null;
+    });
+    let shotOk = false;
+    if (d) {
+      await page.evaluate(({ x, z, yaw, pitch }) => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(x, 1.7, z);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = yaw;
+        S.CAMERA.pitch = pitch;
+      }, d);
+      await sleep(450);
+      await page.screenshot({ path: `${here}/shots/m62-drones-street.png` });
+      shotOk = fs.existsSync(`${here}/shots/m62-drones-street.png`);
+      /* reset to the spawn pose for the remaining checks */
+      await page.evaluate(() => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(0, 4, 18);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = 0;
+        S.CAMERA.pitch = 0;
+      });
+      await sleep(250);
+    }
+    check('M6.2: street-level screenshot with drones written (shots/m62-drones-street.png)',
+      shotOk, `target drone=${d ? `(${d.px.toFixed(0)}, ${d.py.toFixed(0)}, ${d.pz.toFixed(0)})` : 'none in frame'}`);
   }
 
   /* ---- 10. No errors anywhere ---- */

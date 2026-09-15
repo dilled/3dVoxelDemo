@@ -204,12 +204,34 @@ smoke-test evidence.
       releases are counted no-ops, pool returns to full, aggregate
       stats via `POOL.stats()` sane for M6.5 caps / M14.2 HUD.
 
-#### M6.2 — Maintenance drones
-- [ ] Small voxel-quad drones (one InstancedMesh), patrol routes between
+#### M6.2 — Maintenance drones ✅
+- [x] Small voxel-quad drones (one InstancedMesh), patrol routes between
       towers, dock at roof bays; cap by distance to player and FPS tier.
 - **Test:** from street level drones visibly patrol and dock; count never
       exceeds tier cap; no allocation per frame.
 - **Commit when:** drones verified on screen at the cap limit.
+- **Verified:** smoke M6.2 section green — fleet grows to the HIGH cap
+  (16) on the `traffic-drone` M6.1 pool (fixed capacity, every live
+  drone is a pre-created pool item ⇒ zero `new` after init); docked +
+  airborne + routed drones all observed, positions advance across
+  frames, JS heap flat across the live-fleet window (min-of-3-sample
+  churn ≤ 2 MB);
+  `TIER.set('low')` trims the fleet to 5 (excess released to the pool,
+  pool inUse === count), `TIER.set('high')` regrows it to 16; draw calls
+  stay inside budget (< 150) with the fleet at cap; street-level
+  screenshot `smoke/shots/m62-drones-street.png` — pose chosen by an
+  analytic line-of-sight check against the instanced building boxes so
+  the drone is provably in frame (dense core city otherwise hides any
+  given tower). Docks/waypoints are deterministic — `WORLD.buildingAt`
+  replays the exact M3 seeded path (occupancy → archetype → mass) for a
+  block, so routes always land where mass actually is; docks at
+  `info.hTop + 7 m` (hTop = true roof incl. crowns; 7 m clears M4 roof
+  signs), so drones hover visibly ABOVE the roof — a dock on `info.h`
+  sat inside the server crown and was invisible; docks capped to a
+  260 m player annulus, release past 299 m; one merged-geometry voxel
+  quad per drone (chassis + 4 rotors + sensor nub) on a single
+  InstancedMesh = one draw call; cyan/amber per-instance tints,
+  per-frame re-set so swap-remove stays in sync.
 
 #### M6.3 — Sky vehicles with light trails
 - [ ] Vehicles on ring roads at 3 altitudes, additive sprite-streak

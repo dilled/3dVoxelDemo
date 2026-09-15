@@ -266,10 +266,51 @@ const CFG = {
     signPerChunk: 1,             // holo-sign billboards per chunk
     ledTexture: 0,               // 0 = ledA / 1 = ledB (picked per building)
   },
+
+  /* ---- M6.2: traffic — drones & sky vehicles (drones only in 6.2) ----
+   * Drones dock on tower rooftops (the M3 building seeds are replayed
+   * for placement — see WORLD.buildingAt) and patrol between towers at
+   * roof level. One shared InstancedMesh for every drone (one draw
+   * call); state lives in the M6.1 pool. */
+  traffic: {
+    drone: {
+      tiers: { high: 16, med: 10, low: 5 },  // per-TIER.active() caps
+      spawnInterval: 0.5,                    // s between spawn attempts
+      radius: 260,                           // dock search radius (metres)
+      innerRadius: 26,                       // keep clear of the player
+      releaseFactor: 1.15,                   // release past radius*factor
+      minH: 10,                              // min roof height for a dock
+      dockArchetypes: ['server', 'cool', 'fiber', 'holo', 'housing'],
+      cruise: 6,                             // cruise altitude above roof
+      speed: [7, 13],                        // m/s patrol speed range
+      dockHover: 7,                         // hover gap above the roof top
+                                            // (clears crowns / M4 roof signs)
+      dockTime: [3, 9],                      // s at the dock before leaving
+      size: 2.0,                             // overall drone scale (m-ish)
+    },
+  },
 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const damp = (dt, rate) => 1 - Math.exp(-rate * dt);
+
+/* ====================================================================
+ * TIER — active LOD / detail tier (M6.2 seam, auto-detect is M14.1)
+ *
+ *  - TRAFFIC reads CFG.traffic.drone.tiers[TIER.name] every frame, so a
+ *    tier change trims / grows the drone fleet smoothly (excess drones
+ *    are released back to the pool, the fleet regrows on spawn ticks)
+ *  - M14.1 replaces TIER.set with FPS-based auto-detection; nothing
+ *    downstream needs to change for that
+ * ==================================================================== */
+const TIER = {
+  order: ['low', 'med', 'high'],
+  name: 'high',
+  set(n) {
+    if (TIER.order.includes(n)) TIER.name = n;
+  },
+  active() { return TIER.name; },
+};
 
 /* ------------------------------------------------------------------ *
  * BOOT — deterministic state machine: LOADER → RUNNING (→ ERROR)
@@ -1324,6 +1365,35 @@ const WORLD = {
     return false;
   },
 
+  /* M6.2 — replay one block's building seed without building geometry.
+   * Runs the EXACT seeded path of _fill (occupancy → archetype → mass)
+   * into a no-op sink, so drone routes land where mass actually is.
+   * Pure: no chunk state touched. `ring` must be the block's current
+   * player-relative chunk ring (occupancy depends on it, like _fill). */
+  _sink: { add() {} },
+  _sinkCh: null,   // pre-allocated sink chunk (no per-call allocation)
+  buildingAt(bx, bz, ring) {
+    if (WORLD._sinkCh === null) {
+      WORLD._sinkCh = {
+        boxA: WORLD._sink, boxG: WORLD._sink, cyl: WORLD._sink,
+      };
+    }
+    if (WORLD._skipBlock(bx, bz)) return null;
+    const rng = mulberry32(WORLD._seedFor(bx, bz));
+    if (rng() >= CFG.city.occupancy[ring]) return null;
+    const B = WORLD.BLOCK;
+    const wx = (bx + 0.5) * B, wz = (bz + 0.5) * B;
+    const dist = Math.hypot(wx, wz);
+    const zone = dist < 220 ? 'core' : dist < 520 ? 'mid' : 'outer';
+    const fall = 0.35 + 0.65 * Math.exp(-dist * 0.0045);
+    const arch = WORLD._pick(rng, zone);
+    if (!CFG.traffic.drone.dockArchetypes.includes(arch)) return null;
+    const info = WORLD._mass(rng, WORLD._sinkCh, arch,
+      CFG.city.archetypes[arch], wx, wz, fall, ring);
+    if (info.h < CFG.traffic.drone.minH) return null;
+    return info;
+  },
+
   update(dt, t) {
     const p = CAMERA.pos;
     const bx = Math.floor(p.x / WORLD.BLOCK);
@@ -1531,7 +1601,7 @@ const WORLD = {
         housing: [R(11, 14), R(7, 15) * (0.7 + 0.3 * fall)],
       }[arch];
       box.add(x, dims[1] / 2, z, [dims[0], dims[1], dims[0]], tint);
-      info.w = dims[0]; info.h = dims[1];
+      info.w = dims[0]; info.h = dims[1]; info.hTop = dims[1];
       return info;
     }
 
@@ -1541,7 +1611,7 @@ const WORLD = {
       box.add(x, h / 2, z, [w, h, w], tint);
       const u = h * 0.18;
       box.add(x, h + u / 2, z, [w * 0.62, u, w * 0.62], _tintShade(tint, 1.15));
-      info.w = w; info.h = h;
+      info.w = w; info.h = h; info.hTop = h + u;   // crown top (M6.2 docks)
       break;
     }
     case 'rack': {
@@ -1550,14 +1620,14 @@ const WORLD = {
       const a = R(4, 6);
       box.add(x + w * 0.35, a * 0.25, z + w * 0.2, [a, a * 0.5, a],
         _tintShade(tint, 0.8));
-      info.w = w; info.h = h;
+      info.w = w; info.h = h; info.hTop = h;
       break;
     }
     case 'cool': {
       const r = R(4.5, 7), h = R(6, 13);
       ch.cyl.add(x, h / 2, z, [r * 2, h, r * 2], tint);
       ch.cyl.add(x, h + 0.9, z, [r * 1.2, 1.8, r * 1.2], _tintShade(tint, 1.1));
-      info.r = r; info.h = h;
+      info.r = r; info.h = h; info.hTop = h + 1.8;
       break;
     }
     case 'sub': {
@@ -1565,7 +1635,7 @@ const WORLD = {
       box.add(x, h / 2, z, [w, h, w * 0.7], tint);
       ch.cyl.add(x - w * 0.3, h + 0.8, z, [0.7, 1.6, 0.7], _tintShade(tint, 1.2));
       ch.cyl.add(x + w * 0.3, h + 0.8, z, [0.7, 1.6, 0.7], _tintShade(tint, 1.2));
-      info.w = w; info.h = h;
+      info.w = w; info.h = h; info.hTop = h + 1.6;
       break;
     }
     case 'antenna': {
@@ -1574,26 +1644,27 @@ const WORLD = {
       const mh = R(12, 22);
       ch.cyl.add(x, h + mh / 2, z, [0.8, mh, 0.8], _tintShade(tint, 1.1));
       info.w = w; info.h = h + mh;   // h = mast tip (beacons/dishes mount here)
+      info.hTop = h + mh;
       break;
     }
     case 'fiber': {
       const h = R(38, 68) * fall, w = R(4.5, 6);
       box.add(x, h / 2, z, [w, h, w], tint);
       box.add(x, h + 1, z, [w * 0.5, 2, w * 0.5], _tintShade(tint, 1.3));
-      info.w = w; info.h = h;
+      info.w = w; info.h = h; info.hTop = h + 2;
       break;
     }
     case 'holo': {
       const h = R(18, 30) * (0.6 + 0.4 * fall);
       box.add(x, h / 2, z, [5, h, 5], tint);
       box.add(x, h + 1.5, z, [6.5, 3, 6.5], _tintShade(tint, 1.2));  // pad (M4 sign)
-      info.w = 5; info.h = h + 3;
+      info.w = 5; info.h = h + 3; info.hTop = h + 3;
       break;
     }
     case 'housing': {
       const w = R(11, 14), h = R(7, 15) * (0.7 + 0.3 * fall);
       box.add(x, h / 2, z, [w, h, w * 0.85], tint);
-      info.w = w; info.h = h;
+      info.w = w; info.h = h; info.hTop = h;
       break;
     }
     }
@@ -2006,6 +2077,292 @@ const POOL = {
       if (p.peak > s.peak) s.peak = p.peak;
     }
     return s;
+  },
+};
+
+/* ==================================================================== *
+ * TRAFFIC — drones & sky vehicles (M6.2)
+ *
+ *  - drones dock on tower rooftops (deterministic: dock positions come
+ *    from the M3 block seeds via WORLD.buildingAt — the same seeded
+ *    path _fill uses, so routes always land where mass actually is)
+ *  - patrol: pick 2–4 waypoints between tower roofs at roof level
+ *    (dock altitude = roof + cruise + seeded jitter), fly between them
+ *    at seeded speed; then return to the dock, hover, and re-plan —
+ *    routes are always replanned, never baked at init
+ *  - one shared InstancedMesh for every drone (one draw call total);
+ *    per-instance color tints (cyan / amber variation)
+ *  - per-frame work is a tight loop over a pre-allocated state array:
+ *    zero `new`, zero array growth — items come from the M6.1 pool
+ *  - caps: fleet ≤ CFG.traffic.drone.tiers[TIER.active()]; a drone
+ *    whose dock drifted beyond radius*releaseFactor from the player is
+ *    released back to the pool (the M6.5 tier system builds on the
+ *    same TIER seam — auto-detect is M14.1)
+ * --------------------------------------------------------------------- */
+const TRAFFIC = {
+  name: 'TRAFFIC',
+  mesh: null,
+  count: 0,                 // live drones (= mesh.count)
+  pool: null,
+  _live: null,              // pre-allocated live list (pool items)
+  _spawnTimer: 0,
+  _rng: null,
+  _cap: 16,
+  /* pre-allocated scratch (zero per-frame allocation) */
+  _m: new THREE.Matrix4(),
+  _p: new THREE.Vector3(),
+  _q: new THREE.Quaternion(),
+  _s: new THREE.Vector3(1, 1, 1),
+  _y: new THREE.Vector3(0, 1, 0),
+  _tint: new THREE.Color(),
+
+  init() {
+    /* drone body: merged voxel quad — chassis + 4 rotors + sensor nub
+     * (unlit: the per-instance color IS the emissive tint) */
+    const geo = KIT.mergeGeometries([
+      { geo: new THREE.BoxGeometry(1.0, 0.24, 1.0) },
+      { geo: new THREE.BoxGeometry(0.44, 0.06, 0.44),
+        matrix: new THREE.Matrix4().makeTranslation(0.55, 0.14, 0.55) },
+      { geo: new THREE.BoxGeometry(0.44, 0.06, 0.44),
+        matrix: new THREE.Matrix4().makeTranslation(-0.55, 0.14, 0.55) },
+      { geo: new THREE.BoxGeometry(0.44, 0.06, 0.44),
+        matrix: new THREE.Matrix4().makeTranslation(0.55, 0.14, -0.55) },
+      { geo: new THREE.BoxGeometry(0.44, 0.06, 0.44),
+        matrix: new THREE.Matrix4().makeTranslation(-0.55, 0.14, -0.55) },
+      { geo: new THREE.BoxGeometry(0.3, 0.16, 0.3),
+        matrix: new THREE.Matrix4().makeTranslation(0, -0.18, 0.3) },
+    ]);
+    /* unlit basic material: the per-instance color IS the visible tint
+     * (same pattern as M5 compute nodes — lit lambert would vanish into
+     * the black night sky at drone scale) */
+    TRAFFIC.mesh = new THREE.InstancedMesh(
+      geo, new THREE.MeshBasicMaterial({ color: 0xffffff }), 16);
+    TRAFFIC.mesh.count = 0;
+    TRAFFIC.mesh.frustumCulled = false;
+    TRAFFIC.mesh.name = 'drones';
+    scene.add(TRAFFIC.mesh);
+
+    TRAFFIC._live = new Array(16);
+    TRAFFIC.pool = POOL.make('traffic-drone', 16, () => ({
+      /* positions (metres) */
+      px: 0, py: 0, pz: 0,
+      /* patrol targets (metres) */
+      tx: 0, ty: 0, tz: 0,
+      /* dock home (metres) */
+      dx: 0, dy: 0, dz: 0,
+      /* per-drone constants */
+      speed: 10, cruise: 6, size: 2, phase: 0,
+      state: 0,                // 0 docked → 1 patrol → 2 return
+      wp: 0,                   // next waypoint index
+      wpCount: 0,
+      wpT: 0,                  // route timer (returns to waypoint 0)
+      dockT: 4,                // remaining dock time (s)
+      yaw: 0,                  // heading (radians, toward current target)
+      wps: new Float32Array(12),  // up to 4 waypoints, pre-allocated
+      tint: new THREE.Color(0x9fe8ff),
+    }));
+
+    /* persistent rng: spawn planning is deterministic per page load
+     * (seeded once; every call draws from the same stream) */
+    TRAFFIC._rng = mulberry32(CFG.city.seed ^ 0x5d37);
+    TRAFFIC._spawnTimer = 0;
+    TRAFFIC._cap = CFG.traffic.drone.tiers[TIER.name];
+  },
+
+  update(dt, t) {
+    const d = CFG.traffic.drone;
+    /* tier cap: trim the farthest drones down to the tier limit */
+    TRAFFIC._cap = d.tiers[TIER.name];
+    while (TRAFFIC.count > TRAFFIC._cap) {
+      let fi = -1, fd = -1;
+      for (let i = 0; i < TRAFFIC.count; i++) {
+        const it = TRAFFIC._live[i];
+        const dist2 =
+          (it.px - CAMERA.pos.x) * (it.px - CAMERA.pos.x) +
+          (it.pz - CAMERA.pos.z) * (it.pz - CAMERA.pos.z);
+        if (dist2 > fd) { fd = dist2; fi = i; }
+      }
+      TRAFFIC._releaseAt(fi >= 0 ? fi : TRAFFIC.count - 1);
+    }
+
+    /* spawn attempts (persistent rng — zero allocations) */
+    TRAFFIC._spawnTimer -= dt;
+    if (TRAFFIC._spawnTimer <= 0 && TRAFFIC.count < TRAFFIC._cap) {
+      TRAFFIC._spawnTimer = d.spawnInterval;
+      const it = TRAFFIC.pool.acquire();
+      if (it) TRAFFIC._spawn(it);
+      else TRAFFIC._spawnTimer = d.spawnInterval * 2;  // pool full, retry
+    }
+
+    /* per-frame flight update (tight loop, pre-allocated state) */
+    const mesh = TRAFFIC.mesh;
+    for (let i = TRAFFIC.count - 1; i >= 0; i--) {
+      const it = TRAFFIC._live[i];
+      /* distance cap: dock drifted beyond radius*factor → release */
+      const dr = it.dx - CAMERA.pos.x, dz = it.dz - CAMERA.pos.z;
+      if (dr * dr + dz * dz > d.radius * d.releaseFactor * d.radius * d.releaseFactor) {
+        TRAFFIC._releaseAt(i); continue;
+      }
+      let bob = 0;
+      if (it.state === 0) {
+        /* docked: hover bob at dock altitude until the timer elapses */
+        it.dockT -= dt;
+        bob = 0.25 * Math.sin(t * 2 + it.phase);
+        if (it.dockT <= 0 && it.wpCount > 0) it.state = 1;
+        TRAFFIC._pose(it, t, bob);
+      } else {
+        const targetX = it.state === 1 ? it.tx : it.dx;
+        const targetY = it.state === 1 ? it.ty : it.dy;
+        const targetZ = it.state === 1 ? it.tz : it.dz;
+        const dx = targetX - it.px, dy = targetY - it.py, dz = targetZ - it.pz;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const step = it.speed * dt;
+        if (dist <= step + 0.15) {
+          /* arrived */
+          it.px = targetX; it.py = targetY; it.pz = targetZ;
+          if (it.state === 1) {
+            if (it.wp >= it.wpCount - 1) it.state = 2;  // last wp → return
+            else { it.wp++; TRAFFIC._nextWp(it); }
+          } else {
+            it.state = 0;
+            it.dockT = d.dockTime[0] + it.phase / 6.2831853 * (d.dockTime[1] - d.dockTime[0]);
+            TRAFFIC._plan(it);  // replan the next route at the dock
+          }
+        } else {
+          it.yaw = Math.atan2(dx, dz);   // face the current target
+          const inv = it.speed / dist;
+          it.px += dx * inv * dt; it.py += dy * inv * dt; it.pz += dz * inv * dt;
+        }
+        bob = 0.35 * Math.sin(t * 3 + it.phase);
+        TRAFFIC._pose(it, t, bob);
+      }
+      mesh.setMatrixAt(i, TRAFFIC._m);
+      /* re-set tint every frame: swap-remove in _releaseAt moves drones
+       * between slots, and instance colors are per-SLOT, not per-item */
+      mesh.setColorAt(i, it.tint);
+    }
+    mesh.count = TRAFFIC.count;
+    if (TRAFFIC.count > 0) {
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    }
+  },
+
+  /* write the instance matrix for drone `it` into TRAFFIC._m */
+  _pose(it, t, bob) {
+    const yaw = it.state === 0 ? 0.5 * Math.sin(t * 0.7 + it.phase) : it.yaw;
+    TRAFFIC._p.set(it.px, it.py + bob, it.pz);
+    TRAFFIC._q.setFromAxisAngle(TRAFFIC._y, yaw);
+    TRAFFIC._s.set(it.size, it.size, it.size);
+    TRAFFIC._m.compose(TRAFFIC._p, TRAFFIC._q, TRAFFIC._s);
+  },
+
+  /* plan a fresh route for a docked drone: 2–4 waypoints between
+   * tower roofs at roof level (dock altitude = roof + cruise + jitter) */
+  _plan(it) {
+    const r = TRAFFIC._rng;
+    const d = CFG.traffic.drone;
+    it.wpCount = 0;
+    it.wp = 0;
+    it.wpT = 0;
+    const n = 2 + (r() * 3) | 0;
+    for (let k = 0; k < n; k++) {
+      const b = TRAFFIC._findDock(r, it.dx, it.dz, false);
+      if (!b) continue;
+      const alt = b.hTop + d.cruise + r() * 4;   // above the target roof top
+      it.wps[it.wpCount * 3] = b.x;
+      it.wps[it.wpCount * 3 + 1] = alt;
+      it.wps[it.wpCount * 3 + 2] = b.z;
+      it.wpCount++;
+    }
+    if (it.wpCount === 0) return;   // nothing found — stays docked
+    TRAFFIC._nextWp(it);
+  },
+
+  /* pick the next waypoint target (wraps to waypoint 0 at the end) */
+  _nextWp(it) {
+    const i = (it.wp % it.wpCount) * 3;
+    it.tx = it.wps[i]; it.ty = it.wps[i + 1]; it.tz = it.wps[i + 2];
+  },
+
+  /* the block's current player-relative chunk ring — must match how
+   * _fill seeds occupancy for that block (ring drives the occupancy)
+   * the same way WORLD._sync assigns chunk rings */
+  _ringFor(bx, bz) {
+    const B = WORLD.BLOCK, K = WORLD.CHUNK;
+    const pcx = Math.floor(Math.floor(CAMERA.pos.x / B) / K);
+    const pcz = Math.floor(Math.floor(CAMERA.pos.z / B) / K);
+    return Math.max(
+      Math.abs(Math.floor(bx / K) - pcx),
+      Math.abs(Math.floor(bz / K) - pcz));
+  },
+
+  /* seeded dock search: up to 14 random blocks inside an annulus
+   * [innerRadius, radius] around (nearX, nearZ) — returns the first
+   * with a dockable tower (replayed M3 building seed, min height,
+   * player annulus). Planning-time only: small objects, not per-frame. */
+  _findDock(r, nearX, nearZ, skipDup) {
+    const d = CFG.traffic.drone;
+    const B = WORLD.BLOCK;
+    for (let a = 0; a < 14; a++) {
+      const ang = r() * 6.2831853;
+      const rad = d.innerRadius + r() * (d.radius - d.innerRadius);
+      const wx = nearX + Math.cos(ang) * rad;
+      const wz = nearZ + Math.sin(ang) * rad;
+      const bx = Math.floor(wx / B), bz = Math.floor(wz / B);
+      const info = WORLD.buildingAt(bx, bz, TRAFFIC._ringFor(bx, bz));
+      if (!info) continue;
+      const cd = Math.hypot(info.x - CAMERA.pos.x, info.z - CAMERA.pos.z);
+      if (cd < d.innerRadius || cd > d.radius) continue;
+      if (skipDup) {
+        /* don't stack two drones on the same roof */
+        let dup = false;
+        for (let i = 0; i < TRAFFIC.count; i++) {
+          const o = TRAFFIC._live[i];
+          if (Math.abs(o.dx - info.x) < 1 && Math.abs(o.dz - info.z) < 1) { dup = true; break; }
+        }
+        if (dup) continue;
+      }
+      return { x: info.x, z: info.z, h: info.h, hTop: info.hTop };
+    }
+    return null;
+  },
+
+  _spawn(it) {
+    const d = CFG.traffic.drone;
+    const r = TRAFFIC._rng;
+    const b = TRAFFIC._findDock(r, CAMERA.pos.x, CAMERA.pos.z, true);
+    if (!b) { TRAFFIC.pool.release(it); return; }  // try again next tick
+    const alt = d.dockHover + b.hTop;
+    it.dx = b.x; it.dy = alt; it.dz = b.z;
+    it.px = b.x; it.py = alt; it.pz = b.z;
+    it.speed = d.speed[0] + r() * (d.speed[1] - d.speed[0]);
+    it.size = d.size * (0.85 + r() * 0.3);
+    it.phase = r() * 6.2831853;
+    it.state = 0;
+    it.yaw = r() * 6.2831853;
+    it.dockT = d.dockTime[0] + r() * (d.dockTime[1] - d.dockTime[0]);
+    it.tint.setHex(r() < 0.85 ? 0x9fe8ff : 0xffc46b);
+    TRAFFIC._live[TRAFFIC.count++] = it;
+    TRAFFIC._plan(it);
+    TRAFFIC.mesh.setColorAt(TRAFFIC.count - 1, it.tint);
+  },
+
+  _releaseAt(i) {
+    const it = TRAFFIC._live[i];
+    const m = --TRAFFIC.count;
+    if (i !== m) TRAFFIC._live[i] = TRAFFIC._live[m];
+    TRAFFIC._live[m] = undefined;
+    TRAFFIC.pool.release(it);
+  },
+
+  dispose() {
+    for (let i = TRAFFIC.count - 1; i >= 0; i--) TRAFFIC._releaseAt(i);
+    if (TRAFFIC.mesh) {
+      scene.remove(TRAFFIC.mesh);
+      TRAFFIC.mesh.geometry.dispose();
+      TRAFFIC.mesh.material.dispose();
+    }
   },
 };
 
@@ -2458,6 +2815,7 @@ const ENTITY = {
 /* ------------------------------------------------------------------ *
  * Subsystems — FIXED BOOT ORDER = registration order.
  * M0: HUD   M1: INPUT, CAMERA   M2: KIT   M3: WORLD   M5: ENTITY
+ * M6.2: TRAFFIC   (registered after ENTITY, before HUD)
  * ------------------------------------------------------------------ */
 const systems = [];
 function registerSystem(sys) {
@@ -2509,6 +2867,7 @@ registerSystem(CAMERA);
 registerSystem(KIT);
 registerSystem(WORLD);
 registerSystem(ENTITY);
+registerSystem(TRAFFIC);
 registerSystem(HUD);
 for (const s of systems) if (s.init) s.init();
 
@@ -2572,6 +2931,8 @@ window.SIM = {
   WORLD,
   POOL,
   ENTITY,
+  TRAFFIC,
+  TIER,
   HUD,
   CFG,
   renderer,
