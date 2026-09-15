@@ -38,6 +38,10 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 
 ## Milestones
 
+Rule from M6 onward: one sub-milestone (`M#.#`) = one actual, clear functional
+change + its testing + one commit. No sub-milestone shipped without its
+smoke-test evidence.
+
 | Phase | Scope | Gate |
 |---|---|---|
 | **M0** ✅ | Single-file scaffold: full-screen canvas, Three.js via CDN, scene/renderer/camera, `BOOT` state machine with START button + audio gate, FPS counter | START always leads to a live 60 fps loop; page refresh never leaves a stuck state |
@@ -46,15 +50,45 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 | **M3** ✅ | Chunked city generation (far layer): seeded PRNG, city grid, 16×16 block chunks generated/unbuilt around player, weighted archetypes, 3-ring distance LOD | City extends beyond initial view, no visible duplication, draw calls flat as you fly out |
 | **M4** ✅ | Building detail passes (near layer): 5 pooled detail InstancedMeshes per near chunk (fans, dishes, pulses, holo signs, LED facades), per-archetype detail on the M3 mass, per-building seeded salt, ring-2 silhouette stays zero-detail | Every archetype readable from 50–200 m and procedurally varied; draw calls flat (32 near) |
 | **M5** ✅ | The Qwen machine-creature (dormant): plaza pedestal, full creature build from primitives, named rig parts, dormant breathing/idle state, instanced compute-node voxels | Reads as "dormant colossal machine" from street level; silhouette holds from 3 camera distances |
-| **M6** | Traffic & ambient life (pooled): object pools, maintenance drones, sky vehicles with light trails, steam/spark emitters, FPS-tier adaptive caps | City feels inhabited; caps never exceed tier; pools never allocate per frame |
-| **M7** | Particle & FX system: pooled points/sprites, `FX.pulse`, animated electrical arcs, screen-space flash, impulse camera shake | Each effect has a manual trigger key and costs nothing while idle |
-| **M8** | Atmosphere: night sky dome, stars, aurora, zone-tinted fog, volumetric-ish light shafts, distant lightning events | Depth and mood readable from street level; lightning event visible from inside the city |
-| **M9** | Creature animation & awakening sequence: dormant animation, DORMANT→STIR→AWAKE→DECAY state machine, full awakening beats (flare, node ignition, pulse wave, arcs, easter-egg hook, decay), manual + auto trigger | First-time viewer reads the narrative (dormant → stir → awake → pulse → settle) in ≤ 30 s |
-| **M10** | Unsloth easter egg: voxel neon sloth monument + "UNSLOTH" holo sign, holographic sloth, sloth-themed drones, awakening reaction, ≤ 5 % attention budget | A local-LLM fan spots it within seconds and it feels like it belongs to the world |
-| **M11** | Procedural audio (WebAudio only): master graph, looping beds (hum/fans/machinery), event sounds, distance-ish spatial mixing, gesture-gated start | Muting costs nothing; mix identifiable as "machine city" within 3 seconds |
-| **M12** | Intro cinematic: corridor rush → city reveal → low orbit → title card → drop to street, fully skippable/cancellable at any point | Intro finishes, skips, or is interrupted — all paths end in a controllable camera, zero console errors |
-| **M13** | Emergent event director: weighted scheduler with cooldowns, ambient events (data pulse, power cycle, cooling emergency, drone launch, mechanical reposition, EM discharge), awakening-compatible | 3 minutes of idle play shows ≥ 4 different events, none conflicting, none breaking perf |
-| **M14** | Performance, quality tiers, polish: FPS monitor + HIGH/MED/LOW tiers, structural culling verified, HUD stats, polish pass, robustness pass (refresh/tab-hide/resize/gamepad), 3-min recorded verification run | Stable frame rate through the awakening sequence at default quality on a modern gaming GPU |
+| **M6.1** | Generic object-pool foundation (`Pool` helper): fixed-size alloc at init, `acquire/release`, zero per-frame allocation, shared by later emitters | Pool test: 10k acquire/release cycles in smoke run, zero `new` after init, zero GC churn in stats |
+| **M6.2** | Maintenance drones: small voxel quads (InstancedMesh), patrol routes between towers, dock at roof bays, capped by distance to player | Drones visibly patrol + dock from street level; cap holds at tier max; no allocation per frame |
+| **M6.3** | Sky vehicles: light trails (additive sprite streak) on ring roads at 3 altitudes, capped like drones | Trails readable from all 3 altitudes; count never exceeds tier cap |
+| **M6.4** | Steam vents (cooling towers, billboard sprite pool, upward drift, fade) + sparks (substations, tiny points, brief life) | Both emitters run idle-cheap; smoke shot shows steam + sparks at source buildings |
+| **M6.5** | Adaptive caps: `TRAFFIC` reads current FPS tier, scales all M6 pools | Forcing LOW tier in smoke run visibly halves caps; back to HIGH restores; no spike |
+| **M7.1** | Pooled `Points`/sprite particle system: steam, sparks, pulse motes, lightning motes, awakening rain — one system, one budget | One trigger key rains all particle types; idle cost ~0 in stats |
+| **M7.2** | `FX.pulse(origin, radius, color)`: expanding instanced ring mesh + light-intensity ramp (+ audio hook once M11 lands) | Manual key fires a visible pulse; nothing allocated; idle = zero draw calls added |
+| **M7.3** | Animated electrical arcs: Line segments regenerated every N frames between anchors (substation→substation, creature→ring) | Manual key sparks arcs between two substations and creature→ring; regen is frame-cheap |
+| **M7.4** | Screen-space flash: overlay-scene additive plane (or DOM div) driven by `FX.flash(intensity)` | Manual key flashes screen; decays to zero; costs nothing idle |
+| **M7.5** | Camera shake: impulse-decay system consumed by `CAMERA` | Manual key shakes camera with clean decay to still; never accumulates |
+| **M8.1** | Night sky: gradient sky dome (big sphere, canvas/shader texture), stars, faint aurora band | Night mood readable from street level; dome correct from street, orbit, and far fly |
+| **M8.2** | Fog depth tune + zone-tinted haze (cyan core / warm avenues) via fog color lerp | Depth readable at 500 m; zone tint visible flying across zones |
+| **M8.3** | Volumetric-ish light shafts: a few additive cone/cylinder meshes from key spires + creature core (only when near / during awakening) | Shafts visible near spire, absent far away (no permanent draw calls) |
+| **M8.4** | Distant lightning: random far point + brief hemi bump + flash + EM discharge ring across the city | Lightning event visible from inside the city; fires on timer + manual key |
+| **M9.1** | Idle/dormant animation: tensor-ring rotation, antenna sway, breathing core, periodic "dream" LED wave across the node grid (instance-color waves) | Dream wave sweeps the node grid visibly; dormant state stays dim and still-ish |
+| **M9.2** | Wake state machine: DORMANT → STIR (2 s head lift, jaw, rings speed up) → AWAKE (10–20 s) → DECAY → DORMANT, with per-state hooks | State machine smoke test: forced transitions in order, clean return to DORMANT, re-trigger safe |
+| **M9.3** | Awakening beats 1–3: core-eye flare (emissive ramp + light + flash), node voxels ignite in radial waves, rings accelerate + limbs reposition (shake impulse) | Beats 1–3 play in sequence with correct timing on manual trigger |
+| **M9.4** | Awakening beats 4–5: energy pulse ring from plaza + city holo-signs/LEDs following the wave (per-ring scheduled ramps), substation arcs fire, steam bursts, drones scatter/re-route, vehicles avoid | The "thousands of compute nodes illuminate" moment lands; wave visibly travels ring by ring |
+| **M9.5** | Awakening beats 6–7 + decay: easter-egg reaction hook (M10), waves dim outward, hum settles, final pulse | Full sequence ends back in DORMANT with one final pulse; re-trigger immediately works |
+| **M9.6** | Triggers: manual key (`F`) + HUD button, auto-play once ~30 s after intro | All three entry paths (key, button, auto) start the same sequence exactly once |
+| **M10.1** | Voxel neon **sloth** monument atop one compute tower on a side avenue + rooftop "UNSLOTH" holo sign with cycling taglines ("local ≠ slow" / "why rush?") | Monument + sign readable from street; sign cycles; outside default intro framing |
+| **M10.2** | Relaxed holographic sloth silhouette on the antenna arm (billboard + canvas sprite, additive, slow breathing) + 1–2 slow sloth-themed maintenance drones (bigger, soft pink) patrolling that street only | Holo sloth breathes; pink drones patrol only that street |
+| **M10.3** | Awakening reaction: sign flares, holograph brightens + one slow stretch, sloth drones rise to hover for the pulse, then resume | Reaction plays during AWAKE, everything returns to idle after DECAY |
+| **M11.1** | Audio master graph: compressor → user-mute gain → destination; gesture-gated start (START button), resume-safe | Audio starts only after gesture; mute key mutes all; refresh/re-entry safe |
+| **M11.2** | Looping beds: reactor hum (detuned sines + sub + LFO), fans (filtered noise, band-pass sweep), distant machinery (noise + random low thumps) | Beds run indefinitely without audible repeats/bugs; identifiable as "machine city" within 3 s |
+| **M11.3** | Event sounds: pulse thump, arc crackle, steam hiss, drone whir — wired to M6–M9 emitters | Each event in-game produces its sound; all silent when muted; zero cost when idle |
+| **M11.4** | Spatial-ish mixing: one panner + distance gain for 2–3 nearest emitters, rest folded into ambient bed | Walking past an emitter pans/attenuates; cost bounded |
+| **M12.1** | Intro engine: camera-keyframe timeline runner (no async resources) + beat 1 dark server corridor (procedural instanced LED-strip tunnel + dolly) | Corridor beat plays; timeline runner test: start/cancel/seek all clean |
+| **M12.2** | Intro beats 2–5: corridor opens → wide reveal dolly over city → 1.5-orbit low orbit of dormant creature → `QWEN FLASH // AWAKENING` title card (DOM, fades) → lerp to street-level player position | Full ~12–15 s intro ends in controllable street-level camera |
+| **M12.3** | Intro robustness: skippable/cancellable at any point (START/click/keypress) → 0.5 s fade to street camera; START visible after 2 s; intro never blocks play state | Finish / early-skip / late-interrupt all end in controllable camera, zero console errors |
+| **M13.1** | `EVENTS` scheduler: weighted picking, cooldowns, min/max gap, event registry, one-at-a-time + priority rules | Scheduler smoke test: forced random seed yields legal firing order (no overlap, gaps respected) |
+| **M13.2** | Ambient events A: data pulse (dot along conduit, both ends flash — M7 cable) + section power cycle (one ring chunk dims/brightens 3–6 s, per-chunk color multiplier) | Both events fire and resolve cleanly on manual + scheduled triggers |
+| **M13.3** | Ambient events B: cooling emergency (fan spin-up, steam burst, warning LEDs, drone dispatch, 20 s, resolves) + drone launch (roof-bay panel opens, 2–4 drones fly to patrol) | Both events run start→resolve with no leftover state; visible from street level |
+| **M13.4** | Ambient events C: mechanical reposition (giant fan/antenna/ring slow move + rumble + tiny shake) + distant EM discharge (far lightning + a few city arcs); awakening-compat: during AWAKE only creature-priority events fire | 3-min idle play shows ≥ 4 different events, none conflicting, none breaking perf; AWAKE window respected |
+| **M14.1** | Perf monitor + quality tiers: rolling FPS, `HIGH/MED/LOW` (auto + manual); tiers scale LOD radius, particle/drone/vehicle caps, sign texture updates, light shafts, audio beds | Forcing each tier in smoke run: stats within budget, no stutter on tier switch |
+| **M14.2** | HUD stats (small, corner, toggleable): FPS, visible instances, active drones, chunk id, AI state | HUD matches measured stats; toggle hides it; costs nothing hidden |
+| **M14.3** | Polish pass: shake tuning, flash tuning, title fade, mute key (`M`), help overlay (`H`), cheap DOM vignette | Each control verified working; feel pass recorded (3-min run) |
+| **M14.4** | Robustness pass: refresh mid-game, tab-hide/resume (dt clamp), resize mid-awakening, gamepad plug/unplug — no errors, no stuck states | Robustness checklist in smoke run fully green |
+| **M14.5** | Final verification: manual 3-min screen-recording run — intro → reveal → idle life → manual awakening → easter-egg reaction → performance stable | Recording reviewed; stable frame rate through the awakening at default quality on a modern gaming GPU |
 
 ## Milestone details
 
@@ -155,148 +189,346 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
   with the creature — flat vs M4).
 
 ### M6 — Traffic & ambient life (pooled)
-- [ ] Object pools: drones, sky vehicles, steam puffs, sparks, cable
-      packets (glowing dots traveling on conduit paths — precomputed
-      Catmull-Rom lines between towers).
-- [ ] Maintenance drones (small voxel quads): patrol routes between
+
+#### M6.1 — Object-pool foundation
+- [ ] Generic `Pool` helper: fixed capacity allocated at init, `acquire` /
+      `release`, zero `new` after init; shared by all later emitters.
+- **Test:** smoke run does 10k acquire/release cycles; stats show zero
+      allocation after init, no GC churn.
+- **Commit when:** pool lands + smoke test green.
+
+#### M6.2 — Maintenance drones
+- [ ] Small voxel-quad drones (one InstancedMesh), patrol routes between
       towers, dock at roof bays; cap by distance to player and FPS tier.
-- [ ] Sky vehicles: light trails (additive sprite streak) on ring roads at
-      3 altitudes; cap similarly.
-- [ ] Steam vents from cooling towers (billboard sprite pool, upward drift,
-      fade); sparks from substations (tiny points, brief life).
-- [ ] Adaptive caps: `TRAFFIC` reads current FPS tier, scales pool sizes.
-- **Done-when:** city feels inhabited; killing perf budget never spawns more
-  than the tier allows; pools never allocate per frame.
+- **Test:** from street level drones visibly patrol and dock; count never
+      exceeds tier cap; no allocation per frame.
+- **Commit when:** drones verified on screen at the cap limit.
+
+#### M6.3 — Sky vehicles with light trails
+- [ ] Vehicles on ring roads at 3 altitudes, additive sprite-streak
+      trails; capped like drones.
+- **Test:** trails readable from all 3 altitudes; count never exceeds
+      tier cap.
+- **Commit when:** trails verified at each altitude.
+
+#### M6.4 — Steam vents + sparks
+- [ ] Steam vents from cooling towers (billboard sprite pool, upward
+      drift, fade); sparks from substations (tiny points, brief life).
+- **Test:** smoke screenshot shows steam + sparks at their source
+      buildings; both emitters idle-cheap in stats.
+- **Commit when:** screenshot + idle-cost check pass.
+
+#### M6.5 — Adaptive caps by FPS tier
+- [ ] `TRAFFIC` reads current FPS tier and scales all M6 pool sizes.
+- **Test:** forcing LOW tier in smoke run visibly halves caps; switching
+      back to HIGH restores; no frame spike on switch.
+- **Commit when:** tier-switch test passes.
+
+**Phase done-when:** city feels inhabited; caps never exceed tier;
+pools never allocate per frame.
 
 ### M7 — Particle & FX system
-- [ ] One pooled `Points`/sprite system: steam, sparks, pulse motes,
-      lightning motes, rain-of-energy (awakening).
-- [ ] `FX.pulse(origin, radius, color)` — expanding ring of light:
-      instanced ring mesh + light-intensity ramp + audio thump.
-- [ ] Animated electrical arcs: Line segments regenerated every N frames
-      between anchor points (substation → substation, creature → ring).
-- [ ] Screen-space flash: full-screen additive plane in a small overlay
-      scene (or DOM div) driven by `FX.flash(intensity)`.
-- [ ] Camera shake: impulse-decay system consumed by `CAMERA`.
-- **Done-when:** each effect has a manual trigger key (dev) and costs
-      nothing while idle.
+
+#### M7.1 — Pooled particle system
+- [ ] One pooled `Points`/sprite system covering: steam, sparks, pulse
+      motes, lightning motes, rain-of-energy (awakening).
+- **Test:** one dev trigger key rains all particle types; idle cost ~0
+      in stats.
+- **Commit when:** trigger key works and idle cost verified.
+
+#### M7.2 — `FX.pulse`
+- [ ] `FX.pulse(origin, radius, color)`: expanding instanced ring mesh +
+      light-intensity ramp (+ audio thump once M11.3 lands).
+- **Test:** manual key fires a visible pulse; zero allocation; zero
+      added draw calls while idle.
+- **Commit when:** pulse verified on key press.
+
+#### M7.3 — Animated electrical arcs
+- [ ] Line segments regenerated every N frames between anchor points
+      (substation → substation, creature → ring).
+- **Test:** manual key sparks arcs between two substations and
+      creature→ring; regeneration cost stays frame-cheap.
+- **Commit when:** arcs verified at both anchor types.
+
+#### M7.4 — Screen-space flash
+- [ ] Full-screen additive plane in a small overlay scene (or DOM div)
+      driven by `FX.flash(intensity)`.
+- **Test:** manual key flashes and decays to zero; nothing costs while
+      idle.
+- **Commit when:** flash verified.
+
+#### M7.5 — Impulse camera shake
+- [ ] Impulse-decay shake system consumed by `CAMERA`.
+- **Test:** manual key shakes camera, decays cleanly to still, never
+      accumulates under repeated triggers.
+- **Commit when:** shake verified.
+
+**Phase done-when:** every effect has a manual trigger key and costs
+nothing while idle.
 
 ### M8 — Atmosphere: night, fog, sky, light shafts
-- [ ] Night sky: gradient sky dome (shader or big sphere with canvas
-      texture), stars, faint aurora band.
-- [ ] Fog tuned for depth; city haze tinted by zone (cyan core / warm
-      avenues) via fog color lerp.
-- [ ] Volumetric-ish light shafts: a few additive cone/cylinder meshes
-      from key spires and the creature core (only when near or during
-      awakening).
-- [ ] Distant lightning: random far point + brief hemi intensity bump +
-      flash; electromagnetic discharge rings visible across the city.
-- **Done-when:** depth and mood are readable from street level; lightning
-      event is visible from inside the city.
+
+#### M8.1 — Night sky dome
+- [ ] Gradient sky dome (big sphere with canvas/shader texture), stars,
+      faint aurora band.
+- **Test:** night mood readable from street level; dome renders correct
+      from street, orbit, and far-fly cameras.
+- **Commit when:** sky verified from 3 camera distances.
+
+#### M8.2 — Fog depth + zone tint
+- [ ] Fog tuned for depth; haze tinted by zone (cyan core / warm avenues)
+      via fog color lerp.
+- **Test:** depth readable at 500 m; zone tint visible while flying
+      across zones.
+- **Commit when:** both verified on screen.
+
+#### M8.3 — Light shafts
+- [ ] A few additive cone/cylinder meshes from key spires and the
+      creature core; only when near or during awakening.
+- **Test:** shafts visible standing near a spire, absent far away (no
+      permanent draw calls).
+- **Commit when:** near/far toggle verified in stats.
+
+#### M8.4 — Distant lightning events
+- [ ] Random far point + brief hemi intensity bump + flash; EM discharge
+      rings visible across the city.
+- **Test:** lightning event (timer + manual key) visible from inside the
+      city.
+- **Commit when:** event verified from inside the city.
+
+**Phase done-when:** depth and mood readable from street level;
+lightning event visible from inside the city.
 
 ### M9 — Creature animation & awakening sequence (the climax)
-- [ ] Idle/dormant animation: slow tensor-ring rotation, antenna sway,
-      breathing core, occasional "dream" LED wave across the node grid
-      (shader-less: animate instance colors in waves).
-- [ ] Wake state machine: DORMANT → STIR (2 s: head lift, jaw, rings speed
-      up, hum rises) → AWAKE (10–20 s: full power) → DECAY → DORMANT.
-- [ ] Awakening beats, each with audio + FX:
-      1. Core eye flares (emissive ramp + light + flash)
-      2. Node voxels ignite in radial waves (instance color updates)
-      3. Tensor rings accelerate + tilt; limbs reposition (shake impulse)
-      4. Energy pulse ring launches from the plaza; city holo-signs and
-         building LEDs follow the wave (scheduled per-ring color ramps —
-         this is the "thousands of compute nodes illuminate")
-      5. Substation arcs fire; steam vents burst; drones scatter and some
-         re-route to the creature; sky vehicles change to avoidance paths
-      6. Unsloth easter egg reacts (M10)
-      7. Decay: waves dim outward, hum settles, one final pulse.
-- [ ] Manual trigger: key (e.g. `F`) + HUD button; also auto-plays once
-      ~30 s after intro for audience that doesn't press anything.
-- **Done-when:** a first-time viewer reads the sequence as a clear
-  narrative (dormant → stir → awake → pulse → settle) in ≤ 30 s.
+
+#### M9.1 — Idle/dormant animation
+- [ ] Slow tensor-ring rotation, antenna sway, breathing core, occasional
+      "dream" LED wave across the node grid (shader-less: animate
+      instance colors in waves).
+- **Test:** dream wave visibly sweeps the node grid on its timer; dormant
+      state stays dim and still-ish.
+- **Commit when:** wave verified on screen.
+
+#### M9.2 — Wake state machine
+- [ ] DORMANT → STIR (2 s: head lift, jaw, rings speed up) → AWAKE
+      (10–20 s) → DECAY → DORMANT, with per-state hooks.
+- **Test:** smoke test forces transitions in order, verifies clean
+      return to DORMANT and safe immediate re-trigger.
+- **Commit when:** state-machine test green.
+
+#### M9.3 — Awakening beats 1–3 (creature-level power)
+- [ ] Beat 1: core eye flares (emissive ramp + light + flash).
+- [ ] Beat 2: node voxels ignite in radial waves (instance color updates).
+- [ ] Beat 3: tensor rings accelerate + tilt; limbs reposition
+      (shake impulse).
+- **Test:** on manual trigger, beats 1–3 play in sequence with correct
+      timing (visual check + state timestamps in smoke run).
+- **Commit when:** beats 1–3 verified.
+
+#### M9.4 — Awakening beats 4–5 (city-level cascade)
+- [ ] Beat 4: energy pulse ring launches from the plaza; city holo-signs
+      and building LEDs follow the wave (scheduled per-ring color ramps —
+      the "thousands of compute nodes illuminate" moment).
+- [ ] Beat 5: substation arcs fire; steam vents burst; drones scatter and
+      some re-route to the creature; sky vehicles change to avoidance
+      paths.
+- **Test:** wave visibly travels ring by ring; traffic reacts (scatter /
+      re-route / avoidance all observed).
+- **Commit when:** cascade verified end-to-end.
+
+#### M9.5 — Awakening beats 6–7 + decay
+- [ ] Beat 6: Unsloth easter egg reacts (M10.3 hook).
+- [ ] Beat 7: decay — waves dim outward, hum settles, one final pulse,
+      back to DORMANT.
+- **Test:** full sequence ends in DORMANT with one final pulse;
+      re-trigger immediately works.
+- **Commit when:** full-sequence test passes.
+
+#### M9.6 — Triggers (manual + auto)
+- [ ] Manual: key (e.g. `F`) + HUD button. Auto: plays once ~30 s after
+      intro for audience that presses nothing.
+- **Test:** all three entry paths (key, button, auto) start the same
+      sequence exactly once; auto never re-fires.
+- **Commit when:** trigger test passes.
+
+**Phase done-when:** a first-time viewer reads the sequence as a clear
+narrative (dormant → stir → awake → pulse → settle) in ≤ 30 s.
 
 ### M10 — Unsloth easter egg (subtle, integrated)
-- [ ] Location: one side avenue, mid-distance — a voxel **neon sloth**
-      monument atop a compute tower + a rooftop "UNSLOTH" holo sign whose
-      tagline cycles ("local ≠ slow" / "why rush?").
-- [ ] A relaxed holographic sloth silhouette sits on the tower's antenna
-      arm, slowly breathing (billboard + canvas sprite, additive).
+
+#### M10.1 — Sloth monument + "UNSLOTH" sign
+- [ ] One side avenue, mid-distance: voxel **neon sloth** monument atop
+      a compute tower + rooftop "UNSLOTH" holo sign, tagline cycles
+      ("local ≠ slow" / "why rush?").
+- **Test:** monument + sign readable from street; tagline cycles; both
+      outside the default intro-reveal framing.
+- **Commit when:** verified on screen + framing check.
+
+#### M10.2 — Holographic sloth + sloth drones
+- [ ] Relaxed holographic sloth silhouette on the tower's antenna arm,
+      slow breathing (billboard + canvas sprite, additive).
 - [ ] 1–2 sloth-themed maintenance drones (extra slow, slightly larger,
-      soft pink light) patrol that street only.
-- [ ] Awakening reaction: sign flares, holograph brightens + does one slow
-      stretch animation, sloth drones rise to hover nearby for the pulse,
-      then resume patrolling.
+      soft pink light) patrolling that street only.
+- **Test:** holo sloth breathes; pink drones patrol only that street.
+- **Commit when:** both verified.
+
+#### M10.3 — Awakening reaction
+- [ ] Sign flares, holograph brightens + one slow stretch animation,
+      sloth drones rise to hover nearby for the pulse, then resume
+      patrolling.
 - [ ] Constraint: never competes with the creature in the default
       framing of the intro reveal; max ~5 % of attention budget.
-- **Done-when:** a local-LLM fan spots it within seconds and it feels
-  like it belongs to the world, not pasted on.
+- **Test:** reaction plays during AWAKE; everything returns to idle after
+      DECAY.
+- **Commit when:** reaction verified in a full awakening run.
+
+**Phase done-when:** a local-LLM fan spots it within seconds and it
+feels like it belongs to the world, not pasted on.
 
 ### M11 — Procedural audio (Web Audio only)
-- [ ] Master graph: compressor → gain (user mute) → destination.
-- [ ] Beds (looping, cheap):
-      - reactor hum: 2 detuned sines/triangles + sub sine, slow LFO
-      - fans: filtered noise loop, band-pass sweep
-      - distant machinery: filtered noise + random low thumps
-- [ ] Events: pulse thump (sine drop + noise hit), arc crackle (short
-      bursts of filtered noise), steam hiss, drone whirproximity (single
-      gain node panned by simple distance/angle).
-- [ ] Spatial-ish: one panner + distance gain for 2–3 nearest emitters;
-      everything else mixed into the ambient bed.
-- [ ] Starts only on user gesture (START button) — resume-safe.
-- **Done-when:** muting CPU audio costs nothing, and the mix is
-      identifiable as "machine city" within 3 seconds of audio.
+
+#### M11.1 — Master graph + gesture gate
+- [ ] Compressor → user-mute gain → destination; starts only on user
+      gesture (START button), resume-safe.
+- **Test:** no audio before gesture; mute key mutes everything; refresh /
+      re-entry safe, no errors.
+- **Commit when:** gate + mute verified.
+
+#### M11.2 — Looping beds
+- [ ] Reactor hum (2 detuned sines/triangles + sub sine, slow LFO); fans
+      (filtered noise loop, band-pass sweep); distant machinery (filtered
+      noise + random low thumps).
+- **Test:** beds run for minutes without audible repeats/bugs; mix
+      identifiable as "machine city" within 3 s.
+- **Commit when:** long-run listen test passes.
+
+#### M11.3 — Event sounds
+- [ ] Pulse thump (sine drop + noise hit), arc crackle (short filtered-
+      noise bursts), steam hiss, drone whir — wired to the M6–M9
+      emitters.
+- **Test:** each corresponding in-game event produces its sound; all
+      silent when muted; zero cost when idle.
+- **Commit when:** every event sound verified in-game.
+
+#### M11.4 — Spatial-ish mixing
+- [ ] One panner + distance gain for the 2–3 nearest emitters;
+      everything else folded into the ambient bed.
+- **Test:** walking past an emitter pans/attenuates it; cost stays
+      bounded in stats.
+- **Commit when:** spatial behavior verified.
+
+**Phase done-when:** muting audio costs nothing; mix identifiable as
+"machine city" within 3 seconds.
 
 ### M12 — Intro cinematic
-- [ ] Sequence (~12–15 s, skippable at any moment, START always visible
-      after 2 s):
-      1. Dark server corridor: near-black tunnel of LED strips rushing
-         by (procedural instanced wall + camera dolly)
-      2. Corridor opens → wide reveal dolly out over the city
-      3. Low orbit around the dormant creature (1.5 orbits)
-      4. Title card: `QWEN FLASH // AWAKENING` (DOM overlay, fades)
-      5. Lerp into player position at street level → gameplay.
-- [ ] Robustness: intro is a timeline of camera keyframes only —
-      pressing START/click/keypress at any point cancels it and drops
-      the camera to the street position with a 0.5 s fade; intro cannot
-      block the play state; no async resources in the timeline.
-- **Done-when:** intro finishes, skips, or is interrupted by clicking —
-  all three paths end in a controllable camera, zero console errors.
+
+#### M12.1 — Intro engine + corridor beat
+- [ ] Camera-keyframe timeline runner (no async resources anywhere).
+- [ ] Beat 1: dark server corridor — near-black tunnel of LED strips
+      rushing by (procedural instanced wall + camera dolly).
+- **Test:** corridor beat plays; timeline-runner smoke test: start,
+      cancel mid-way, re-seek — all clean, zero errors.
+- **Commit when:** engine + beat 1 verified.
+
+#### M12.2 — Beats 2–5: reveal, orbit, title, drop
+- [ ] Beat 2: corridor opens → wide reveal dolly out over the city.
+- [ ] Beat 3: low orbit around the dormant creature (1.5 orbits).
+- [ ] Beat 4: title card `QWEN FLASH // AWAKENING` (DOM overlay, fades).
+- [ ] Beat 5: lerp into player position at street level → gameplay.
+- **Test:** full ~12–15 s intro plays to a controllable street-level
+      camera.
+- **Commit when:** full intro verified end-to-end.
+
+#### M12.3 — Skip/cancel robustness
+- [ ] Skippable/cancellable at any moment (START/click/keypress) → 0.5 s
+      fade to street camera; START always visible after 2 s; intro can
+      never block the play state.
+- **Test:** finish / early-skip / late-interrupt — all three paths end
+      in a controllable camera with zero console errors.
+- **Commit when:** all three paths verified.
+
+**Phase done-when:** intro finishes, skips, or is interrupted — all
+paths end in a controllable camera, zero console errors.
 
 ### M13 — Emergent event director
-- [ ] Scheduler (weighted, cooldowns, min/max gap) firing ambient events:
-      - data pulse: light dot travels between two towers along a conduit
-        path, both ends flash (uses M7 cables)
-      - section power cycle: one ring chunk dims/brightens over 3–6 s
-        (per-chunk material color multiplier — cheap)
-      - cooling emergency: one cooling tower fans spin up, steam burst,
-        warning LEDs, drones dispatch, 20 s, resolves
-      - drone launch: a roof bay opens (animated panel), 2–4 drones fly
-        to patrol
-      - mechanical reposition: one giant fan/antenna/ring moves slowly
-        with rumble audio + tiny shake
-      - distant EM discharge: lightning far off + a few arcs in the city
-- [ ] Events are independent of, and compatible with, the awakening
-  sequence (during AWAKE only creature-priority events may fire).
-- **Done-when:** 3 minutes of idle play shows at least 4 different
-  events, none conflicting, none breaking perf.
+
+#### M13.1 — Scheduler core
+- [ ] Weighted picking, cooldowns, min/max gap, event registry,
+      one-at-a-time + priority rules.
+- **Test:** smoke test with a fixed random seed yields a legal firing
+      order — no overlaps, gaps respected, priorities held.
+- **Commit when:** scheduler test green.
+
+#### M13.2 — Ambient events A: data pulse + power cycle
+- [ ] Data pulse: light dot travels between two towers along a conduit
+      path, both ends flash (uses M7 cables).
+- [ ] Section power cycle: one ring chunk dims/brightens over 3–6 s
+      (per-chunk material color multiplier — cheap).
+- **Test:** both events fire and resolve cleanly on manual + scheduled
+      triggers; no leftover state.
+- **Commit when:** both verified.
+
+#### M13.3 — Ambient events B: cooling emergency + drone launch
+- [ ] Cooling emergency: one cooling tower fans spin up, steam burst,
+      warning LEDs, drones dispatch, ~20 s, resolves.
+- [ ] Drone launch: a roof bay opens (animated panel), 2–4 drones fly
+      to patrol.
+- **Test:** each event runs start→resolve with no leftover state; both
+      visible from street level.
+- **Commit when:** both verified.
+
+#### M13.4 — Ambient events C + awakening compatibility
+- [ ] Mechanical reposition: one giant fan/antenna/ring moves slowly
+      with rumble audio + tiny shake.
+- [ ] Distant EM discharge: lightning far off + a few arcs in the city.
+- [ ] Awakening compatibility: during AWAKE only creature-priority events
+      may fire.
+- **Test:** 3-minute idle play shows ≥ 4 different events, none
+      conflicting, none breaking perf; AWAKE-window rule respected.
+- **Commit when:** 3-min idle run + AWAKE rule verified.
+
+**Phase done-when:** 3 minutes of idle play shows at least 4 different
+events, none conflicting, none breaking perf.
 
 ### M14 — Performance, quality tiers, polish pass
-- [ ] Perf monitor: rolling FPS; tiers `HIGH / MED / LOW` (auto + manual).
+
+#### M14.1 — FPS monitor + quality tiers
+- [ ] Rolling FPS monitor; tiers `HIGH / MED / LOW` (auto + manual).
       Tiers scale: far-chunk LOD radius, particle caps, drone/vehicle
       counts, holo-sign texture updates, light shafts, audio beds.
-- [ ] Frustum + ring culling already structural; verify with stats.
-- [ ] HUD (small, corner, toggleable): FPS, visible instances, active
+- **Test:** forcing each tier in the smoke run keeps stats within budget;
+      no stutter on tier switch; frustum + ring culling verified via
+      stats.
+- **Commit when:** all three tiers verified.
+
+#### M14.2 — HUD stats
+- [ ] Small corner HUD, toggleable: FPS, visible instances, active
       drones, chunk id, AI state.
-- [ ] Polish: camera shake tuning, flash tuning, title fade, mute key
-      (`M`), help overlay (`H`), vignette via cheap DOM gradient.
-- [ ] Final pass: page refresh mid-game, tab-hide/resume (dt clamp),
-      window resize mid-awakening, gamepad plug/unplug — no errors,
-      no stuck states.
-- [ ] Manual 3-minute screen-recording run to verify the "wow" beats:
-      intro → reveal → idle life → manual awakening → easter egg reaction.
-- **Done-when:** on a modern gaming GPU the whole thing runs at a stable
-  frame rate through the awakening sequence at default quality.
+- **Test:** HUD values match measured stats; toggle hides it; hidden HUD
+      costs nothing.
+- **Commit when:** values cross-checked.
+
+#### M14.3 — Polish pass
+- [ ] Camera shake tuning, flash tuning, title fade, mute key (`M`),
+      help overlay (`H`), vignette via cheap DOM gradient.
+- **Test:** each control verified working; short feel pass recorded.
+- **Commit when:** polish checklist green.
+
+#### M14.4 — Robustness pass
+- [ ] Page refresh mid-game, tab-hide/resume (dt clamp), window resize
+      mid-awakening, gamepad plug/unplug — no errors, no stuck states.
+- **Test:** robustness checklist in the smoke run fully green.
+- **Commit when:** checklist green.
+
+#### M14.5 — Final verification run
+- [ ] Manual 3-minute screen-recording run: intro → reveal → idle life →
+      manual awakening → easter egg reaction.
+- **Test:** recording reviewed — stable frame rate through the awakening
+      sequence at default quality on a modern gaming GPU.
+- **Commit when:** recording approved + final tag.
+
+**Phase done-when:** on a modern gaming GPU the whole thing runs at a
+stable frame rate through the awakening sequence at default quality.
 
 ---
 

@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-09-15T05:12:40.042Z._
+_Auto-generated. Last updated 2026-09-15T05:39:52.643Z._
 
 - [entity-system-m5](pages/entity-system-m5.md) — category: decision | tags: [entity, m5, creature, instancing] | ENTITY is the 6th system in the fixed boot order (INPUT → CAMERA → KIT → WORLD → **ENTITY** → HUD), registered between WORLD and HUD in `ind
 - [m2-material-kit](pages/m2-material-kit.md) — category: decision | tags: [kit, materials, draw-calls, three] | M2's `KIT` system is the shared foundation every later visual milestone builds on:
