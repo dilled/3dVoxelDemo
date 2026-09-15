@@ -45,7 +45,7 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
 | **M2** ✅ | Procedural voxel material kit: shared materials, canvas-texture helpers (LED grid, holo signs, glow sprites), instanced box/cylinder + merged-geometry builders, lighting rig | Kit renders a test wall/tower with animated LED faces and signs at < 10 draw calls |
 | **M3** ✅ | Chunked city generation (far layer): seeded PRNG, city grid, 16×16 block chunks generated/unbuilt around player, weighted archetypes, 3-ring distance LOD | City extends beyond initial view, no visible duplication, draw calls flat as you fly out |
 | **M4** ✅ | Building detail passes (near layer): 5 pooled detail InstancedMeshes per near chunk (fans, dishes, pulses, holo signs, LED facades), per-archetype detail on the M3 mass, per-building seeded salt, ring-2 silhouette stays zero-detail | Every archetype readable from 50–200 m and procedurally varied; draw calls flat (32 near) |
-| **M5** | The Qwen machine-creature (dormant): plaza pedestal, full creature build from primitives, named rig parts, dormant breathing/idle state, instanced compute-node voxels | Reads as "dormant colossal machine" from street level; silhouette holds from 3 camera distances |
+| **M5** ✅ | The Qwen machine-creature (dormant): plaza pedestal, full creature build from primitives, named rig parts, dormant breathing/idle state, instanced compute-node voxels | Reads as "dormant colossal machine" from street level; silhouette holds from 3 camera distances |
 | **M6** | Traffic & ambient life (pooled): object pools, maintenance drones, sky vehicles with light trails, steam/spark emitters, FPS-tier adaptive caps | City feels inhabited; caps never exceed tier; pools never allocate per frame |
 | **M7** | Particle & FX system: pooled points/sprites, `FX.pulse`, animated electrical arcs, screen-space flash, impulse camera shake | Each effect has a manual trigger key and costs nothing while idle |
 | **M8** | Atmosphere: night sky dome, stars, aurora, zone-tinted fog, volumetric-ish light shafts, distant lightning events | Depth and mood readable from street level; lightning event visible from inside the city |
@@ -134,20 +134,25 @@ awakening of a colossal AI machine-creature, with an integrated "UNSLOTH" easter
   dish=8, ring-2 all zero, byte-identical regen, fans+pulses animate,
   32 draw calls near — flat vs M3).
 
-### M5 — The Qwen machine-creature (dormant)
-- [ ] Central plaza: darkened mega-core pedestal, creature ~ several
+### M5 — The Qwen machine-creature (dormant) ✅
+- [x] Central plaza: darkened mega-core pedestal, creature ~ several
       buildings tall, built from: server-tower torso, cooling-tower
       shoulders, glowing compute-core head/face, mechanical limbs,
       antennas, rotating tensor torus rings (idle: almost still, dim).
-- [ ] Named rig parts with transform roots so M9 can animate them
+- [x] Named rig parts with transform roots so M9 can animate them
       (`head`, `jaw`, `coreEye`, `ringA..C`, `armL/R`, `spine`, `antenna*`).
-- [ ] Dormant state: slow breathing scale on the core, 1 % dim LEDs,
-      minimal particle drip (steam), faint heartbeat audio (M11).
-- [ ] Thousands of compute-node voxels (single InstancedMesh, per-instance
+- [x] Dormant state: slow breathing scale on the core, 1 % dim LEDs,
+      minimal particle drip (steam) — heartbeat audio stays in M11.
+- [x] Thousands of compute-node voxels (single InstancedMesh, per-instance
       color + emissive via color) arranged on torso/rings — the nodes that
       will ignite at awakening.
 - **Done-when:** the creature reads as "dormant colossal machine" from
-      street level; silhouette holds from 3 camera distances.
+  street level; silhouette holds from 3 camera distances — verified:
+  street-close + street-full + mid + far screenshots in `smoke/shots/`
+  (`m5-*.png`); smoke M5 section green (2,132 node voxels on one
+  InstancedMesh, all named rig parts, breathing/ring-spin/eye-pulse
+  animate, node matrices static, steam drip animates, 37 draw calls
+  with the creature — flat vs M4).
 
 ### M6 — Traffic & ambient life (pooled)
 - [ ] Object pools: drones, sky vehicles, steam puffs, sparks, cable

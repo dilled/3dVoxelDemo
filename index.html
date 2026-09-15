@@ -1923,9 +1923,455 @@ const WORLD = {
 
 };
 
+/* ==================================================================== *
+ * ENTITY — the Qwen machine-creature, DORMANT (M5)
+ *
+ *  - central plaza (WORLD keeps ±2 blocks clear): darkened mega-core
+ *    pedestal + a colossal machine ~65 m tall (several buildings high)
+ *  - built from primitives only: server-tower torso, cooling-tower
+ *    shoulders, glowing compute-core head/face, mechanical limbs,
+ *    antennas, three rotating tensor torus rings (idle: almost still,
+ *    dim)
+ *  - named rig parts with transform roots so M9 can animate them:
+ *    pedestal, spine, torso, head, jaw, coreEye, ringA..C, armL/armR,
+ *    shoulderL/R, antenna1..4 (head group → jaw/coreEye pivot off it)
+ *  - dormant state: slow breathing scale on the core, ~1 % dim node
+ *    LEDs, minimal steam drip (pooled points, 32 puffs, 4 vents),
+ *    hero point light #0 claimed for the dim core glow (the heartbeat
+ *    audio itself is M11)
+ *  - thousands of compute-node voxels: ONE InstancedMesh with
+ *    per-instance color (unlit material ⇒ the color IS the emissive);
+ *    these are the nodes that ignite at awakening (M9)
+ * --------------------------------------------------------------------- */
+const ENTITY = {
+  name: 'ENTITY',
+  state: 'DORMANT',                 // M9 extends: DORMANT → STIR → AWAKE → DECAY
+  root: null,
+  parts: {},
+  core: null,                       // breathing group (torso/head/jaw/coreEye)
+  nodes: null,                     // single InstancedMesh (thousands of nodes)
+  nodeCount: 0,
+  ringSpin: [0.06, -0.045, 0.035], // rad/s idle — "almost still, dim"
+  _steam: null,
+  _steamPars: null,
+  _coreA: new THREE.Color(0x173d52),
+  _coreB: new THREE.Color(0x3f96cc),
+  _col: new THREE.Color(),
+
+  init() {
+    const R = new THREE.Group();
+    R.name = 'ENTITY-root';
+    scene.add(R);
+    ENTITY.root = R;
+    const P = ENTITY.parts;
+    const merge = parts => KIT.mergeGeometries(parts);
+    const box = (w, h, d, x, y, z) => ({
+      geo: new THREE.BoxGeometry(w, h, d),
+      matrix: new THREE.Matrix4().makeTranslation(x, y, z),
+    });
+    const cyl = (r, h, x, y, z, seg = 14) => ({
+      geo: new THREE.CylinderGeometry(r, r, h, seg),
+      matrix: new THREE.Matrix4().makeTranslation(x, y, z),
+    });
+    /* dedicated hero body mass: Standard, faint blue emissive lift so the
+     * silhouette volume reads on key-light-opposite faces (night scene) */
+    const matBody = new THREE.MeshStandardMaterial({
+      color: 0x5b6b82, roughness: 0.5, metalness: 0.7,
+      emissive: 0x0a1826, emissiveIntensity: 0.5,
+    });
+    const matPed = new THREE.MeshLambertMaterial({ color: 0x141c2a });
+    const matRing = new THREE.MeshBasicMaterial({ color: 0x1d4c60 });
+    const matTip = MATS.pulseGlow.clone();
+    matTip.color.set(0x2a6d8c);
+    const matEye = new THREE.MeshBasicMaterial({ color: 0x1f4f66 });
+
+    /* ---- pedestal: darkened mega-core platform, 3 steps (0 → 5.6 m) ---- */
+    const ped = new THREE.Mesh(
+      merge([
+        cyl(21, 2, 0, 1, 0, 28),
+        cyl(17.5, 2, 0, 3, 0, 24),
+        cyl(14, 1.6, 0, 4.8, 0, 20),
+      ]),
+      matPed,
+    );
+    ped.name = 'pedestal';
+    P.pedestal = ped;
+    R.add(ped);
+
+    /* ---- spine: pelvis / waist / lower back (5.6 → 18.6 m) ---- */
+    const spine = new THREE.Mesh(
+      merge([
+        box(10, 4, 9, 0, 7.6, 0),
+        box(8.5, 4.4, 8, 0, 11.8, 0),
+        box(7.5, 4.6, 7.5, 0, 16.3, 0),
+      ]),
+      matBody,
+    );
+    spine.name = 'spine';
+    P.spine = spine;
+    R.add(spine);
+
+    /* ---- core: the breathing group (torso mass + face panels + head) ---- */
+    const core = new THREE.Group();
+    core.name = 'ENTITY-core';
+    P.core = core;
+    ENTITY.core = core;
+    R.add(core);
+
+    /* torso: server-tower mass (18.6 → 43.6 m) */
+    const torso = new THREE.Mesh(
+      merge([
+        box(14, 8, 14, 0, 22.6, 0),
+        box(12, 9, 12, 0, 31.1, 0),
+        box(9.5, 5, 9.5, 0, 38.1, 0),
+        box(4.5, 3, 4.5, 0, 42.1, 0),
+      ]),
+      matBody,
+    );
+    torso.name = 'torso';
+    P.torso = torso;
+    core.add(torso);
+
+    /* emissive data-panel bands on the torso facades (dim, Lambert) */
+    const chest = new THREE.Mesh(
+      merge([
+        box(11, 6.2, 0.3, 0, 31.1, 6.1),
+        box(11, 6.2, 0.3, 0, 31.1, -6.1),
+        box(8.9, 3.6, 0.3, 0, 38.1, 4.82),
+        box(8.9, 3.6, 0.3, 0, 38.1, -4.82),
+      ]),
+      MATS.server,
+    );
+    chest.name = 'chestPanels';
+    core.add(chest);
+
+    /* head: skull + brow + crown, pivot at the neck (43.6 m) */
+    const head = new THREE.Group();
+    head.position.set(0, 43.6, 0);
+    head.name = 'head';
+    P.head = head;
+    const skull = new THREE.Mesh(
+      merge([
+        box(8, 7, 8, 0, 3.5, 0),
+        box(8.2, 1.6, 8.2, 0, 4.9, 0),
+        box(6, 2, 6, 0, 6.6, 0),
+      ]),
+      matBody,
+    );
+    skull.name = 'head-mass';
+    head.add(skull);
+
+    /* coreEye: the glowing compute-core face (unlit — color IS emissive) */
+    const eye = new THREE.Mesh(new THREE.BoxGeometry(5.2, 1.8, 0.8), matEye);
+    eye.position.set(0, 3.6, 4.0);
+    eye.name = 'coreEye';
+    P.coreEye = eye;
+    head.add(eye);
+    core.add(head);
+
+    /* jaw: hinged under the head, pivot at its top edge */
+    const jaw = new THREE.Group();
+    jaw.position.set(0, 44.4, 2.2);
+    jaw.name = 'jaw';
+    P.jaw = jaw;
+    const jawMesh = new THREE.Mesh(new THREE.BoxGeometry(4.5, 2.2, 5.5), matBody);
+    jawMesh.position.set(0, -1.1, -0.2);
+    jawMesh.name = 'jaw-mass';
+    jaw.add(jawMesh);
+    core.add(jaw);
+
+    /* ---- shoulders: cooling-tower masses, base at 30 m ---- */
+    for (const side of [-1, 1]) {
+      const sh = new THREE.Group();
+      sh.position.set(side * 12.5, 30, 0);
+      sh.name = side < 0 ? 'shoulderL' : 'shoulderR';
+      P[side < 0 ? 'shoulderL' : 'shoulderR'] = sh;
+      const m = new THREE.Mesh(
+        merge([
+          box(10.5, 1.6, 10.5, 0, 0.8, 0),
+          cyl(5, 8, 0, 4, 0, 18),
+          cyl(3.2, 1.8, 0, 8.9, 0, 14),
+        ]),
+        matBody,
+      );
+      m.name = sh.name + '-mass';
+      sh.add(m);
+      R.add(sh);
+    }
+
+    /* ---- arms: mechanical limbs hanging from the shoulders ---- */
+    for (const side of [-1, 1]) {
+      const arm = new THREE.Group();
+      arm.position.set(side * 12.8, 37.5, 0.3);
+      arm.name = side < 0 ? 'armL' : 'armR';
+      P[side < 0 ? 'armL' : 'armR'] = arm;
+      const x = side * 0.8;           // slight outward slant (local +x)
+      const m = new THREE.Mesh(
+        merge([
+          box(5, 1.4, 5, x * 0.5, 0.4, 0),             // shoulder pad
+          box(3.6, 10, 3.6, x, -4.5, 0),               // upper arm  37→27
+          cyl(1.8, 2, x, -10.6, 0, 10),               // elbow       ~26.9
+          box(3, 8.5, 3, x * 1.5, -14.2, 0),          // forearm    26.5→18
+          box(3.4, 3, 3.4, x * 1.7, -18.6, 0),        // hand       18→15.2
+          box(1.2, 1.2, 1.2, x * 1.7 - 1.1, -20.6, 0.8),
+          box(1.2, 1.2, 1.2, x * 1.7 + 1.1, -20.6, 0.8),
+        ]),
+        matBody,
+      );
+      m.name = arm.name + '-mass';
+      arm.add(m);
+      R.add(arm);
+    }
+
+    /* ---- antennas: 2 head masts + 2 shoulder masts, glow tips ---- */
+    const antSpecs = [
+      { name: 'antenna1', x: -2.3, y: 52.6, z: -1.6, h: 12 },
+      { name: 'antenna2', x: 2.3, y: 52.6, z: -1.6, h: 12 },
+      { name: 'antenna3', x: -15.4, y: 39.8, z: -3.4, h: 8 },
+      { name: 'antenna4', x: 15.4, y: 39.8, z: -3.4, h: 8 },
+    ];
+    for (const a of antSpecs) {
+      const g = new THREE.Group();
+      g.position.set(a.x, a.y, a.z);
+      g.name = a.name;
+      P[a.name] = g;
+      const mast = new THREE.Mesh(cyl(0.45, a.h, 0, a.h / 2, 0, 8).geo, MATS.cable);
+      mast.name = a.name + '-mast';
+      g.add(mast);
+      const tip = new THREE.Mesh(new THREE.BoxGeometry(1.1, 1.1, 1.1), matTip);
+      tip.position.set(0, a.h + 0.4, 0);
+      tip.name = a.name + '-tip';
+      g.add(tip);
+      R.add(g);
+    }
+
+    /* ---- tensor torus rings around the head (idle: almost still, dim) */
+    const ringSpecs = [
+      { name: 'ringA', y: 46.8, R: 8.5, tube: 0.45, ex: 1.25, ey: 0 },
+      { name: 'ringB', y: 43, R: 11, tube: 0.4, ex: -1.3, ey: 0.55 },
+      { name: 'ringC', y: 33, R: 14.5, tube: 0.35, ex: 1.52, ey: -0.4 },
+    ];
+    ENTITY._ringBaseQ = [];
+    for (let i = 0; i < ringSpecs.length; i++) {
+      const s = ringSpecs[i];
+      const g = new THREE.Group();
+      g.position.set(0, s.y, 0);
+      g.name = s.name;
+      P[s.name] = g;
+      const m = new THREE.Mesh(new THREE.TorusGeometry(s.R, s.tube, 10, 48), matRing);
+      m.name = s.name + '-mass';
+      g.add(m);
+      const base = new THREE.Quaternion()
+        .setFromEuler(new THREE.Euler(s.ex, s.ey, 0));
+      g.quaternion.copy(base);
+      m.rotation.z = 0;
+      ENTITY._ringBaseQ.push(base);
+      R.add(g);
+    }
+
+    /* ---- compute-node voxels: ONE InstancedMesh, per-instance color ---- */
+    const N = KIT.InstancedBox(4200, [1, 1, 1],
+      new THREE.MeshBasicMaterial({ color: 0xffffff }));
+    N.mesh.name = 'computeNodes';
+    ENTITY.nodes = N.mesh;
+    R.add(N.mesh);
+    ENTITY._placeNodes(N);
+    ENTITY.nodeCount = N.count;
+
+    /* ---- steam drip: 32 pooled puffs from 4 vents (minimal, dormant) ---- */
+    const vents = [
+      [-12.5, 39.9, 0], [12.5, 39.9, 0],          // shoulder cooling caps
+      [-4.5, 40.7, 2.6], [4.5, 40.7, -2.6],       // chest vents
+    ];
+    const rng = ENTITY._mulb();
+    const nP = 32;
+    const pos = new Float32Array(nP * 3);
+    const col = new Float32Array(nP * 3);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    const pts = new THREE.Points(geo, new THREE.PointsMaterial({
+      size: 2.6, sizeAttenuation: true, map: KIT.tex.glow.tex,
+      transparent: true, depthWrite: false,
+      blending: THREE.AdditiveBlending, vertexColors: true,
+    }));
+    pts.name = 'steamDrip';
+    pts.frustumCulled = false;
+    P.steam = pts;
+    R.add(pts);
+    ENTITY._steam = pts;
+    ENTITY._steamPars = Array.from({ length: nP }, (_, i) => ({
+      vent: i % vents.length,
+      off: rng() * 12,
+      life: 6 + rng() * 4,
+      ph: rng() * 6.28,
+      v: vents[i % vents.length],
+    }));
+
+    /* claim hero point light #0 for the dormant core glow
+     * (#1 stays reserved for the M9 awakening flare) */
+    const hero = KIT.heroLights[0];
+    hero.color.set(0x6fd8ff);
+    hero.position.set(0, 47.2, 5.5);
+    ENTITY._hero = hero;
+  },
+
+  /* seeded rng — the node layout is deterministic (smoke regenerates it) */
+  _mulb() {
+    return WORLD.mulberry(CFG.city.seed ^ 0x51A7E5);
+  },
+
+  /* thousands of node voxels on torso / spine / head faces, ring bands,
+   * pedestal rims, shoulders, arms — dormant: ~1 % dim, static (no
+   * per-frame upload; M9 animates these via instance color). */
+  _placeNodes(N) {
+    const rng = ENTITY._mulb();
+    const add = (x, y, z) => {
+      if (N.count >= N.capacity) return;
+      const s = 0.62 + rng() * 0.4;
+      const roll = rng();
+      let c;
+      if (roll < 0.05) c = [1, 0.62, 0.32];      // dim amber
+      else if (roll < 0.78) c = [0.32, 0.85, 1]; // dim cyan
+      else c = [0.55, 0.62, 1];                  // dim blue-violet
+      let b = 0.018 + rng() * 0.055;          // dormant dimness (~1 %)
+      if (rng() < 0.07) b = 0.004;            // dead node
+      N.add(x, y, z, [s, s, s], ENTITY._col
+        .setRGB(c[0], c[1], c[2]).multiplyScalar(b).getHex());
+    };
+    /* face grid: `u` span along the face, y0..y1, offset from center,
+     * axis 'x' ⇒ face normal ±X (span runs along Z), 'z' ⇒ normal ±Z */
+    const face = (axis, off, u, y0, y1, s, skip, pred) => {
+      const nu = Math.max(1, Math.floor(u / s));
+      const nv = Math.max(1, Math.floor((y1 - y0) / s));
+      for (let i = 0; i < nu; i++) {
+        const pu = -u / 2 + (i + 0.5) * s;
+        for (let j = 0; j < nv; j++) {
+          const py = y0 + (j + 0.5) * s;
+          if (pred && !pred(pu, py)) continue;
+          if (rng() < skip) continue;
+          if (axis === 'z') add(pu, py, off);
+          else add(off, py, pu);
+        }
+      }
+    };
+    /* torso / spine / head facades (±X and ±Z of each stack tier) */
+    face('z', 7.35, 14, 18.9, 26.3, 0.7, 0.18);
+    face('x', 7.35, 14, 18.9, 26.3, 0.7, 0.18);
+    face('z', 6.35, 12, 26.9, 35.3, 0.65, 0.18);
+    face('x', 6.35, 12, 26.9, 35.3, 0.65, 0.18);
+    face('z', 4.85, 9.5, 35.9, 40.3, 0.6, 0.18);
+    face('x', 4.85, 9.5, 35.9, 40.3, 0.6, 0.18);
+    const eyeBlock = (pu, py) =>
+      !(Math.abs(pu) < 3.4 && py > 45.6 && py < 49.0);
+    face('z', 4.4, 8, 44.0, 50.2, 0.6, 0.18, eyeBlock);
+    face('z', -4.4, 8, 44.0, 50.2, 0.6, 0.18);
+    face('x', 4.4, 8, 44.0, 50.2, 0.6, 0.18);
+    face('x', -4.4, 8, 44.0, 50.2, 0.6, 0.18);
+    /* spine tiers (slightly inset per tier) */
+    face('z', 4.85, 10, 5.9, 9.3, 0.8, 0.18);
+    face('x', 5.35, 9, 5.9, 9.3, 0.8, 0.18);
+    face('z', 4.6, 8.5, 9.9, 13.3, 0.8, 0.18);
+    face('x', 4.6, 8, 9.9, 13.3, 0.8, 0.18);
+    face('z', 4.1, 7.5, 13.9, 18.3, 0.8, 0.18);
+    face('x', 4.1, 7.5, 13.9, 18.3, 0.8, 0.18);
+    /* circle of nodes: n evenly spaced (seeded jitter), radius r at y */
+    const circle = (r, y, n) => {
+      for (let i = 0; i < n; i++) {
+        const a = (i + 0.5) * 6.2832 / n + (rng() - 0.5) * 0.1;
+        if (rng() < 0.22) continue;
+        add(Math.cos(a) * r, y + (rng() - 0.5) * 0.2, Math.sin(a) * r);
+      }
+    };
+    /* pedestal rims */
+    circle(13.3, 5.62, 120);
+    circle(16.8, 3.02, 136);
+    circle(20.3, 1.02, 148);
+    /* tensor-ring node bands (match the ring planes, radius ≈ ring R) */
+    for (let i = 0; i < 3; i++) {
+      const s = [
+        { y: 46.8, R: 8.5, ex: 1.25, ey: 0 },
+        { y: 43, R: 11, ex: -1.3, ey: 0.55 },
+        { y: 33, R: 14.5, ex: 1.52, ey: -0.4 },
+      ][i];
+      const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(s.ex, s.ey, 0));
+      const X = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
+      const Y = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+      const n = i === 0 ? 64 : i === 1 ? 84 : 104;
+      for (let k = 0; k < n; k++) {
+        const a = (k + 0.5) * 6.2832 / n + (rng() - 0.5) * 0.12;
+        if (rng() < 0.15) continue;
+        const c = 0.92 + rng() * 0.16;
+        add(
+          (X.x * Math.cos(a) + Y.x * Math.sin(a)) * s.R * c,
+          s.y + (X.y * Math.cos(a) + Y.y * Math.sin(a)) * s.R * c,
+          (X.z * Math.cos(a) + Y.z * Math.sin(a)) * s.R * c,
+        );
+      }
+    }
+    /* shoulder caps + arm columns (outer + front per arm) + crown */
+    circle(2.6, 39.95, 26);
+    for (const side of [-1, 1]) {
+      for (const [ox, oz] of [[side * 15.3, 0.35], [side * 13.2, 1.95]]) {
+        for (let y = 16; y < 36; y += 0.85) {
+          if (rng() < 0.15) continue;
+          add(ox + (rng() - 0.5) * 0.5, y, oz + (rng() - 0.5) * 0.5);
+        }
+      }
+    }
+    circle(3.1, 51.7, 24);
+    circle(2.2, 52.65, 18);
+    N.commit();
+  },
+
+  update(dt, t) {
+    /* breathing: slow scale on the core (period ≈ 10.5 s) */
+    const br = 1 + 0.008 * Math.sin(t * 0.6);
+    ENTITY.core.scale.setScalar(br);
+    /* coreEye: faint dormant pulse of the compute-core face */
+    const k = 0.5 + 0.5 * Math.sin(t * 0.6);
+    ENTITY._hero.intensity = 0.9 + 0.3 * k;
+    if (ENTITY.parts.coreEye) {
+      ENTITY._col.copy(ENTITY._coreA).lerp(ENTITY._coreB, 0.35 * k);
+      ENTITY.parts.coreEye.material.color.copy(ENTITY._col);
+    }
+    /* tensor rings: almost-still idle spin (absolute angle ⇒ deterministic) */
+    const rings = ['ringA', 'ringB', 'ringC'];
+    for (let i = 0; i < 3; i++) {
+      const g = ENTITY.parts[rings[i]];
+      if (g) g.children[0].rotation.z = t * ENTITY.ringSpin[i];
+    }
+    /* steam drip: 32 pooled puffs, 4 vents — rises, drifts, fades, re-enters */
+    const pts = ENTITY._steam;
+    if (pts) {
+      const pos = pts.geometry.attributes.position.array;
+      const col = pts.geometry.attributes.color.array;
+      const pars = ENTITY._steamPars;
+      for (let i = 0; i < pars.length; i++) {
+        const p = pars[i];
+        const age = (((t + p.off) % p.life) / p.life);   // 0..1, loops
+        const rise = age * 7;
+        const sway = 0.45 * age;
+        const x = p.v[0] + Math.sin(t * 0.7 + p.ph) * sway;
+        const y = p.v[1] + rise;
+        const z = p.v[2] + Math.cos(t * 0.6 + p.ph) * sway * 0.8;
+        pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z;
+        const a = Math.sin(age * Math.PI) * 0.32;
+        col[i * 3] = 0.55 * a; col[i * 3 + 1] = 0.65 * a; col[i * 3 + 2] = 0.75 * a;
+      }
+      pts.geometry.attributes.position.needsUpdate = true;
+      pts.geometry.attributes.color.needsUpdate = true;
+    }
+  },
+
+  dispose() {
+    if (ENTITY.root) scene.remove(ENTITY.root);
+  },
+};
+
 /* ------------------------------------------------------------------ *
  * Subsystems — FIXED BOOT ORDER = registration order.
- * M0: HUD   M1: INPUT, CAMERA   M2: KIT   M3: WORLD
+ * M0: HUD   M1: INPUT, CAMERA   M2: KIT   M3: WORLD   M5: ENTITY
  * ------------------------------------------------------------------ */
 const systems = [];
 function registerSystem(sys) {
@@ -1964,6 +2410,7 @@ const HUD = {
         HUD.el.textContent =
           `FPS ${String(Math.round(HUD.fps)).padStart(2, ' ')}\n` +
           `STATE ${BOOT.state}\n` +
+          `AI ${ENTITY.state}\n` +
           `CAM ${mode} · FOV ${Math.round(camera.fov)} · ${mouse} · ${pad}`;
         HUD.el.style.whiteSpace = 'pre';
       }
@@ -1975,6 +2422,7 @@ registerSystem(INPUT);
 registerSystem(CAMERA);
 registerSystem(KIT);
 registerSystem(WORLD);
+registerSystem(ENTITY);
 registerSystem(HUD);
 for (const s of systems) if (s.init) s.init();
 
@@ -2036,6 +2484,7 @@ window.SIM = {
   CAMERA,
   KIT,
   WORLD,
+  ENTITY,
   HUD,
   CFG,
   renderer,

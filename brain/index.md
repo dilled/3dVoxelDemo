@@ -1,7 +1,8 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-09-15T03:42:50.770Z._
+_Auto-generated. Last updated 2026-09-15T05:12:40.042Z._
 
+- [entity-system-m5](pages/entity-system-m5.md) — category: decision | tags: [entity, m5, creature, instancing] | ENTITY is the 6th system in the fixed boot order (INPUT → CAMERA → KIT → WORLD → **ENTITY** → HUD), registered between WORLD and HUD in `ind
 - [m2-material-kit](pages/m2-material-kit.md) — category: decision | tags: [kit, materials, draw-calls, three] | M2's `KIT` system is the shared foundation every later visual milestone builds on:
 - [near-layer-detail-pass](pages/near-layer-detail-pass.md) — category: decision | tags: [m4, detail, instancing] | ## Decision
 - [pi-runner-plan-format](pages/pi-runner-plan-format.md) — category: decision | tags: [plan, pi-runner, formatting] | The `## Milestones` section of `PLAN.md` must use the same format as `.

@@ -2,12 +2,12 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-09-15T06:50:46"
+updated: "2026-09-15T08:13:04"
 ---
 
 # Roadmap
 
-Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status below; M0–M4 done and smoke-verified headless (M4: near-layer detail pass, see [[near-layer-detail-pass]]).
+Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status below; M0–M5 done and smoke-verified headless (M5: dormant Qwen machine-creature, see [[entity-system-m5]]).
 
 ```mermaid
 gantt
@@ -22,7 +22,7 @@ gantt
   M3 chunked city far layer :done, m3, after m2, 3d
   M4 building detail passes :done, m4, after m3, 3d
   section Creature & life
-  M5 Qwen creature dormant :m5, after m4, 3d
+  M5 Qwen creature dormant :done, m5, after m4, 3d
   M6 traffic + ambient life :m6, after m5, 2d
   M7 particles + FX :m7, after m6, 2d
   section Climax
@@ -35,10 +35,3 @@ gantt
   M13 emergent event director :m13, after m12, 3d
   M14 perf, tiers, polish :m14, after m13, 3d
 ```
-
-## Notes
-
-- M3 landed `WORLD`: mulberry32-seeded 16×16-block chunks in a 5×5 keep-set, 8 weighted archetypes, 3 LOD rings, ≤ 3 instanced draw calls per chunk with frustum culling — the M2 gate test rig is absorbed inside the city (keep-out at (0,0,-80)).
-- M4 added the near-layer detail pass: five pooled detail InstancedMesh per ring 0/1 chunk (fan / dish / pulse / sign / LED window), per-building seeded salt, fair two-pass LED facade allocation, ring-2 silhouette stays zero-detail; 32 draw calls near, byte-identical regen preserved.
-- The central plaza (±2 blocks) is reserved for the M5 creature pedestal.
-- Hero point lights are reserved in `KIT.heroLights` (intensity 0) for M5/M9/M11.

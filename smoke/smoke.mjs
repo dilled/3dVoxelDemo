@@ -14,7 +14,8 @@
  *     START works again
  *
  *   M1 checks:
- *   - systems registry boots in fixed order (INPUT, CAMERA, KIT, HUD)
+ *   - systems registry boots in fixed order
+ *     (INPUT, CAMERA, KIT, WORLD, ENTITY, HUD)
  *   - no gamepad: loop stays clean, camera holds still, nothing throws
  *   - fake gamepad: left-stick forward moves the camera
  *   - keyboard: W moves forward, Space rises, Shift sprints (no throw)
@@ -49,6 +50,18 @@
  *   - fans rotate and pulses animate; per-mesh culling bounds are
  *     instance-aware (contain every instance they describe)
  *   - total draw calls stay inside budget with the detail pass on
+ *
+ *   M5 checks:
+ *   - ENTITY registered in the fixed order after WORLD; named rig parts
+ *     (pedestal, spine, torso, head, jaw, coreEye, ringA..C, armL/R,
+ *     shoulderL/R, antenna1..4) exist as transform roots (M9-ready)
+ *   - thousands of compute-node voxels on ONE InstancedMesh with
+ *     per-instance color
+ *   - dormant behaviour: slow breathing scale on the core, idle ring
+ *     spin, dim coreEye pulse, static node matrices (no per-frame
+ *     upload), minimal steam drip (32 pooled puffs, 4 vents)
+ *   - draw calls stay inside budget with the creature in the scene
+ *   - street/mid/far silhouette screenshots (shots/m5-*.png)
  *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
@@ -250,11 +263,12 @@ try {
     }));
   }
 
-  /* ---- 6a. Fixed-order systems registry ---- */
+  /* ---- 6a. Fixed-order systems registry (M5 adds ENTITY after WORLD) ---- */
   {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
-      JSON.stringify(names) === JSON.stringify(['INPUT', 'CAMERA', 'KIT', 'WORLD', 'HUD']),
+      JSON.stringify(names) === JSON.stringify(
+        ['INPUT', 'CAMERA', 'KIT', 'WORLD', 'ENTITY', 'HUD']),
       names.join(', '));
   }
 
@@ -415,12 +429,19 @@ try {
       `mats=${kit.mats}`);
 
     // The M2 gate measures the KIT test wall/tower alone: hide the M3
-    // city for a frame or two, read the draw-call count, show it again.
-    await page.evaluate(() => { window.SIM.WORLD.root.visible = false; });
+    // city + M5 creature for a frame or two, read the draw-call count,
+    // show it again.
+    await page.evaluate(() => {
+      window.SIM.WORLD.root.visible = false;
+      window.SIM.ENTITY.root.visible = false;
+    });
     await sleep(250);
     const c1 = await page.evaluate(() => window.SIM.renderer.info.render.calls);
-    await page.evaluate(() => { window.SIM.WORLD.root.visible = true; });
-    check('M2 gate: test wall/tower (city hidden) renders at < 10 draw calls',
+    await page.evaluate(() => {
+      window.SIM.WORLD.root.visible = true;
+      window.SIM.ENTITY.root.visible = true;
+    });
+    check('M2 gate: test wall/tower (city + creature hidden) renders at < 10 draw calls',
       Number.isInteger(c1) && c1 >= 1 && c1 < 10,
       `calls=${c1}`);
 
@@ -498,14 +519,20 @@ try {
       `instances=${before.n}`);
   }
 
-  /* ---- 7d. Draw calls flat + unbuild-behind as you fly far out ---- */
+  /* ---- 7d. Draw calls flat + unbuild-behind as you fly far out ----
+   * The M5 creature is hidden for this measurement: it is one static hero
+   * object whose frustum culling is pose-dependent (tall ⇒ head/antennas
+   * clip out at street range), not part of the city LOD flatness signal. */
   {
+    await page.evaluate(() => { window.SIM.ENTITY.root.visible = false; });
+    await sleep(120);                           // let one frame render w/o it
     const cNear = await page.evaluate(() => window.SIM.renderer.info.render.calls);
     await page.evaluate(() => {
       window.SIM.CAMERA.pos.set(0, 4, 1600);   // fly ~4 city radii out
     });
     await sleep(700);                           // sync: retire old, build new
     const cFar = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    await page.evaluate(() => { window.SIM.ENTITY.root.visible = true; });
     check('draw calls stay flat (and within budget) when flying far out',
       cFar < 150 && cFar <= cNear + 8,
       `near=${cNear}, far=${cFar}`);
@@ -662,7 +689,103 @@ try {
       calls < 150, `calls=${calls}`);
   }
 
-  /* ---- 9. No errors anywhere ---- */
+  /* ------------------------------------------------------------------
+   * M5 — ENTITY: the Qwen machine-creature (dormant)
+   * ------------------------------------------------------------------ */
+  {
+    /* 9a. named rig parts with transform roots (M9-ready) */
+    const parts = await page.evaluate(() => {
+      const P = window.SIM.ENTITY.parts;
+      const want = ['pedestal', 'spine', 'torso', 'head', 'jaw', 'coreEye',
+        'ringA', 'ringB', 'ringC', 'armL', 'armR', 'shoulderL', 'shoulderR',
+        'antenna1', 'antenna2', 'antenna3', 'antenna4'];
+      return {
+        state: window.SIM.ENTITY.state,
+        missing: want.filter(n => !P[n]),
+      };
+    });
+    check('M5: named rig parts present as transform roots (M9-ready)',
+      parts.state === 'DORMANT' && parts.missing.length === 0,
+      `state=${parts.state}, missing=${parts.missing.join(',') || 'none'}`);
+
+    /* 9b. thousands of compute-node voxels: ONE InstancedMesh, per-instance color */
+    const nInfo = await page.evaluate(() => {
+      const n = window.SIM.ENTITY.nodes;
+      return {
+        isInstanced: n.isInstancedMesh,
+        count: n.count,
+        hasColor: !!n.instanceColor,
+      };
+    });
+    check('M5: compute nodes = one InstancedMesh w/ per-instance color (thousands)',
+      nInfo.isInstanced && nInfo.hasColor && nInfo.count >= 2000,
+      `nodes=${nInfo.count}`);
+
+    /* 9c. dormant behaviour: breathing + idle rings + dim eye pulse +
+     *     static node matrices + minimal steam drip */
+    const dorm = () => page.evaluate(() => ({
+      s: window.SIM.ENTITY.core.scale.x,
+      rz: window.SIM.ENTITY.parts.ringA.children[0].rotation.z,
+      rzB: window.SIM.ENTITY.parts.ringB.children[0].rotation.z,
+      eye: window.SIM.ENTITY.parts.coreEye.material.color.getHex(),
+      nm: Array.from(window.SIM.ENTITY.nodes.instanceMatrix.array.slice(0, 128)),
+      steam: Array.from(
+        window.SIM.ENTITY._steam.geometry.attributes.position.array.slice(0, 12)),
+    }));
+    const d0 = await dorm();
+    await sleep(1200);
+    const d1 = await dorm();
+    check('M5: dormant breathing scale on the core (slow, small)',
+      Math.abs(d1.s - d0.s) > 1e-4 && d1.s > 0.98 && d1.s < 1.05,
+      `scale ${d0.s.toFixed(4)} -> ${d1.s.toFixed(4)}`);
+    check('M5: tensor rings spin at idle speed (A vs B counter-rotating)',
+      d1.rz !== d0.rz && d1.rzB !== d0.rzB,
+      `A ${((d1.rz - d0.rz) * 60 / Math.PI).toFixed(1)}/min, B ${((d1.rzB - d0.rzB) * 60 / Math.PI).toFixed(1)}/min`);
+    check('M5: coreEye dim pulse animates (faint heartbeat of the core)',
+      d1.eye !== d0.eye, `0x${d0.eye.toString(16)} -> 0x${d1.eye.toString(16)}`);
+    check('M5: compute-node matrices static while dormant (no per-frame upload)',
+      d1.nm.every((v, i) => v === d0.nm[i]));
+    check('M5: steam drip animates (32 pooled puffs, 4 vents, minimal)',
+      d1.steam.some((v, i) => v !== d0.steam[i]));
+
+    /* 9d. draw-call budget with the creature in the scene */
+    const calls = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    check('M5: draw calls inside budget with the creature (< 150)',
+      calls < 150, `calls=${calls}`);
+
+    /* 9e. street / mid / far silhouette screenshots (visual gate) */
+    const shot = async (name, x, y, z, yaw, pitch) => {
+      await page.evaluate(([x, y, z, yaw, pitch]) => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(x, y, z);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = yaw;
+        S.CAMERA.pitch = pitch;
+      }, [x, y, z, yaw, pitch]);
+      await sleep(450);
+      await page.screenshot({ path: `${here}/shots/${name}.png` });
+    };
+    // street (dwarfed-up view of the giant) + full silhouette at ~90 m,
+    // mid ~180 m, far ~250 m (fog limit: beyond that the void takes over)
+    await shot('m5-street-close', 45, 1.7, 10, 1.35, 0.55);
+    await shot('m5-street-full', 72, 1.7, 55, 0.92, 0.30);
+    await shot('m5-mid', 120, 50, 120, 0.785, -0.14);
+    await shot('m5-far', 170, 90, 170, 0.785, -0.26);
+    check('M5: street/mid/far silhouette screenshots written (see shots/m5-*.png)',
+      ['m5-street-close.png', 'm5-street-full.png', 'm5-mid.png', 'm5-far.png']
+        .every(f => fs.existsSync(`${here}/shots/${f}`)));
+    // reset to the spawn pose for the remaining checks
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(0, 4, 18);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = 0;
+    });
+    await sleep(250);
+  }
+
+  /* ---- 10. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));
 } finally {
