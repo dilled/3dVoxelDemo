@@ -187,6 +187,23 @@
  *   - arcs resolve clean (0 live, drawRange 0, pool drained); heap flat
  *   - screenshot with both anchor types in frame (shots/m73-arcs.png)
  *
+ *   M7.4 checks (screen-space flash — additive overlay plane):
+ *   - FX flash registered: one additive plane in a separate overlay
+ *     scene (not the main scene), hidden at 0 flash; renderer.info
+ *     autoReset off (per-frame manual reset ⇒ calls accumulate over
+ *     main + overlay renders)
+ *   - idle = zero added draw calls (overlay not rendered at 0 flash,
+ *     stable calls)
+ *   - manual key B flashes: plane visible, exactly +1 draw call (the
+ *     one overlay plane); material color = tint × level (additive
+ *     amount)
+ *   - flash decays monotonically to exactly 0, overlay hidden, calls
+ *     back to the idle count
+ *   - FX.flash(intensity, color) semantics: clamps to 0..max, re-
+ *     trigger never accumulates, color honoured + default reset
+ *   - heap flat; screenshot shows the full-screen flash (mean
+ *     luminance well above the idle pose, shots/m74-flash.png)
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -2989,6 +3006,229 @@ try {
       ` inFrame=${shotSt.inFrame}`);
     await page.waitForFunction(() => window.SIM.FX.arcCount === 0,
       { timeout: 10000 });
+  }
+
+  /* ------------------------------------------------------------------
+   * M7.4 — screen-space flash: additive overlay plane driven by
+   *        FX.flash(intensity)
+   *
+   *  One additive plane (2×2 NDC, toneMapped-off MeshBasicMaterial) in
+   *  a tiny overlay scene + ortho NDC camera, rendered after the main
+   *  scene ONLY while the level is > 0 ⇒ 0 flash = 0 draw calls
+   *  added. Level clamps to 0..CFG.fx.flash.max, re-trigger = max
+   *  (never accumulates), exponential decay (τ = CFG.fx.flash.decay)
+   *  with a snap to 0. Dev trigger: Key B. renderer.info is reset
+   *  once per frame (autoReset off) so the reported call count
+   *  accumulates over the main + overlay renders.
+   * ------------------------------------------------------------------ */
+  {
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, F = S.FX;
+      const m = F._flashMat;
+      return {
+        hasPlane: !!F._flashPlane,
+        inOverlay: F._flashScene.children.includes(F._flashPlane) &&
+          !S.scene.children.includes(F._flashPlane),
+        additive: m.blending === 2,        // THREE.AdditiveBlending
+        transparent: m.transparent === true,
+        noDepth: m.depthTest === false && m.depthWrite === false,
+        noTone: m.toneMapped === false,
+        autoResetOff: S.renderer.info.autoReset === false,
+        max: S.CFG.fx.flash.max,
+        decay: S.CFG.fx.flash.decay,
+        level: F._flash,
+        visible: F._flashPlane.visible,
+      };
+    });
+    check('M7.4: FX flash registered — one additive plane in a separate overlay scene, hidden at 0 flash (per-frame info reset)',
+      reg.hasPlane && reg.inOverlay && reg.additive && reg.transparent &&
+      reg.noDepth && reg.noTone && reg.autoResetOff &&
+      reg.max === 1 && reg.decay > 0 && reg.level === 0 && !reg.visible,
+      `max=${reg.max}, decay=${reg.decay}, level=${reg.level}`);
+
+    /* idle cost zero: 0 flash ⇒ the overlay is never rendered ⇒ the
+     * per-frame call count is stable (ambient variable meshes hidden) */
+    const parity = await page.evaluate(async () => {
+      const S = window.SIM;
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      const sample = async n => {
+        const a = [];
+        for (let i = 0; i < n; i++) {
+          a.push(S.renderer.info.render.calls);
+          await sleep(120);
+        }
+        return a;
+      };
+      const P = S.PARTS;
+      P.smesh.visible = false;
+      P.spoints.visible = false;
+      await sleep(150);   // let the hide land in a rendered frame
+      const zero = await sample(4);
+      P.smesh.visible = true;
+      P.spoints.visible = true;
+      return { zero, hidden: S.FX._flashPlane.visible === false };
+    });
+    const stable = a => a.every(v => v === a[0]);
+    const base = parity.zero[0];
+    check('M7.4: idle = zero added draw calls (overlay not rendered at 0 flash, stable calls)',
+      stable(parity.zero) && parity.hidden,
+      `zero=${parity.zero.join()}`);
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const heapBefore = await heapMin();
+
+    /* manual key B flashes the screen: level > 0, plane visible,
+     * exactly +1 draw call (the one overlay plane); material color =
+     * tint × level (a uniform positive scalar on the tint) */
+    await page.keyboard.press('b');
+    await page.waitForFunction(() => window.SIM.FX._flash > 0,
+      { timeout: 5000 });
+    const f0 = await page.evaluate(async () => {
+      const S = window.SIM, F = S.FX;
+      const P = S.PARTS;
+      P.smesh.visible = false;
+      P.spoints.visible = false;
+      await new Promise(r => setTimeout(r, 120));
+      const calls = S.renderer.info.render.calls;
+      P.smesh.visible = true;
+      P.spoints.visible = true;
+      const c = F._flashMat.color, t = F._flashTint;
+      const kr = c.r / t.r, kg = c.g / t.g, kb = c.b / t.b;
+      return {
+        level: F._flash,
+        visible: F._flashPlane.visible,
+        calls,
+        colorOk: Math.min(kr, kg, kb) > 0.05 &&
+          Math.max(kr, kg, kb) - Math.min(kr, kg, kb) < 0.05,
+      };
+    });
+    check('M7.4: key B flashes the screen — plane visible, exactly +1 draw call (the one overlay plane)',
+      f0.level > 0 && f0.visible && f0.calls === base + 1,
+      `level=${f0.level.toFixed(2)}, calls=${f0.calls} (idle=${base})`);
+    check('M7.4: overlay material color = tint × level (the additive amount)',
+      f0.colorOk, `level=${f0.level.toFixed(2)}`);
+
+    /* decay: monotonically decreasing, resolves to exactly 0, the
+     * overlay is hidden again and the call count is back to idle */
+    const decay = await page.evaluate(async () => {
+      const S = window.SIM, F = S.FX;
+      const rows = [];
+      for (let i = 0; i < 8; i++) {
+        await new Promise(r => requestAnimationFrame(r));
+        rows.push(F._flash);
+      }
+      return rows;
+    });
+    const monotone = decay.every((v, i) => i === 0 || v <= decay[i - 1]);
+    const strict = decay.slice(0, -1).some((v, i) => decay[i + 1] < v);
+    await page.waitForFunction(() => window.SIM.FX._flash === 0,
+      { timeout: 5000 });
+    const resolved = await page.evaluate(async () => {
+      const S = window.SIM;
+      const P = S.PARTS;
+      P.smesh.visible = false;
+      P.spoints.visible = false;
+      await new Promise(r => setTimeout(r, 120));
+      const calls = S.renderer.info.render.calls;
+      P.smesh.visible = true;
+      P.spoints.visible = true;
+      return { calls, visible: S.FX._flashPlane.visible, level: S.FX._flash };
+    });
+    check('M7.4: flash decays to zero (monotone, resolves clean — overlay hidden, calls back to idle)',
+      monotone && strict && resolved.level === 0 &&
+      resolved.visible === false && resolved.calls === base,
+      `calls=${resolved.calls} (idle=${base})`);
+
+    /* API semantics: intensity clamps to 0..max, a re-trigger never
+     * accumulates, color is honoured (hex) and reset (default) */
+    const api = await page.evaluate(() => {
+      const S = window.SIM, F = S.FX;
+      F._flash = 0;
+      const half = F.flash(0.5);
+      const clamped = F.flash(2);           // clamps to max 1
+      const neg = F.flash(-1);              // clamps to 0 ⇒ no-op
+      F._flash = 0;
+      F.flash(0.8); F.flash(0.8);           // re-trigger ⇒ max, not sum
+      const re = F._flash;
+      F.flash(0.5, 0xff0000);
+      const red = F._flashTint.r > 0.9 &&
+        F._flashTint.g < 0.1 && F._flashTint.b < 0.1;
+      F.flash(0.5);                         // no color ⇒ default tint
+      const ref = new F._flashTint.constructor();
+      ref.setHex(S.CFG.fx.flash.color);
+      const def = Math.abs(F._flashTint.r - ref.r) < 1e-6 &&
+        Math.abs(F._flashTint.g - ref.g) < 1e-6 &&
+        Math.abs(F._flashTint.b - ref.b) < 1e-6;
+      F._flash = 0; F._flashPlane.visible = false;
+      return { half, clamped, neg, re, red, def };
+    });
+    check('M7.4: FX.flash(intensity, color) semantics — clamps to 0..max, re-trigger never accumulates, color honoured + default reset',
+      api.half === 0.5 && api.clamped === 1 && api.neg === 1 &&
+      api.re === 0.8 && api.red && api.def,
+      `half=${api.half}, clamped=${api.clamped}, neg=${api.neg},` +
+      ` re=${api.re}`);
+
+    /* heap flat across the whole flash sequence */
+    const heapAfter = await heapMin();
+    check('M7.4: no allocation per flash (heap flat across the flash sequence)',
+      heapBefore > 0 && heapAfter > 0 &&
+      heapAfter - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,` +
+      ` after=${Math.round(heapAfter / 1024)}KB`);
+
+    /* visual gate: full-screen flash — deterministic pose (seeded
+     * city + fixed camera, same pose as M7.3). Mean luminance of the
+     * flash shot must sit well above the idle shot at the same pose
+     * (both decoded in-page via dataURL → 2D canvas) */
+    const lum = b64 => page.evaluate(async (b64) => {
+      const img = new Image();
+      await new Promise((res, rej) => {
+        img.onload = res; img.onerror = rej;
+        img.src = 'data:image/png;base64,' + b64;
+      });
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const d = ctx.getImageData(0, 0, c.width, c.height).data;
+      let s = 0;
+      for (let i = 0; i < d.length; i += 4)
+        s += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      return s / (d.length / 4);
+    }, b64);
+
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(-180, 40, 180);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.fov = 60;                  // reset wheel zoom ⇒ deterministic pose
+      S.CAMERA.yaw = 2.22;
+      S.CAMERA.pitch = -0.35;
+    });
+    await sleep(800);
+    const idleLum = await lum((await page.screenshot()).toString('base64'));
+    await page.evaluate(() => window.SIM.FX.flash(1));
+    await sleep(120);
+    await page.evaluate(() => window.SIM.FX.flash(1));   // re-raise for the grab
+    const flashShot = await page.screenshot(
+      { path: `${here}/shots/m74-flash.png` });
+    const flashLum = await lum(flashShot.toString('base64'));
+    const lvl = await page.evaluate(() => window.SIM.FX._flash);
+    check('M7.4: screenshot shows the full-screen flash (shots/m74-flash.png) — mean luminance well above the idle pose',
+      fs.existsSync(`${here}/shots/m74-flash.png`) &&
+      lvl > 0.3 && flashLum > idleLum + 25,
+      `lvl=${lvl.toFixed(2)}, idle=${idleLum.toFixed(1)},` +
+      ` flash=${flashLum.toFixed(1)}`);
+    await page.waitForFunction(() => window.SIM.FX._flash === 0,
+      { timeout: 5000 });
   }
 
   /* ---- 10. No errors anywhere ---- */

@@ -400,6 +400,14 @@ const CFG = {
       ringLane: 132,                      // ring-road lane for creature→ring (120+12)
       ringZ: 60,                          // max lane offset along the road (m)
     },
+    /* M7.4: screen-space flash — additive overlay plane driven by
+     * FX.flash(intensity), exponential decay to zero. 0 ⇒ hidden ⇒
+     * 0 draw calls. */
+    flash: {
+      max: 1,                            // clamp ceiling for FX.flash(intensity)
+      decay: 0.30,                       // s — exponential decay time constant
+      color: 0xcfe8ff,                  // tint (pale cyan-white)
+    },
   },
 };
 
@@ -499,6 +507,10 @@ const renderer = new THREE.WebGLRenderer({
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
+/* M7.4: the frame may render a second (flash-overlay) scene — with the
+ * default autoReset the 2nd render would zero the reported call count,
+ * so reset once per frame and let the counts accumulate over both. */
+renderer.info.autoReset = false;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(CFG.color.void);
@@ -551,6 +563,7 @@ const INPUT = {
   rainTrigger: false,         // P edge — dev trigger: rain all particles
   pulseTrigger: false,        // R edge — dev trigger: FX.pulse ahead
   arcTrigger: false,          // T edge — dev trigger: FX arcs (sub↔sub, creature→ring)
+  flashTrigger: false,        // B edge — dev trigger: FX.flash (screen flash)
 
   pad: {
     connected: false,
@@ -568,6 +581,7 @@ const INPUT = {
       if (e.code === 'KeyP' && !e.repeat) INPUT.rainTrigger = true;
       if (e.code === 'KeyR' && !e.repeat) INPUT.pulseTrigger = true;
       if (e.code === 'KeyT' && !e.repeat) INPUT.arcTrigger = true;
+      if (e.code === 'KeyB' && !e.repeat) INPUT.flashTrigger = true;
       INPUT.keys.add(e.code);
       if (e.code === 'Space') e.preventDefault();
     });
@@ -3492,8 +3506,8 @@ const PARTS = {
 };
 
 /* ==================================================================== *
- * FX — pulse (M7.2) + electrical arcs (M7.3); later: flash (M7.4),
- *     shake (M7.5)
+ * FX — pulse (M7.2) + electrical arcs (M7.3) + screen flash (M7.4);
+ *     later: shake (M7.5)
  *
  *  - FX.pulse(origin, radius, color): expanding ground ring on ONE
  *    shared InstancedMesh (per-instance color = tint × fade on the
@@ -3511,12 +3525,16 @@ const PARTS = {
  *    M6/M7 fleets
  *  - 0 live ⇒ ring count 0 + lights invisible + arc drawRange 0
  *    ⇒ 0 draw calls added
- *  - dev trigger: Key R fires a pulse ahead of the player; Key T
- *    sparks arcs — substation→substation (two nearest live
- *    substations) + creature→ring road (antenna tip → a ring-road
- *    lane point at a vehicle altitude)
- *  - audio thump/crackle: wired in M11.3 (seam: the pulse()/arc()
- *    call sites)
+ *  - FX.flash(intensity, color): screen-space flash — one additive
+ *    plane (PlaneGeometry 2×2, toneMapped-off MeshBasicMaterial) in a
+ *    tiny overlay scene + ortho NDC camera, rendered after the main
+ *    scene ONLY while the level is > 0. Level clamps to
+ *    0..CFG.fx.flash.max, re-trigger = max (never accumulates),
+ *    exponential decay (τ = CFG.fx.flash.decay) with a snap to 0 ⇒
+ *    0 flash = hidden plane = 0 draw calls added. Material color =
+ *    tint × level IS the additive amount. Dev trigger: Key B
+ *  - audio thump/crackle/whoosh: wired in M11.3 (seam: the
+ *    pulse()/arc()/flash() call sites)
  * --------------------------------------------------------------------- */
 const FX = {
   name: 'FX',
@@ -3540,6 +3558,13 @@ const FX = {
   _arcPts: new Float32Array(13 * 3),  // main-bolt points scratch
   _arcVa: new THREE.Vector3(),
   _arcCap2: 0,
+  /* M7.4: screen-space flash */
+  _flashScene: null,       // tiny overlay scene (one plane)
+  _flashCam: null,         // ortho NDC camera
+  _flashPlane: null,      // the additive full-screen plane (one draw call)
+  _flashMat: null,
+  _flash: 0,               // current flash level (0..CFG.fx.flash.max)
+  _flashTint: null,        // working-space tint
   /* scratch (zero per-frame allocation) */
   _m: new THREE.Matrix4(),
   _p: new THREE.Vector3(),
@@ -3608,6 +3633,26 @@ const FX = {
       j: new Float32Array(48),                  // regen jitter scratch
     }));
     FX._arcCap = acf.tiers[TIER.name];
+    /* M7.4: screen-space flash — one additive plane in a tiny overlay
+     * scene, rendered after the main scene ONLY while the flash is
+     * alive ⇒ 0 flash = 0 draw calls added. The plane spans the NDC
+     * square; material color = tint × level IS the additive amount
+     * (toneMapped off ⇒ the flash is raw, not tone-mapped). */
+    FX._flashScene = new THREE.Scene();
+    FX._flashCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    FX._flashMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 1,
+      blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false,
+      toneMapped: false,
+    });
+    FX._flashPlane = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2), FX._flashMat);
+    FX._flashPlane.frustumCulled = false;
+    FX._flashPlane.name = 'fx-flash';
+    FX._flashPlane.visible = false;
+    FX._flashScene.add(FX._flashPlane);
+    FX._flashTint = new THREE.Color(CFG.fx.flash.color);
+    FX._flash = 0;
   },
 
   /* public API — M9.4 plaza pulse, M13.2 data pulse, dev trigger Key R.
@@ -3660,6 +3705,25 @@ const FX = {
     FX.arcs.geometry.attributes.position.needsUpdate = true;
     /* audio crackle: wired in M11.3 */
     return it;
+  },
+
+  /* public API — M8.4 lightning, M9.3 beat-1 flare, dev trigger Key B.
+   * intensity: flash level, clamped to 0..CFG.fx.flash.max — a re-
+   * trigger raises to max(current, intensity), it never accumulates;
+   * color: THREE.Color or hex (default CFG.fx.flash.color). Returns
+   * the resulting flash level. */
+  flash(intensity, color) {
+    const v = Math.max(0, Math.min(+intensity || 0, CFG.fx.flash.max));
+    if (v > FX._flash) FX._flash = v;
+    if (color && color.isColor) {
+      FX._flashTint.copy(color);
+    } else if (typeof color === 'number') {
+      FX._flashTint.setHex(color);
+    } else {
+      FX._flashTint.setHex(CFG.fx.flash.color);
+    }
+    /* audio: wired in M11.3 */
+    return FX._flash;
   },
 
   /* rebuild one arc slot: refill the jitter scratch with fresh randoms
@@ -3902,6 +3966,24 @@ const FX = {
     /* 0 live ⇒ the shared LineSegments is hidden ⇒ 0 draw calls added
      * (three r160 does not skip drawRange-0 objects) */
     FX.arcs.visible = FX.arcCount > 0;
+
+    /* ---- M7.4: screen-space flash — exponential decay to zero ---- */
+    if (INPUT.flashTrigger) {
+      INPUT.flashTrigger = false;
+      FX.flash(CFG.fx.flash.max, CFG.fx.flash.color);
+    }
+    if (FX._flash > 0) {
+      FX._flash *= Math.exp(-dt / CFG.fx.flash.decay);
+      if (FX._flash < 1 / 256) FX._flash = 0;   // snap ⇒ hidden again
+    }
+    FX._flashPlane.visible = FX._flash > 0;
+    if (FX._flash > 0) {
+      /* material color = tint × level IS the additive amount */
+      FX._flashMat.color.setRGB(
+        FX._flashTint.r * FX._flash,
+        FX._flashTint.g * FX._flash,
+        FX._flashTint.b * FX._flash);
+    }
   },
 
   _releaseAt(i) {
@@ -4402,7 +4484,7 @@ const HUD = {
     HUD.hintEl.textContent =
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
       'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
-      'P particles · R pulse · T arcs';
+      'P particles · R pulse · T arcs · B flash';
   },
 
   update(dt) {
@@ -4463,7 +4545,11 @@ function frame(now) {
       );
     }
   }
+  renderer.info.reset();
   renderer.render(scene, camera);
+  /* M7.4: screen-space flash overlay — exactly one extra draw call
+   * while the flash is alive, nothing at 0. */
+  if (FX._flashPlane.visible) renderer.render(FX._flashScene, FX._flashCam);
   BOOT.frames++;
 }
 

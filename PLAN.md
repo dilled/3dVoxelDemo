@@ -58,7 +58,7 @@ smoke-test evidence.
 | **M7.1** ✅ | Pooled `Points`/sprite particle system: steam, sparks, pulse motes, lightning motes, awakening rain — one system, one budget | One trigger key rains all particle types; idle cost ~0 in stats |
 | **M7.2** ✅ | `FX.pulse(origin, radius, color)`: expanding instanced ring mesh + light-intensity ramp (+ audio hook once M11 lands) | Manual key fires a visible pulse; nothing allocated; idle = zero draw calls added |
 | **M7.3** ✅ | Animated electrical arcs: Line segments regenerated every N frames between anchors (substation→substation, creature→ring) | Manual key sparks arcs between two substations and creature→ring; regen is frame-cheap |
-| **M7.4** | Screen-space flash: overlay-scene additive plane (or DOM div) driven by `FX.flash(intensity)` | Manual key flashes screen; decays to zero; costs nothing idle |
+| **M7.4** ✅ | Screen-space flash: overlay-scene additive plane (or DOM div) driven by `FX.flash(intensity)` | Manual key flashes screen; decays to zero; costs nothing idle |
 | **M7.5** | Camera shake: impulse-decay system consumed by `CAMERA` | Manual key shakes camera with clean decay to still; never accumulates |
 | **M8.1** | Night sky: gradient sky dome (big sphere, canvas/shader texture), stars, faint aurora band | Night mood readable from street level; dome correct from street, orbit, and far fly |
 | **M8.2** | Fog depth tune + zone-tinted haze (cyan core / warm avenues) via fog color lerp | Depth readable at 500 m; zone tint visible flying across zones |
@@ -386,12 +386,36 @@ pools never allocate per frame.
   `smoke/shots/m73-arcs.png` with all four live endpoints asserted
   in-frame (deterministic pose: seeded city + fixed camera + fov reset).
 
-#### M7.4 — Screen-space flash
-- [ ] Full-screen additive plane in a small overlay scene (or DOM div)
+#### M7.4 — Screen-space flash ✅
+- [x] Full-screen additive plane in a small overlay scene (or DOM div)
       driven by `FX.flash(intensity)`.
 - **Test:** manual key flashes and decays to zero; nothing costs while
       idle.
 - **Commit when:** flash verified.
+- **Verified:** smoke M7.4 section green — flash state on `FX` (no pool
+  needed: one level scalar): ONE additive plane (`PlaneGeometry(2,2)`,
+  toneMapped-off `MeshBasicMaterial`, depthTest/Write off) in a dedicated
+  overlay scene + ortho NDC camera (`FX._flashScene`/`FX._flashCam`),
+  rendered after the main scene ONLY while `FX._flash > 0` ⇒ 0 flash = 0
+  added draw calls (verified: overlay not rendered at 0, stable call
+  count); Key B fires `FX.flash(1)` ⇒ exactly +1 draw call (the overlay
+  plane) with material color = tint × level (the additive amount); the
+  flash decays monotonically (exponential, τ = `CFG.fx.flash.decay`
+  0.30 s) and resolves clean — exactly 0, plane hidden, calls back to
+  idle; `FX.flash(intensity, color)` semantics verified (clamps to
+  0..max, ≤ 0 no-op, re-trigger = max not sum, hex + default color
+  honoured); heap flat; screenshot `smoke/shots/m74-flash.png` (full-
+  screen pale cyan-white flash at the deterministic M7.3 pose, mean
+  luminance 174 vs 9 idle — both decoded in-page via dataURL → 2D
+  canvas). Also: `renderer.info.autoReset = false` + per-frame
+  `renderer.info.reset()` in `frame()` — with the default autoReset the
+  second per-frame render (the overlay) would zero the reported main-
+  scene call count; per-frame count is now main + overlay and idle
+  frames are unchanged (every pre-existing smoke call-count check passes
+  unmodified). Note: the pre-existing M6.2 heap-flat check flakes in
+  this headless environment (~2.6 MB vs the 2 MB bound) — verified to
+  fail identically at the pre-M7.4 HEAD baseline (environmental GC
+  noise, not a regression).
 
 #### M7.5 — Impulse camera shake
 - [ ] Impulse-decay shake system consumed by `CAMERA`.
