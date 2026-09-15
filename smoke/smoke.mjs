@@ -63,6 +63,16 @@
  *   - draw calls stay inside budget with the creature in the scene
  *   - street/mid/far silhouette screenshots (shots/m5-*.png)
  *
+ *   M6.1 checks (generic object pool):
+ *   - POOL exposed on window.SIM; make() pre-allocates the full capacity
+ *     up front (factory called exactly capacity times, once)
+ *   - 10k acquire/release cycles: every acquired item is a reference
+ *     captured before the cycle starts (zero `new` after init) and the
+ *     JS heap stays flat across the run (no GC churn)
+ *   - exhaustion returns null (cap hit, no throw, no alloc); release is
+ *     idempotent (double release counted, never corrupts the stack);
+ *     pool stats stay balanced (free returns to capacity)
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -783,6 +793,113 @@ try {
       S.CAMERA.pitch = 0;
     });
     await sleep(250);
+  }
+
+  /* ------------------------------------------------------------------
+   * M6.1 — generic object-pool foundation
+   * ------------------------------------------------------------------ */
+  {
+    const m61 = await page.evaluate(() => {
+      const P = window.SIM.POOL;
+      const out = { ok: false };
+      if (!P || typeof P.make !== 'function') return out;
+
+      const CAP = 64;
+      let factoryCalls = 0;
+      const pool = P.make('m61-test', CAP, i => {
+        factoryCalls++;
+        return { v: i };
+      });
+      out.ok = true;
+      out.factoryCalls = factoryCalls;
+      out.initFree = pool.top;
+
+      // Identity set: every item the pool will EVER hand out was created
+      // by make() — anything else would prove a `new` after init.
+      const initial = new Set(pool.stack);
+      const acquired = new Set();
+
+      // 10k acquire/release cycles in one synchronous block; the heap
+      // samples bracket only that block, so the delta measures churn
+      // from the pool itself (GC may still reclaim other garbage, so
+      // only growth is a failure).
+      const mem = () => performance.memory ? performance.memory.usedJSHeapSize : -1;
+      const heapBefore = mem();
+      let nulls = 0;
+      for (let c = 0; c < 10000; c++) {
+        const items = [];
+        const burst = 1 + (c % 7);            // bursty 1..7 live items
+        for (let i = 0; i < burst; i++) {
+          const it = pool.acquire();
+          if (it === null) { nulls++; break; }
+          it.v = c;                           // re-init on acquire, in place
+          acquired.add(it);
+          items.push(it);
+        }
+        for (let i = items.length - 1; i >= 0; i--) pool.release(items[i]);
+      }
+      const heapAfter = mem();
+      out.nulls = nulls;
+      out.heapDelta = heapAfter - heapBefore;
+      out.heapBefore = heapBefore; // must be > 0 (perf.memory present)
+      out.zeroNew = [...acquired].every(it => initial.has(it));
+      out.acquiredKinds = acquired.size;
+      out.freeBackToFull = pool.top === CAP;
+      out.balanced = pool.acquires === pool.releases && pool.exhausted === 0;
+      out.stats = { acquires: pool.acquires, releases: pool.releases,
+        peak: pool.peak, exhausted: pool.exhausted };
+
+      // Exhaustion: drain the pool — the (CAP+1)th acquire must be null
+      const drained = [];
+      while (true) {
+        const it = pool.acquire();
+        if (it === null) break;
+        drained.push(it);
+      }
+      out.drainFull = drained.length === CAP;
+      out.drainNull = pool.exhausted === 1;
+      for (let i = drained.length - 1; i >= 0; i--) pool.release(drained[i]);
+
+      // Double release: idempotent, counted, stack never duplicated
+      const a0 = pool.acquires, r0 = pool.releases;
+      const it0 = pool.acquire();
+      pool.release(it0);
+      pool.release(it0);          // second release must be a no-op
+      pool.release({ __free: false });  // foreign object — also no-op
+      out.doubleReleaseSafe =
+        pool.badReleases === 2 && pool.top === CAP &&
+        pool.acquires === a0 + 1 && pool.releases === r0 + 1;
+
+      // Pool registry: smoke pool registered, aggregate stats sane
+      out.inList = P.list.some(p => p === pool);
+      const agg = P.stats();
+      out.aggSane = agg.pools >= 1 && agg.capacity >= CAP && agg.inUse === 0;
+      out.agg = agg;
+      return out;
+    });
+
+    check('M6.1: POOL.make pre-allocates the full capacity once at init',
+      m61.ok && m61.factoryCalls === 64 && m61.initFree === 64,
+      `factory calls=${m61.factoryCalls}, free=${m61.initFree}`);
+    check('M6.1: 10k acquire/release cycles — zero `new` after init',
+      m61.zeroNew === true && m61.nulls === 0,
+      `distinct items handed out=${m61.acquiredKinds}, nulls=${m61.nulls}`);
+    check('M6.1: 10k cycles — JS heap flat (no GC churn)',
+      m61.heapBefore > 0 &&
+      Number.isFinite(m61.heapDelta) && m61.heapDelta <= 64 * 1024,
+      `before=${Math.round(m61.heapBefore / 1024)}KB, ` +
+      `delta=${m61.heapDelta} bytes`);
+    check('M6.1: stats balanced, pool returns to full after the run',
+      m61.freeBackToFull && m61.balanced,
+      JSON.stringify(m61.stats));
+    check('M6.1: exhaustion returns null (cap hit, no throw, no alloc)',
+      m61.drainFull && m61.drainNull,
+      `drained=${m61.drainFull}, exhausted=${m61.drainNull}`);
+    check('M6.1: release is idempotent (double/foreign releases are no-ops)',
+      m61.doubleReleaseSafe,
+      `badReleases guarded`);
+    check('M6.1: pools register in POOL.list with sane aggregate stats',
+      m61.inList && m61.aggSane, `agg=${JSON.stringify(m61.agg)}`);
   }
 
   /* ---- 10. No errors anywhere ---- */

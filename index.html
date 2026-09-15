@@ -1924,6 +1924,92 @@ const WORLD = {
 };
 
 /* ==================================================================== *
+ * POOL — generic fixed-capacity object pools (M6.1)
+ *
+ *  - every pool's items are created exactly once, in make() — the only
+ *    allocation the pool ever performs. acquire()/release() move
+ *    references on a pre-allocated free stack (swap-pop / swap-push):
+ *    zero `new` and zero array growth for the life of the pool.
+ *  - acquire() returns null when the pool is drained (cap hit): emitters
+ *    skip this spawn and poll acquire() again next frame — the cap is
+ *    enforced structurally, never by a throw.
+ *  - release() is idempotent per item (a __free flag guards the stack):
+ *    double-releases and wrong-pool releases are counted, never corrupt.
+ *  - every pool registers in POOL.list so M6.5 (tier caps), the M14.2
+ *    HUD and the smoke harness can read live capacity/use at any time.
+ *  - consumers must re-init every field of an item on acquire — released
+ *    items keep their last values (no hidden reset cost).
+ * --------------------------------------------------------------------- */
+const POOL = {
+  list: [],   // every pool ever made (M6.5 / M14.2 / smoke read this)
+
+  /** make(name, capacity, makeItem) -> pool.
+   *  makeItem(i) runs exactly capacity times, right here. */
+  make(name, capacity, makeItem) {
+    const stack = new Array(capacity);
+    const pool = {
+      name,
+      capacity,
+      top: capacity,    // free items on the stack (0..capacity)
+      peak: 0,          // highest simultaneous in-use count
+      acquires: 0,      // successful lifetime acquires
+      releases: 0,      // successful lifetime releases
+      exhausted: 0,     // acquires that found the pool empty (cap hits)
+      badReleases: 0,   // double / foreign releases (ignored, counted)
+      stack,
+      acquire: null,
+      release: null,
+    };
+    for (let i = 0; i < capacity; i++) {
+      const it = makeItem(i);
+      it.__free = true;
+      it.__pool = pool;   // back-ref: release() rejects foreign items
+      stack[i] = it;
+    }
+    pool.acquire = function acquire() {
+      const n = pool.top;
+      if (n === 0) {
+        pool.exhausted++;
+        return null;               // cap hit — caller skips the spawn
+      }
+      const item = stack[n - 1];
+      stack[n - 1] = undefined;
+      pool.top = n - 1;
+      pool.acquires++;
+      const used = capacity - pool.top;
+      if (used > pool.peak) pool.peak = used;
+      item.__free = false;
+      return item;
+    };
+    pool.release = function release(item) {
+      if (!item || item.__pool !== pool || item.__free) {
+        // foreign item, or double release — counted, never pushed
+        pool.badReleases++;
+        return;
+      }
+      const n = pool.top;
+      stack[n] = item;
+      pool.top = n + 1;
+      pool.releases++;
+      item.__free = true;
+    };
+    POOL.list.push(pool);
+    return pool;
+  },
+
+  /** Aggregate pool stats — HUD (M14.2) and tier-cap scaling (M6.5). */
+  stats() {
+    const s = { pools: POOL.list.length, capacity: 0, inUse: 0, peak: 0 };
+    for (const p of POOL.list) {
+      s.capacity += p.capacity;
+      s.inUse += p.capacity - p.top;
+      if (p.peak > s.peak) s.peak = p.peak;
+    }
+    return s;
+  },
+};
+
+/* ==================================================================== *
  * ENTITY — the Qwen machine-creature, DORMANT (M5)
  *
  *  - central plaza (WORLD keeps ±2 blocks clear): darkened mega-core
@@ -2484,6 +2570,7 @@ window.SIM = {
   CAMERA,
   KIT,
   WORLD,
+  POOL,
   ENTITY,
   HUD,
   CFG,

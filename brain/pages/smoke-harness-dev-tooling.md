@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-15T02:32:16"
+updated: "2026-09-15T09:30:36"
 ---
 
 <!-- compiled_truth -->
@@ -47,3 +47,9 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   summary: "M3 extends the harness: WORLD checks — mulberry32 known-vector + distinct per-block seeds, 5×5 keep-set (25 chunks, ring 1/8/16, ≥1900 m, >2500 instances), byte-identical chunk regeneration (WORLD.regen + instanceMatrix compare), flat draw calls after flying to (0,4,1600) (far ≤ near+8, <150), and unbuild-behind/ahead on chunk change; M2 gate now hides WORLD.root around the <10 draw-call read"
   source: M3 implementation
   affects: [smoke-harness-dev-tooling, world-chunk-generation]
+
+- time: 2026-09-15T09:30:36
+  kind: decision
+  summary: "M6.1 extends the harness: POOL section — 64-item test pool (factory called 64×), 10k-cycle burst acquire/release in one synchronous evaluate with perf.memory bracket (heap delta must stay ≤ 64KB), zero-new-identity check via pre-captured Set, exhaustion→null drain, double/foreign release no-op check, POOL.list + POOL.stats() aggregate sanity; window.SIM now also exposes POOL"
+  source: M6.1 implementation
+  affects: [smoke-harness-dev-tooling, m61-object-pool]

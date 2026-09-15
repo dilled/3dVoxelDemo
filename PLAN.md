@@ -50,7 +50,7 @@ smoke-test evidence.
 | **M3** ✅ | Chunked city generation (far layer): seeded PRNG, city grid, 16×16 block chunks generated/unbuilt around player, weighted archetypes, 3-ring distance LOD | City extends beyond initial view, no visible duplication, draw calls flat as you fly out |
 | **M4** ✅ | Building detail passes (near layer): 5 pooled detail InstancedMeshes per near chunk (fans, dishes, pulses, holo signs, LED facades), per-archetype detail on the M3 mass, per-building seeded salt, ring-2 silhouette stays zero-detail | Every archetype readable from 50–200 m and procedurally varied; draw calls flat (32 near) |
 | **M5** ✅ | The Qwen machine-creature (dormant): plaza pedestal, full creature build from primitives, named rig parts, dormant breathing/idle state, instanced compute-node voxels | Reads as "dormant colossal machine" from street level; silhouette holds from 3 camera distances |
-| **M6.1** | Generic object-pool foundation (`Pool` helper): fixed-size alloc at init, `acquire/release`, zero per-frame allocation, shared by later emitters | Pool test: 10k acquire/release cycles in smoke run, zero `new` after init, zero GC churn in stats |
+| **M6.1** ✅ | Generic object-pool foundation (`Pool` helper): fixed-size alloc at init, `acquire/release`, zero per-frame allocation, shared by later emitters | Pool test: 10k acquire/release cycles in smoke run, zero `new` after init, zero GC churn in stats |
 | **M6.2** | Maintenance drones: small voxel quads (InstancedMesh), patrol routes between towers, dock at roof bays, capped by distance to player | Drones visibly patrol + dock from street level; cap holds at tier max; no allocation per frame |
 | **M6.3** | Sky vehicles: light trails (additive sprite streak) on ring roads at 3 altitudes, capped like drones | Trails readable from all 3 altitudes; count never exceeds tier cap |
 | **M6.4** | Steam vents (cooling towers, billboard sprite pool, upward drift, fade) + sparks (substations, tiny points, brief life) | Both emitters run idle-cheap; smoke shot shows steam + sparks at source buildings |
@@ -191,11 +191,18 @@ smoke-test evidence.
 ### M6 — Traffic & ambient life (pooled)
 
 #### M6.1 — Object-pool foundation
-- [ ] Generic `Pool` helper: fixed capacity allocated at init, `acquire` /
+- [x] Generic `Pool` helper: fixed capacity allocated at init, `acquire` /
       `release`, zero `new` after init; shared by all later emitters.
 - **Test:** smoke run does 10k acquire/release cycles; stats show zero
       allocation after init, no GC churn.
 - **Commit when:** pool lands + smoke test green.
+- **Verified:** smoke M6.1 section green — `POOL.make` allocated the full
+      capacity exactly once (factory called 64×); 10k-cycle burst run
+      (39,994 acquire/release ops) handed out only pre-created refs
+      (zero `new` after init), JS heap delta 0 bytes across the run;
+      exhaustion returns null (cap hit, no throw), double/foreign
+      releases are counted no-ops, pool returns to full, aggregate
+      stats via `POOL.stats()` sane for M6.5 caps / M14.2 HUD.
 
 #### M6.2 — Maintenance drones
 - [ ] Small voxel-quad drones (one InstancedMesh), patrol routes between

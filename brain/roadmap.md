@@ -2,12 +2,12 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-09-15T08:13:04"
+updated: "2026-09-15T09:31:03"
 ---
 
 # Roadmap
 
-Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status below; M0–M5 done and smoke-verified headless (M5: dormant Qwen machine-creature, see [[entity-system-m5]]).
+Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status below: M0–M5 + M6.1 done and smoke-verified headless (M5: dormant Qwen machine-creature, see [[entity-system-m5]]; M6.1: generic object-pool foundation, see [[m61-object-pool]]).
 
 ```mermaid
 gantt
@@ -23,7 +23,8 @@ gantt
   M4 building detail passes :done, m4, after m3, 3d
   section Creature & life
   M5 Qwen creature dormant :done, m5, after m4, 3d
-  M6 traffic + ambient life :m6, after m5, 2d
+  M6.1 object pool foundation :done, m61, after m5, 1d
+  M6.2-6.5 traffic + ambient life :m6, after m61, 2d
   M7 particles + FX :m7, after m6, 2d
   section Climax
   M8 atmosphere :m8, after m7, 2d
