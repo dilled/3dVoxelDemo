@@ -117,6 +117,20 @@
  *   - street-level screenshot showing steam + sparks at their source
  *     buildings (shots/m64-steam-sparks-street.png)
  *
+ *   M6.5 checks (adaptive caps by FPS tier — integrated switch):
+ *   - all four M6 fleets saturated at the HIGH caps first (drone 16,
+ *     vehicle 12, steam 48, spark stream alive)
+ *   - LOW caps are visibly lower than HIGH caps in config (each ≤ 1/2)
+ *   - TIER.set('low') trims ALL four fleets to their LOW caps in one
+ *     switch; excess items land back in the pools (inUse === live
+ *     count for all four pools)
+ *   - LOW caps hold while the emitters cycle (sampled)
+ *   - no frame spike on switch: rAF delta windows around the LOW and
+ *     HIGH switches stay within 2× the baseline max frame (100 ms floor)
+ *   - TIER.set('high') restores all four fleets (regrows on spawn ticks)
+ *   - heap flat across the whole LOW→HIGH switch (no allocation), draw
+ *     calls inside budget at the restored HIGH caps
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -1887,6 +1901,190 @@ try {
       d ? `puff=(${d.puff.map(v => v.toFixed(0)).join(',')}),`
         + ` sub=(${d.sub.map(v => v.toFixed(0)).join(',')})`
         : 'no resolvable vent+sub pair in frame');
+  }
+
+  /* ------------------------------------------------------------------ *
+   * M6.5 — adaptive caps by FPS tier (integrated tier switch)
+   *
+   *  TRAFFIC reads CFG.traffic.*.tiers[TIER.name] every frame for all
+   *  four fleets, so one TIER switch scales every M6 pool at once.
+   *  Verify the whole switch end-to-end: LOW halves every cap (live
+   *  counts + pools), HIGH restores all four, and the switch itself
+   *  costs no frame time (rAF delta probe) and no allocation (heap).
+   * ------------------------------------------------------------------ */
+  {
+    /* frame-time probe: rAF delta sampler spanning both tier switches;
+     * windows are snapshotted + cleared between phases, so each window
+     * holds only the frames around that switch */
+    await page.evaluate(() => {
+      window.__m65 = { deltas: [], on: true };
+      let last = performance.now();
+      const tick = () => {
+        const w = window.__m65;
+        if (!w || !w.on) return;
+        const now = performance.now();
+        w.deltas.push(now - last);
+        last = now;
+        if (w.deltas.length > 1500)
+          w.deltas.splice(0, w.deltas.length - 1500);
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+
+    /* baseline: all four M6 fleets saturated at the HIGH caps */
+    await page.waitForFunction(() => {
+      const T = window.SIM.TRAFFIC;
+      return T.count === 16 && T.vcount === 12 &&
+        T.scount === 48 && T.pcount >= 3;
+    }, { timeout: 120000 });
+    const capsHi = await page.evaluate(() => {
+      const t = window.SIM.CFG.traffic;
+      return {
+        drone: t.drone.tiers.high, vehicle: t.vehicle.tiers.high,
+        steam: t.steam.tiers.high, spark: t.spark.tiers.high,
+      };
+    });
+    await sleep(1000);
+    const snapWin = () => page.evaluate(() => {
+      const d = window.__m65.deltas;
+      window.__m65.deltas = [];
+      let max = 0;
+      for (let i = 0; i < d.length; i++) if (d[i] > max) max = d[i];
+      return { n: d.length, max };
+    });
+    const base = await snapWin();
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const heapBefore = await heapMin();
+
+    /* LOW caps must be visibly lower than HIGH caps (halved in config) */
+    const capsLo = await page.evaluate(() => {
+      const t = window.SIM.CFG.traffic;
+      return {
+        drone: t.drone.tiers.low, vehicle: t.vehicle.tiers.low,
+        steam: t.steam.tiers.low, spark: t.spark.tiers.low,
+      };
+    });
+    check('M6.5: LOW caps are visibly lower than HIGH caps (each ≤ 1/2)',
+      capsLo.drone <= capsHi.drone / 2 &&
+      capsLo.vehicle <= capsHi.vehicle / 2 &&
+      capsLo.steam <= capsHi.steam / 2 &&
+      capsLo.spark <= capsHi.spark / 2,
+      `drone ${capsHi.drone}->${capsLo.drone},` +
+      ` vehicle ${capsHi.vehicle}->${capsLo.vehicle},` +
+      ` steam ${capsHi.steam}->${capsLo.steam},` +
+      ` spark ${capsHi.spark}->${capsLo.spark}`);
+
+    /* one switch scales ALL four fleets at once */
+    await page.evaluate(() => window.SIM.TIER.set('low'));
+    await page.waitForFunction(o => {
+      const T = window.SIM.TRAFFIC;
+      return T.count <= o.drone && T.vcount <= o.vehicle &&
+        T.scount <= o.steam && T.pcount <= o.spark;
+    }, { ...capsLo }, { timeout: 15000 });
+    const tLow = await page.evaluate(() => {
+      const S = window.SIM, T = S.TRAFFIC;
+      const inUse = n => {
+        const p = S.POOL.list.find(pp => pp.name === n);
+        return p.capacity - p.top;
+      };
+      return {
+        count: T.count, vcount: T.vcount, scount: T.scount,
+        pcount: T.pcount,
+        droneInUse: inUse('traffic-drone'),
+        vehInUse: inUse('traffic-vehicle'),
+        steamInUse: inUse('traffic-steam'),
+        sparkInUse: inUse('traffic-spark'),
+      };
+    });
+    check('M6.5: LOW tier trims ALL four fleets to their LOW caps',
+      tLow.count <= capsLo.drone && tLow.vcount <= capsLo.vehicle &&
+      tLow.scount <= capsLo.steam && tLow.pcount <= capsLo.spark,
+      `drone=${tLow.count}/${capsLo.drone},` +
+      ` vehicle=${tLow.vcount}/${capsLo.vehicle},` +
+      ` steam=${tLow.scount}/${capsLo.steam},` +
+      ` spark=${tLow.pcount}/${capsLo.spark}`);
+    check('M6.5: excess items land back in the pools (inUse === live, all 4)',
+      tLow.droneInUse === tLow.count &&
+      tLow.vehInUse === tLow.vcount &&
+      tLow.steamInUse === tLow.scount &&
+      tLow.sparkInUse === tLow.pcount,
+      `inUse drone=${tLow.droneInUse}, veh=${tLow.vehInUse},` +
+      ` steam=${tLow.steamInUse}, spark=${tLow.sparkInUse}`);
+    const lowWin = await snapWin();
+
+    /* LOW caps hold while the emitters cycle */
+    const capHold = await page.evaluate(async () => {
+      const S = window.SIM;
+      const t = S.CFG.traffic;
+      for (let i = 0; i < 10; i++) {
+        if (S.TRAFFIC.count > t.drone.tiers.low ||
+            S.TRAFFIC.vcount > t.vehicle.tiers.low ||
+            S.TRAFFIC.scount > t.steam.tiers.low ||
+            S.TRAFFIC.pcount > t.spark.tiers.low) return false;
+        await new Promise(r => setTimeout(r, 150));
+      }
+      return true;
+    });
+    check('M6.5: LOW caps hold while the emitters cycle', capHold === true);
+
+    /* back to HIGH: every fleet regrows to its HIGH cap */
+    await page.evaluate(() => window.SIM.TIER.set('high'));
+    await page.waitForFunction(o => {
+      const T = window.SIM.TRAFFIC;
+      return T.count === o.drone && T.vcount === o.vehicle &&
+        T.scount === o.steam && T.pcount >= 3;
+    }, { drone: capsHi.drone, vehicle: capsHi.vehicle, steam: capsHi.steam },
+      { timeout: 120000 });
+    const tHi = await page.evaluate(() => {
+      const T = window.SIM.TRAFFIC;
+      return { count: T.count, vcount: T.vcount, scount: T.scount,
+        pcount: T.pcount };
+    });
+    const hiWin = await snapWin();
+    check('M6.5: HIGH tier restores all four fleets (regrows on spawn ticks)',
+      tHi.count === capsHi.drone && tHi.vcount === capsHi.vehicle &&
+      tHi.scount === capsHi.steam && tHi.pcount >= 3,
+      `drone=${tHi.count}/${capsHi.drone},` +
+      ` vehicle=${tHi.vcount}/${capsHi.vehicle},` +
+      ` steam=${tHi.scount}/${capsHi.steam}, spark=${tHi.pcount}`);
+
+    /* no frame spike: switch windows stay within 2× the baseline max
+     * frame (100 ms floor — headless rAF jitter tolerance) */
+    const bound = Math.max(100, base.max * 2);
+    check('M6.5: no frame spike on tier switch (both switches vs baseline)',
+      base.n > 0 && lowWin.n > 0 && hiWin.n > 0 &&
+      lowWin.max <= bound && hiWin.max <= bound,
+      `baseline max=${base.max.toFixed(1)}ms,` +
+      ` LOW switch max=${lowWin.max.toFixed(1)}ms,` +
+      ` HIGH switch max=${hiWin.max.toFixed(1)}ms,` +
+      ` bound=${bound.toFixed(1)}ms`);
+
+    /* the whole switch allocates nothing */
+    const heapAfter = await heapMin();
+    check('M6.5: tier switch allocates nothing (heap flat across LOW→HIGH)',
+      heapBefore > 0 && heapAfter > 0 &&
+      heapAfter - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,` +
+      ` after=${Math.round(heapAfter / 1024)}KB`);
+
+    /* draw-call budget at the restored HIGH caps */
+    const calls = await page.evaluate(() =>
+      window.SIM.renderer.info.render.calls);
+    check('M6.5: draw calls inside budget with all four fleets at HIGH cap',
+      calls > 0 && calls < 150, `calls=${calls}`);
+
+    /* stop the frame probe (leave the object; the pending rAF sees
+     * on=false and exits — deleting it would throw in the callback) */
+    await page.evaluate(() => { window.__m65.on = false; });
   }
 
   /* ---- 10. No errors anywhere ---- */

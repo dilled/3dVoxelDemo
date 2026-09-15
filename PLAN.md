@@ -54,7 +54,7 @@ smoke-test evidence.
 | **M6.2** ✅ | Maintenance drones: small voxel quads (InstancedMesh), patrol routes between towers, dock at roof bays, capped by distance to player | Drones visibly patrol + dock from street level; cap holds at tier max; no allocation per frame |
 | **M6.3** ✅ | Sky vehicles: light trails (additive sprite streak) on ring roads at 3 altitudes, capped like drones | Trails readable from all 3 altitudes; count never exceeds tier cap |
 | **M6.4** ✅ | Steam vents (cooling towers, billboard sprite pool, upward drift, fade) + sparks (substations, tiny points, brief life) | Both emitters run idle-cheap; smoke shot shows steam + sparks at source buildings |
-| **M6.5** | Adaptive caps: `TRAFFIC` reads current FPS tier, scales all M6 pools | Forcing LOW tier in smoke run visibly halves caps; back to HIGH restores; no spike |
+| **M6.5** ✅ | Adaptive caps: `TRAFFIC` reads current FPS tier, scales all M6 pools | Forcing LOW tier in smoke run visibly halves caps; back to HIGH restores; no spike |
 | **M7.1** | Pooled `Points`/sprite particle system: steam, sparks, pulse motes, lightning motes, awakening rain — one system, one budget | One trigger key rains all particle types; idle cost ~0 in stats |
 | **M7.2** | `FX.pulse(origin, radius, color)`: expanding instanced ring mesh + light-intensity ramp (+ audio hook once M11 lands) | Manual key fires a visible pulse; nothing allocated; idle = zero draw calls added |
 | **M7.3** | Animated electrical arcs: Line segments regenerated every N frames between anchors (substation→substation, creature→ring) | Manual key sparks arcs between two substations and creature→ring; regen is frame-cheap |
@@ -294,7 +294,7 @@ smoke-test evidence.
   (while-loop, not if-reset) so the rate is frame-rate independent.
 
 #### M6.5 — Adaptive caps by FPS tier
-- [ ] `TRAFFIC` reads current FPS tier and scales all M6 pool sizes.
+- [x] `TRAFFIC` reads current FPS tier and scales all M6 pool sizes.
 - **Test:** forcing LOW tier in smoke run visibly halves caps; switching
       back to HIGH restores; no frame spike on switch.
 - **Commit when:** tier-switch test passes.
