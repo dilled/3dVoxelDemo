@@ -411,6 +411,29 @@ const CFG = {
       color: 0xcfe8ff,                  // tint (pale cyan-white)
     },
   },
+
+  /* ---- M8.1: ATMOS — night sky (gradient dome + stars + aurora) ----
+   * Everything is "at infinity": pinned to the camera every frame so
+   * the dome is correct from street, orbit, and far-fly. All three
+   * meshes are fog-off (FogExp2 would swallow a 2400 m dome) and cost
+   * exactly 3 draw calls total. */
+  atmos: {
+    dome: {
+      radius: 2400,          // m — inside the 3000 m camera far plane
+    },
+    stars: {
+      tiers: { high: 1600, med: 900, low: 500 },   // drawRange caps
+      radius: 2300,          // m — just inside the dome
+      size: 2.5,             // px (sizeAttenuation off)
+    },
+    aurora: {
+      radius: 2250,          // m — band radius (open cylinder)
+      height: 300,           // m — band vertical thickness
+      altitude: 480,         // m — band centre height above the street
+      opacity: 0.45,        // faint (texture alpha fades it further)
+      spin: 0.012,           // rad/s — slow drift
+    },
+  },
 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -4473,11 +4496,171 @@ const ENTITY = {
   },
 };
 
+/* ====================================================================
+ * ATMOS — night sky: gradient dome + stars + faint aurora band (M8.1)
+ *
+ * - dome: one big BackSide sphere with a vertical canvas gradient
+ *   (deep zenith → glowing horizon). fog:false — the FogExp2 haze would
+ *   swallow a 2400 m dome. Pinned to the camera every frame ⇒ the sky
+ *   is correct from street, orbit, and far-fly (always 2400 m around
+ *   the player, inside the 3000 m far plane).
+ * - stars: one seeded Points cloud on the upper hemisphere, additive
+ *   glow sprites (shared KIT glow texture), tier-capped by drawRange
+ *   (zero allocation — the full HIGH set exists from init).
+ * - aurora: one open-ended additive cylinder band at fixed altitude
+ *   with slow spin — faint green curtains (static canvas texture).
+ * - exactly 3 draw calls total, zero per-frame allocation.
+ * ==================================================================== */
+const ATMOS = {
+  name: 'ATMOS',
+  root: null,
+  dome: null,
+  stars: null,
+  aurora: null,
+
+  init() {
+    const A = CFG.atmos;
+    ATMOS.root = new THREE.Group();
+
+    /* dome: vertical gradient — canvas top (v = 1) is the zenith,
+     * v = 0.5 is the horizon (where the fog-tinted city sits), below
+     * the horizon fades to the void colour. */
+    const sky = makeCanvasTexture(1, 256, (ctx, w, h) => {
+      const g = ctx.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0.00, '#05070f');   // zenith — deep night
+      g.addColorStop(0.35, '#081226');
+      g.addColorStop(0.48, '#0d1c33');
+      g.addColorStop(0.52, '#16304f');   // horizon glow (city haze)
+      g.addColorStop(0.58, '#0a1526');
+      g.addColorStop(0.80, '#05080f');
+      g.addColorStop(1.00, '#04060c');   // below the horizon
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, w, h);
+    });
+    ATMOS.dome = new THREE.Mesh(
+      new THREE.SphereGeometry(A.dome.radius, 32, 20),
+      new THREE.MeshBasicMaterial({
+        map: sky.tex,
+        side: THREE.BackSide,
+        fog: false,
+        depthWrite: false,
+      }),
+    );
+    ATMOS.root.add(ATMOS.dome);
+
+    /* stars: seeded upper-hemisphere points (deterministic field),
+     * tier cap via drawRange — no allocation at any tier. */
+    const cap = A.stars.tiers.high;
+    const pos = new Float32Array(cap * 3);
+    const col = new Float32Array(cap * 3);
+    const rnd = mulberry32(0xA705);
+    const c = new THREE.Color();
+    for (let i = 0; i < cap; i++) {
+      const el = Math.asin(0.06 + 0.94 * rnd());   // elevation 3.4°..90°
+      const az = rnd() * Math.PI * 2;
+      const r = A.stars.radius;
+      pos[i * 3] = Math.cos(el) * Math.sin(az) * r;
+      pos[i * 3 + 1] = Math.sin(el) * r;
+      pos[i * 3 + 2] = Math.cos(el) * Math.cos(az) * r;
+      const b = 0.55 + 0.45 * rnd();                // brightness
+      const warm = rnd();                          // rare warm / most cool
+      c.setRGB(
+        b * (warm < 0.7 ? 0.85 : 1.0),
+        b * (warm < 0.7 ? 0.92 : 0.95),
+        b * (warm < 0.7 ? 1.0 : 0.8));
+      col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+    }
+    const sg = new THREE.BufferGeometry();
+    sg.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    sg.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    ATMOS.stars = new THREE.Points(sg, new THREE.PointsMaterial({
+      size: A.stars.size,
+      sizeAttenuation: false,
+      map: KIT.tex.glow.tex,          // shared soft glow sprite
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.9,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      fog: false,
+    }));
+    ATMOS.stars.geometry.setDrawRange(0, cap);
+    ATMOS.root.add(ATMOS.stars);
+
+    /* aurora: open-ended additive band at fixed altitude, slow spin.
+     * Static canvas — green curtains fading out at both edges. */
+    const band = makeCanvasTexture(512, 256, (ctx, w, h) => {
+      ctx.clearRect(0, 0, w, h);
+      /* green-dominant curtains fading out at both edges; the
+       * material opacity (CFG.atmos.aurora.opacity) does the final
+       * "faint" dimming. */
+      const v = ctx.createLinearGradient(0, 0, 0, h);
+      v.addColorStop(0, 'rgba(100,255,120,0)');
+      v.addColorStop(0.35, 'rgba(100,255,120,0.20)');
+      v.addColorStop(0.55, 'rgba(110,255,130,0.50)');
+      v.addColorStop(1, 'rgba(100,255,120,0)');
+      ctx.fillStyle = v;
+      ctx.fillRect(0, 0, w, h);
+      const arnd = mulberry32(0x5EED);
+      ctx.globalCompositeOperation = 'lighter';
+      for (let i = 0; i < 90; i++) {
+        const x = arnd() * w;
+        const ww = 6 + arnd() * 34;
+        const a = 0.15 + arnd() * 0.30;
+        const hue = arnd() < 0.5 ? '100,255,120' : '70,240,90';
+        const g = ctx.createLinearGradient(0, 0, 0, h);
+        g.addColorStop(0, `rgba(${hue},0)`);
+        g.addColorStop(0.5, `rgba(${hue},${a})`);
+        g.addColorStop(1, `rgba(${hue},0)`);
+        ctx.fillStyle = g;
+        ctx.fillRect(x, 0, ww, h);
+      }
+      ctx.globalCompositeOperation = 'source-over';
+    });
+    ATMOS.aurora = new THREE.Mesh(
+      new THREE.CylinderGeometry(
+        A.aurora.radius, A.aurora.radius, A.aurora.height, 96, 1, true),
+      new THREE.MeshBasicMaterial({
+        map: band.tex,
+        transparent: true,
+        opacity: A.aurora.opacity,
+        side: THREE.BackSide,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        fog: false,
+      }),
+    );
+    ATMOS.aurora.position.y = A.aurora.altitude;
+    ATMOS.root.add(ATMOS.aurora);
+
+    scene.add(ATMOS.root);
+  },
+
+  update(dt, t) {
+    const A = CFG.atmos;
+    /* "at infinity": everything pinned to the camera — the dome is
+     * always 2400 m around the player, so street / orbit / far-fly
+     * all see a correct sky. */
+    ATMOS.dome.position.copy(camera.position);
+    ATMOS.stars.position.copy(camera.position);
+    ATMOS.aurora.position.set(
+      camera.position.x, A.aurora.altitude, camera.position.z);
+    ATMOS.aurora.rotation.y = t * A.aurora.spin;
+    /* tier cap: drawRange only (no allocation) */
+    ATMOS.stars.geometry.setDrawRange(0, A.stars.tiers[TIER.active()]);
+  },
+
+  dispose() {
+    if (ATMOS.root) scene.remove(ATMOS.root);
+  },
+};
+
 /* ------------------------------------------------------------------ *
  * Subsystems — FIXED BOOT ORDER = registration order.
  * M0: HUD   M1: INPUT, CAMERA   M2: KIT   M3: WORLD   M5: ENTITY
  * M6.2: TRAFFIC   (registered after ENTITY, before HUD)
  * M7.2: FX   (registered after PARTS, before HUD)
+ * M8.1: ATMOS   (registered after FX, before HUD)
  * ------------------------------------------------------------------ */
 const systems = [];
 function registerSystem(sys) {
@@ -4533,6 +4716,7 @@ registerSystem(ENTITY);
 registerSystem(TRAFFIC);
 registerSystem(PARTS);
 registerSystem(FX);
+registerSystem(ATMOS);
 registerSystem(HUD);
 for (const s of systems) if (s.init) s.init();
 
@@ -4603,6 +4787,7 @@ window.SIM = {
   TRAFFIC,
   PARTS,
   FX,
+  ATMOS,
   TIER,
   HUD,
   CFG,

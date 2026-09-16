@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-15T09:30:36"
+updated: "2026-09-16T03:19:20"
 ---
 
 <!-- compiled_truth -->
@@ -53,3 +53,9 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   summary: "M6.1 extends the harness: POOL section — 64-item test pool (factory called 64×), 10k-cycle burst acquire/release in one synchronous evaluate with perf.memory bracket (heap delta must stay ≤ 64KB), zero-new-identity check via pre-captured Set, exhaustion→null drain, double/foreign release no-op check, POOL.list + POOL.stats() aggregate sanity; window.SIM now also exposes POOL"
   source: M6.1 implementation
   affects: [smoke-harness-dev-tooling, m61-object-pool]
+
+- time: 2026-09-16T03:19:20
+  kind: decision
+  summary: "M8.1 extends the harness: fixed-order check is now …FX→ATMOS→HUD; M2 gate hides/shows ATMOS.root around its draw-call read; new M8.1 section — ATMOS registration (dome BackSide fog-off, stars additive fog-off, aurora additive fog-off), camera-follow (dome/stars track exactly, aurora at configured altitude), +3 draw calls (min-over-6-frames per state, retry ≤3 — other systems add transient calls), star drawRange tier cap, aurora spin animation, heap flat on pure animation frames, and the first multi-pose on/off visual gate: 3 camera distances (street GROUND / orbit CINE / far CINE), each an ATMOS-hidden vs visible screenshot pair decoded in-page, sky region = top 55 % at x ≥ 25 % (HUD corner excluded), asserting mean luminance (dome), bright pixels (stars), greenish pixels (aurora) all rise; on-shots saved as shots/m81-sky-{street,orbit,far}.png"
+  source: M8.1 implementation
+  affects: [smoke-harness-dev-tooling, m81-night-sky]

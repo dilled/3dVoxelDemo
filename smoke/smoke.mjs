@@ -216,6 +216,19 @@
  *   - never accumulates: 10 rapid re-triggers hold at the energy cap;
  *     shake(10) clamps to the cap; negative is a no-op; heap flat
  *
+ *   M8.1 checks (night sky — gradient dome + stars + aurora band):
+ *   - ATMOS registered (fixed order …FX, ATMOS, HUD): dome BackSide
+ *     fog-off gradient sphere, additive fog-off stars Points, additive
+ *     fog-off aurora band — all pinned to the camera
+ *   - camera follow: dome/stars track the camera, aurora rides above
+ *     it at the configured altitude
+ *   - exactly +3 draw calls vs hidden (total < 150); star tier cap via
+ *     drawRange (TIER low/high); aurora spin animates; heap flat
+ *   - three camera distances (street / orbit / far-fly): on/off
+ *     screenshot pairs — sky region brighter with ATMOS (dome),
+ *     more bright star pixels (stars), more greenish pixels
+ *     (aurora band); shots saved as m81-sky-*.png
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -417,13 +430,14 @@ try {
   }
 
   /* ---- 6a. Fixed-order systems registry (M5 adds ENTITY after WORLD,
-   * M7.1 adds PARTS after TRAFFIC, M7.2 adds FX after PARTS) ---- */
+   * M7.1 adds PARTS after TRAFFIC, M7.2 adds FX after PARTS, M8.1
+   * adds ATMOS after FX) ---- */
   {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
       JSON.stringify(names) === JSON.stringify(
         ['INPUT', 'CAMERA', 'KIT', 'WORLD', 'ENTITY', 'TRAFFIC',
-         'PARTS', 'FX', 'HUD']),
+         'PARTS', 'FX', 'ATMOS', 'HUD']),
       names.join(', '));
   }
 
@@ -585,8 +599,9 @@ try {
 
     // The M2 gate measures the KIT test wall/tower alone: hide the M3
     // city + M5 creature + M6 TRAFFIC meshes (drones/vehicles/trails) +
-    // M7.1 PARTS particle meshes + M7.2 FX pulse ring for a frame or
-    // two, read the draw-call count, show it again.
+    // M7.1 PARTS particle meshes + M7.2 FX pulse ring + M8.1 ATMOS
+    // night sky for a frame or two, read the draw-call count, show it
+    // again.
     await page.evaluate(() => {
       window.SIM.WORLD.root.visible = false;
       window.SIM.ENTITY.root.visible = false;
@@ -594,7 +609,8 @@ try {
       const P = window.SIM.PARTS;
       for (const m of [T.mesh, T.vmesh, T.tmesh,
         P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh,
-        window.SIM.FX.ring, window.SIM.FX.arcs])
+        window.SIM.FX.ring, window.SIM.FX.arcs,
+        window.SIM.ATMOS.root])
         if (m) m.visible = false;
     });
     await sleep(250);
@@ -606,7 +622,8 @@ try {
       const P = window.SIM.PARTS;
       for (const m of [T.mesh, T.vmesh, T.tmesh,
         P.smesh, P.spoints, P.mpoints, P.lpoints, P.rmesh,
-        window.SIM.FX.ring, window.SIM.FX.arcs])
+        window.SIM.FX.ring, window.SIM.FX.arcs,
+        window.SIM.ATMOS.root])
         if (m) m.visible = true;
     });
     check('M2 gate: test wall/tower (city + creature hidden) renders at < 10 draw calls',
@@ -3401,6 +3418,246 @@ try {
     /* heap flat across the whole shake sequence */
     const heapAfter = await heapMin();
     check('M7.5: no allocation per shake (heap flat across the shake sequence)',
+      heapBefore > 0 && heapAfter > 0 &&
+      heapAfter - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,` +
+      ` after=${Math.round(heapAfter / 1024)}KB`);
+  }
+
+  /* ------------------------------------------------------------------
+   * M8.1 — night sky: gradient dome + stars + faint aurora band
+   *
+   *  ATMOS owns exactly three fog-off meshes — a BackSide gradient
+   *  sphere (2400 m), a seeded additive Points star field (tier cap
+   *  via drawRange), and a faint additive aurora band (open-ended
+   *  cylinder at fixed altitude, slow spin). Everything is pinned to
+   *  the camera every frame ⇒ the dome is correct from street,
+   *  orbit, and far-fly. 3 draw calls total, zero per-frame
+   *  allocation.
+   * ------------------------------------------------------------------ */
+  {
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, A = S.ATMOS;
+      const domeM = A.dome.material, starsM = A.stars.material,
+        aurM = A.aurora.material;
+      return {
+        inSystems: S.systems.map(x => x.name).includes('ATMOS'),
+        children: A.root.children.length,
+        dome: A.dome.geometry.type === 'SphereGeometry' &&
+          domeM.side === 1 && domeM.fog === false &&   // 1 = BackSide
+          domeM.depthWrite === false && domeM.map !== null,
+        stars: A.stars.geometry.type === 'BufferGeometry' &&
+          starsM.blending === 2 && starsM.fog === false &&
+          starsM.vertexColors === true && starsM.map !== null &&
+          starsM.sizeAttenuation === false,
+        starCount: A.stars.geometry.attributes.position.count,
+        drawRange: A.stars.geometry.drawRange.count,
+        aurora: A.aurora.geometry.type === 'CylinderGeometry' &&
+          aurM.blending === 2 && aurM.fog === false &&
+          aurM.side === 1 && aurM.transparent === true &&   // 1 = BackSide
+          aurM.opacity > 0 && aurM.opacity <= 0.6,
+        radius: S.CFG.atmos.dome.radius,
+        far: S.camera.far,
+      };
+    });
+    check('M8.1: ATMOS registered — gradient dome (BackSide, fog-off), additive stars, faint additive aurora band',
+      reg.inSystems && reg.children === 3 && reg.dome && reg.stars &&
+      reg.aurora && reg.radius < reg.far,
+      `stars=${reg.starCount}, drawRange=${reg.drawRange}`);
+
+    /* camera follow: move the camera to a fixed pose — the dome and
+     * stars must track it exactly, the aurora rides above it at the
+     * configured altitude */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(300, 30, -400);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.fov = 60;
+      S.CAMERA.yaw = 1.1;
+      S.CAMERA.pitch = -0.2;
+    });
+    await page.evaluate(() => new Promise(r => requestAnimationFrame(
+      () => requestAnimationFrame(r))));
+    const follow = await page.evaluate(() => {
+      const S = window.SIM, A = S.ATMOS, cam = S.camera.position;
+      return {
+        dome: A.dome.position.distanceTo(cam) < 1e-6,
+        stars: A.stars.position.distanceTo(cam) < 1e-6,
+        auroraXZ: Math.abs(A.aurora.position.x - cam.x) < 1e-6 &&
+          Math.abs(A.aurora.position.z - cam.z) < 1e-6,
+        auroraY: Math.abs(A.aurora.position.y - S.CFG.atmos.aurora.altitude) < 1e-6,
+      };
+    });
+    check('M8.1: dome + stars track the camera, aurora rides above it at the configured altitude',
+      follow.dome && follow.stars && follow.auroraXZ && follow.auroraY);
+
+    /* exactly +3 draw calls vs hidden; total inside budget */
+    /* other systems add transient draw calls (drones, arcs) — sample
+     * the min over several frames per state and retry until the delta
+     * is clean */
+    const calls = await page.evaluate(async () => {
+      const S = window.SIM, A = S.ATMOS;
+      const minCalls = async n => {
+        let m = Infinity;
+        for (let i = 0; i < n; i++) {
+          await new Promise(r => setTimeout(r, 100));
+          m = Math.min(m, S.renderer.info.render.calls);
+        }
+        return m;
+      };
+      let hidden, shown, tries = 0;
+      do {
+        A.root.visible = false;
+        hidden = await minCalls(6);
+        A.root.visible = true;
+        shown = await minCalls(6);
+        tries++;
+      } while (shown - hidden !== 3 && tries < 3);
+      return { hidden, shown };
+    });
+    check('M8.1: exactly +3 draw calls (dome + stars + aurora), total inside budget (< 150)',
+      calls.shown === calls.hidden + 3 && calls.shown < 150,
+      `hidden=${calls.hidden}, shown=${calls.shown}`);
+
+    /* star tier cap: drawRange only (no allocation) */
+    const tier = await page.evaluate(async () => {
+      const S = window.SIM, A = S.ATMOS;
+      const cap = k => S.CFG.atmos.stars.tiers[k];
+      S.TIER.set('low');
+      await new Promise(r => setTimeout(r, 150));
+      const low = A.stars.geometry.drawRange.count;
+      S.TIER.set('high');
+      await new Promise(r => setTimeout(r, 150));
+      const high = A.stars.geometry.drawRange.count;
+      return { low, high, wantLow: cap('low'), wantHigh: cap('high'),
+        count: A.stars.geometry.attributes.position.count };
+    });
+    check('M8.1: star tier cap via drawRange (low/high), full set pre-allocated',
+      tier.low === tier.wantLow && tier.high === tier.wantHigh &&
+      tier.count === tier.wantHigh,
+      `low=${tier.low}, high=${tier.high}`);
+
+    /* aurora spin animates (slow drift, deterministic t × spin) */
+    const spin = await page.evaluate(async () => {
+      const S = window.SIM, A = S.ATMOS;
+      const a = A.aurora.rotation.y;
+      await new Promise(r => setTimeout(r, 250));
+      return { a, b: A.aurora.rotation.y };
+    });
+    check('M8.1: aurora band animates (slow spin)',
+      spin.b > spin.a && spin.b - spin.a > 1e-4,
+      `Δ=${(spin.b - spin.a).toFixed(5)}`);
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    /* visual gate: three camera distances. Each pose gets an
+     * ATMOS-on/off screenshot pair (decoded in-page via dataURL → 2D
+     * canvas); the top 55 % of the frame is the sky region. On must
+     * beat off on: mean luminance (dome gradient), bright pixel
+     * count (stars), greenish pixel count (aurora band). The
+     * on-shot is saved as the milestone screenshot. */
+    /* sky region = top 55 % of the frame, x >= 25 % (the top-left
+     * corner holds the FPS HUD text — excluded). Decoded in-page via
+     * dataURL → 2D canvas. */
+    const skyStats = b64 => page.evaluate(async (b64) => {
+      const img = new Image();
+      await new Promise((res, rej) => {
+        img.onload = res; img.onerror = rej;
+        img.src = 'data:image/png;base64,' + b64;
+      });
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const x0 = Math.floor(c.width * 0.25);
+      const h = Math.floor(c.height * 0.55);
+      const d = ctx.getImageData(x0, 0, c.width - x0, h).data;
+      let sum = 0, bright = 0, green = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        sum += l;
+        if (l > 120) bright++;
+        if (g > b + 8 && g > r + 8 && g > 25) green++;
+      }
+      const n = d.length / 4;
+      return { mean: sum / n, bright, green };
+    }, b64);
+
+    /* all three poses look ~14° up: the horizon-glow band (dome),
+     * the low star band, and the ~11° aurora band are all in the
+     * top 55 % region (the sky region) — where the void background
+     * (ATMOS hidden) is near-black */
+    const poses = [
+      { name: 'street', mode: 'GROUND', pos: [-180, 4, 180],
+        yaw: 2.22, pitch: -0.25, aurora: true },
+      { name: 'orbit', mode: 'CINE', pos: [0, 60, 260],
+        yaw: 0, pitch: -0.25, aurora: true },
+      { name: 'far', mode: 'CINE', pos: [700, 140, 700],
+        yaw: 0.785, pitch: -0.3, aurora: true },
+    ];
+    for (const pose of poses) {
+      await page.evaluate(({ mode, pos, yaw, pitch }) => {
+        const S = window.SIM, C = S.CAMERA;
+        C.setMode(mode);
+        C.pos.set(pos[0], pos[1], pos[2]);
+        C.vel.set(0, 0, 0);
+        C.fov = 60;                     // reset wheel zoom ⇒ deterministic pose
+        C.yaw = yaw;
+        C.pitch = pitch;
+      }, pose);
+      await sleep(400);
+      await page.evaluate(() => {
+        window.SIM.ATMOS.root.visible = false;
+      });
+      await sleep(150);
+      const offB64 = (await page.screenshot()).toString('base64');
+      await page.evaluate(() => {
+        window.SIM.ATMOS.root.visible = true;
+      });
+      await sleep(150);
+      const onShot = await page.screenshot(
+        { path: `${here}/shots/m81-sky-${pose.name}.png` });
+      const off = await skyStats(offB64);
+      const on = await skyStats(onShot.toString('base64'));
+      check(`M8.1: ${pose.name} sky renders (shots/m81-sky-${pose.name}.png) — dome brighter than the void background`,
+        fs.existsSync(`${here}/shots/m81-sky-${pose.name}.png`) &&
+        on.mean > off.mean + 2,
+        `mean ${off.mean.toFixed(1)} → ${on.mean.toFixed(1)}`);
+      check(`M8.1: ${pose.name} sky shows stars (bright sky pixels)`,
+        on.bright > off.bright + 40 && on.bright > 0,
+        `bright ${off.bright} → ${on.bright}`);
+      if (pose.aurora) {
+        check(`M8.1: ${pose.name} view shows the faint aurora band (greenish sky pixels)`,
+          on.green > off.green + 30 && on.green > 0,
+          `green ${off.green} → ${on.green}`);
+      }
+    }
+
+    /* back to a neutral pose for the tail checks */
+    await page.evaluate(() => {
+      const S = window.SIM, C = S.CAMERA;
+      C.setMode('GROUND');
+      C.pos.set(-180, 40, 180);
+      C.vel.set(0, 0, 0);
+      C.fov = 60;
+      C.yaw = 2.22;
+      C.pitch = -0.35;
+    });
+
+    /* heap flat across pure animation frames (the camera teleports
+     * and screenshots above are harness costs, not ATMOS) */
+    const heapBefore = await heapMin();
+    await sleep(600);
+    const heapAfter = await heapMin();
+    check('M8.1: no allocation per frame (heap flat across the sky sequence)',
       heapBefore > 0 && heapAfter > 0 &&
       heapAfter - heapBefore <= 2 * 1024 * 1024,
       `before=${Math.round(heapBefore / 1024)}KB,` +

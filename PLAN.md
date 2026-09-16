@@ -60,7 +60,7 @@ smoke-test evidence.
 | **M7.3** ✅ | Animated electrical arcs: Line segments regenerated every N frames between anchors (substation→substation, creature→ring) | Manual key sparks arcs between two substations and creature→ring; regen is frame-cheap |
 | **M7.4** ✅ | Screen-space flash: overlay-scene additive plane (or DOM div) driven by `FX.flash(intensity)` | Manual key flashes screen; decays to zero; costs nothing idle |
 | **M7.5** ✅ | Camera shake: impulse-decay system consumed by `CAMERA` | Manual key shakes camera with clean decay to still; never accumulates |
-| **M8.1** | Night sky: gradient sky dome (big sphere, canvas/shader texture), stars, faint aurora band | Night mood readable from street level; dome correct from street, orbit, and far fly |
+| **M8.1** ✅ | Night sky: gradient sky dome (big sphere, canvas/shader texture), stars, faint aurora band | Night mood readable from street level; dome correct from street, orbit, and far fly |
 | **M8.2** | Fog depth tune + zone-tinted haze (cyan core / warm avenues) via fog color lerp | Depth readable at 500 m; zone tint visible flying across zones |
 | **M8.3** | Volumetric-ish light shafts: a few additive cone/cylinder meshes from key spires + creature core (only when near / during awakening) | Shafts visible near spire, absent far away (no permanent draw calls) |
 | **M8.4** | Distant lightning: random far point + brief hemi bump + flash + EM discharge ring across the city | Lightning event visible from inside the city; fires on timer + manual key |
@@ -448,11 +448,31 @@ nothing while idle.
 ### M8 — Atmosphere: night, fog, sky, light shafts
 
 #### M8.1 — Night sky dome
-- [ ] Gradient sky dome (big sphere with canvas/shader texture), stars,
+- [x] Gradient sky dome (big sphere with canvas/shader texture), stars,
       faint aurora band.
 - **Test:** night mood readable from street level; dome renders correct
       from street, orbit, and far-fly cameras.
 - **Commit when:** sky verified from 3 camera distances.
+- **Verified:** smoke M8.1 section green — new `ATMOS` system (after FX,
+  before HUD, registered in the fixed boot order) owns exactly 3 draw
+  calls: a BackSide gradient dome (r 2400 < far 3000, 1×256 canvas
+  vertical gradient, fog-off, no depth write), an additive `Points`
+  star field (1600 pre-allocated, seeded mulberry32, upper hemisphere
+  r 2300, shared `KIT.tex.glow` map, tier cap via `drawRange`
+  high 1600 / med 900 / low 500), and a faint additive aurora band
+  (open-ended BackSide cylinder r 2250, h 300 at 480 m altitude,
+  canvas green curtains, slow spin) — all three pinned to the camera
+  position each frame. Verified: exactly +3 draw calls vs hidden
+  (total < 150); dome/stars track the camera exactly, aurora rides at
+  the configured altitude; star `drawRange` caps at low/high with the
+  full set pre-allocated (no allocation); aurora spin animates; heap
+  flat across pure animation frames. Visual gate at 3 camera
+  distances (street GROUND / orbit CINE / far CINE flyby): each
+  on/off screenshot pair shows the dome raising sky-region mean
+  luminance (5.4→15.2, 10.2→25.5, 8.6→26.2), stars adding bright
+  sky pixels (167→232, 162→218, 172→272), and the aurora adding
+  greenish sky pixels (0→6780, 0→7413, 0→7517) — `shots/m81-sky-
+  {street,orbit,far}.png`.
 
 #### M8.2 — Fog depth + zone tint
 - [ ] Fog tuned for depth; haze tinted by zone (cyan core / warm avenues)
