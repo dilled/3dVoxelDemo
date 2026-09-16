@@ -62,7 +62,7 @@ smoke-test evidence.
 | **M7.5** ✅ | Camera shake: impulse-decay system consumed by `CAMERA` | Manual key shakes camera with clean decay to still; never accumulates |
 | **M8.1** ✅ | Night sky: gradient sky dome (big sphere, canvas/shader texture), stars, faint aurora band | Night mood readable from street level; dome correct from street, orbit, and far fly |
 | **M8.2** ✅ | Fog depth tune + zone-tinted haze (cyan core / warm avenues) via fog color lerp | Depth readable at 500 m; zone tint visible flying across zones |
-| **M8.3** | Volumetric-ish light shafts: a few additive cone/cylinder meshes from key spires + creature core (only when near / during awakening) | Shafts visible near spire, absent far away (no permanent draw calls) |
+| **M8.3** ✅ | Volumetric-ish light shafts: a few additive cone/cylinder meshes from key spires + creature core (only when near / during awakening) | Shafts visible near spire, absent far away (no permanent draw calls) |
 | **M8.4** | Distant lightning: random far point + brief hemi bump + flash + EM discharge ring across the city | Lightning event visible from inside the city; fires on timer + manual key |
 | **M9.1** | Idle/dormant animation: tensor-ring rotation, antenna sway, breathing core, periodic "dream" LED wave across the node grid (instance-color waves) | Dream wave sweeps the node grid visibly; dormant state stays dim and still-ish |
 | **M9.2** | Wake state machine: DORMANT → STIR (2 s head lift, jaw, rings speed up) → AWAKE (10–20 s) → DECAY → DORMANT, with per-state hooks | State machine smoke test: forced transitions in order, clean return to DORMANT, re-trigger safe |
@@ -506,11 +506,36 @@ nothing while idle.
   both pass on other runs; environmental, not M8.2 regressions.
 
 #### M8.3 — Light shafts
-- [ ] A few additive cone/cylinder meshes from key spires and the
+- [x] A few additive cone/cylinder meshes from key spires and the
       creature core; only when near or during awakening.
 - **Test:** shafts visible standing near a spire, absent far away (no
       permanent draw calls).
 - **Commit when:** near/far toggle verified in stats.
+- **Verified:** smoke M8.3 section green — 4 spire slots + 1 creature
+  core cone in `ATMOS.shaftGroup` (additive, fog-off, shared canvas
+  gradient texture, `CFG.atmos.shaft`): a 2 s nearest-N scan
+  (`ATMOS._refreshShafts`, pre-allocated scratch, no per-frame
+  allocation) pins each slot to the nearest seeded fiber spire within
+  130 m; opacity eases in/out (fade 2.5/s, no pop) and hidden shafts
+  are `visible = false` ⇒ 0 draw calls; the core cone activates near
+  the plaza (170 m) OR during any non-DORMANT entity state (M9 seam);
+  tier cap trims via slot count (high 4 / med 2 / low 1). Gates:
+  far pose (deterministic golden-angle spiral search for a spire-free
+  130 m disc, 200–1600 m out) — every shaft hidden, group on/off
+  draw-call delta 0 (per-pair median of 7, robust to transient dips);
+  near pose (street pose with a fiber spire 30–45 m out) — ≥ 1 shaft,
+  anchors replay through the seeded `buildingAt` path as real fiber
+  spires, and the group on/off delta equals the in-frame count, where
+  in-frame is the exact renderer culling test (6 frustum planes of
+  P×V vs the cone bounding sphere, same as `WebGLRenderer`); visual
+  gate: on/off screenshot pair — the cone adds light in a ±8 %
+  vertical strip centred on the projected spire, 2-pair averaged
+  12.47 → 14.67 (`shots/m83-shafts-near.png`); awakening seam:
+  AWAKE at the far pose forces the core shaft on (+1 draw call),
+  DORMANT hides it again (delta back to 0); heap flat across the whole
+  sequence. Note: the pre-existing timing-sensitive flakes (M6.2
+  heap-flat, M6.3 streak screenshots, M7.4 flash timing) are
+  environmental in this headless setup and pass on other runs.
 
 #### M8.4 — Distant lightning events
 - [ ] Random far point + brief hemi intensity bump + flash; EM discharge

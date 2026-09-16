@@ -449,6 +449,27 @@ const CFG = {
       outer: 0x241a10,                   // warm haze (outer avenues)
       domeTint: { core: 0xd9e6ff, outer: 0xffe3d0 },
     },
+
+    /* ---- M8.3: volumetric-ish light shafts ----
+     * Additive cones from key fiber spires + the creature core. Only
+     * visible when the camera is near (radius / coreRadius) or during
+     * awakening (ENTITY.state !== 'DORMANT' — M9 seam). A hidden shaft
+     * costs 0 draw calls (visible = opacity > 0). */
+    shaft: {
+      radius: 130,             // m — spire shafts activate near the camera
+      coreRadius: 170,        // m — creature core shaft activates near plaza
+      refresh: 2,             // s — nearby spire scan cadence
+      tiers: { high: 4, med: 2, low: 1 },  // max spire shafts (core extra)
+      len: 90,                // m — spire shaft length (scaled to short spires)
+      rTop: 0.4,              // m — radius at the tip (the light source)
+      rBottom: 8,             // m — radius at the base (clearly wider than the 4.5–6 m spire)
+      opacity: 0.18,          // base additive opacity (faint volumetric haze)
+      coreLen: 120,           // m — creature core shaft length
+      coreRBottom: 9,         // m — core shaft base radius
+      color: 0x66d9ff,        // spire shaft tint
+      coreColor: 0x9fe8ff,    // core shaft tint
+      fade: 2.5,              // 1/s — opacity ease rate (no pop in/out)
+    },
   },
 };
 
@@ -4538,6 +4559,9 @@ const ATMOS = {
   dome: null,
   stars: null,
   aurora: null,
+  shaftGroup: null,          // M8.3: light shafts (spires + creature core)
+  shafts: null,
+  coreShaft: null,
 
   init() {
     const A = CFG.atmos;
@@ -4665,8 +4689,99 @@ const ATMOS = {
     ATMOS.aurora.position.y = A.aurora.altitude;
     ATMOS.root.add(ATMOS.aurora);
 
+    /* M8.3: volumetric-ish light shafts — additive cones from key fiber
+     * spires + the creature core. Only visible when near (radius /
+     * coreRadius) or during awakening (ENTITY.state !== 'DORMANT' —
+     * M9 seam). All meshes, materials, and scratch are pre-allocated
+     * here; a hidden shaft costs 0 draw calls (visible = opacity > 0),
+     * so far away the whole group is free. FrontSide (the transparent
+     * DoubleSide 2x draw-call trap, M2) — the outer surface of the
+     * cone is what is seen. */
+    const SH = A.shaft;
+    ATMOS.shaftGroup = new THREE.Group();
+    ATMOS.shaftGroup.name = 'ATMOS-shafts';
+    const shaftTex = makeCanvasTexture(1, 128, (ctx, w, h) => {
+      /* vertical: canvas top (v = 1 = the tip) is bright, the base
+       * fades out — the material color tints it. */
+      const g = ctx.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0.0, 'rgba(255,255,255,0.9)');
+      g.addColorStop(0.5, 'rgba(255,255,255,0.35)');
+      g.addColorStop(1.0, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, w, h);
+    });
+    const shaftMat = tint => new THREE.MeshBasicMaterial({
+      map: shaftTex.tex,
+      color: tint,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      fog: false,
+    });
+    ATMOS.shafts = [];
+    for (let i = 0; i < SH.tiers.high; i++) {
+      const mesh = new THREE.Mesh(
+        new THREE.CylinderGeometry(SH.rTop, SH.rBottom, SH.len, 10, 1, true),
+        shaftMat(SH.color));
+      mesh.visible = false;
+      ATMOS.shaftGroup.add(mesh);
+      ATMOS.shafts.push({ mesh, op: 0, x: 0, z: 0, tip: 0 });
+    }
+    /* creature core shaft — larger, brighter, from the core eye */
+    const coreMesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(SH.rTop, SH.coreRBottom, SH.coreLen,
+        10, 1, true),
+      shaftMat(SH.coreColor));
+    coreMesh.visible = false;
+    ATMOS.shaftGroup.add(coreMesh);
+    ATMOS.coreShaft = { mesh: coreMesh, op: 0 };
+    /* pre-allocated scan scratch: the nearest `tiers.high` spires */
+    ATMOS._best = Array.from(
+      { length: SH.tiers.high },
+      () => ({ x: 0, z: 0, tip: 0, d2: Infinity }));
+    ATMOS._corePos = new THREE.Vector3();
+    ATMOS._shaftTimer = 0;
+    ATMOS.root.add(ATMOS.shaftGroup);
+
     scene.add(ATMOS.root);
   },
+
+  /* M8.3: nearest-N spire scan (the M6.4 PARTS pattern) — replays the
+   * seeded M3 fiber blocks around the camera and keeps the N closest
+   * in _best (no sort, no allocation). */
+  _refreshShafts() {
+    const S = CFG.atmos.shaft;
+    const B = WORLD.BLOCK, K = WORLD.CHUNK;
+    const pcx = Math.floor(CAMERA.pos.x / B);
+    const pcz = Math.floor(CAMERA.pos.z / B);
+    const pcx2 = Math.floor(pcx / K), pcz2 = Math.floor(pcz / K);
+    const n = Math.ceil(S.radius / B);
+    const best = ATMOS._best;
+    for (let i = 0; i < best.length; i++) best[i].d2 = Infinity;
+    for (let bx = pcx - n; bx <= pcx + n; bx++) {
+      for (let bz = pcz - n; bz <= pcz + n; bz++) {
+        const ring = Math.max(
+          Math.abs(Math.floor(bx / K) - pcx2),
+          Math.abs(Math.floor(bz / K) - pcz2));
+        const c = WORLD.buildingAt(bx, bz, ring, ['fiber'], 0);
+        if (!c) continue;
+        const dx = c.x - CAMERA.pos.x, dz = c.z - CAMERA.pos.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 > S.radius * S.radius) continue;
+        /* keep the N nearest: replace the current farthest slot */
+        let fi = 0, fd = -1;
+        for (let i = 0; i < best.length; i++) {
+          if (best[i].d2 > fd) { fd = best[i].d2; fi = i; }
+        }
+        if (d2 < fd) {
+          best[fi].x = c.x; best[fi].z = c.z;
+          best[fi].tip = c.hTop; best[fi].d2 = d2;
+        }
+      }
+    }
+  },
+
 
   update(dt, t) {
     const A = CFG.atmos;
@@ -4694,6 +4809,70 @@ const ATMOS = {
       ATMOS._fog.copy(ATMOS._fogCore).lerp(ATMOS._fogOuter, k);
       scene.fog.color.copy(ATMOS._fog);
       ATMOS.dome.material.color.copy(ATMOS._tintCore).lerp(ATMOS._tintOuter, k);
+    }
+
+    /* M8.3: volumetric-ish light shafts — spire cones only when near,
+     * the creature core cone when near OR during awakening (M9 seam:
+     * any non-DORMANT state). Opacity eases (no pop); hidden = 0
+     * draw calls. No allocation: scan scratch is pre-allocated. */
+    {
+      const S = A.shaft;
+      ATMOS._shaftTimer -= dt;
+      if (ATMOS._shaftTimer <= 0) {
+        ATMOS._shaftTimer += S.refresh;
+        ATMOS._refreshShafts();
+      }
+      const cap = S.tiers[TIER.active()];
+      const ease = 1 - Math.exp(-S.fade * dt);
+      for (let i = 0; i < ATMOS.shafts.length; i++) {
+        const s = ATMOS.shafts[i];
+        const b = ATMOS._best[i];
+        const on = i < cap && b.d2 !== Infinity;
+        if (on && (s.x !== b.x || s.z !== b.z)) {
+          s.x = b.x; s.z = b.z; s.tip = b.tip;
+        }
+        s.op += ((on ? 1 : 0) - s.op) * ease;
+        if (s.op < 0.004) s.op = 0;
+        s.mesh.visible = s.op > 0;
+        if (!s.mesh.visible) continue;
+        s.mesh.material.opacity = S.opacity * s.op;
+        /* short spire ⇒ scale the cone down to the tip (beam ends at
+         * the ground); tall spire ⇒ full length below the tip */
+        if (s.tip >= S.len) {
+          s.mesh.scale.y = 1;
+          s.mesh.position.set(s.x, s.tip - S.len * 0.5, s.z);
+        } else {
+          s.mesh.scale.y = s.tip / S.len;
+          s.mesh.position.set(s.x, s.tip * 0.5, s.z);
+        }
+      }
+      /* creature core shaft: the core eye is the light source */
+      const cs = ATMOS.coreShaft;
+      let coreOn = 0;
+      const eye = ENTITY.parts && ENTITY.parts.coreEye;
+      if (eye) {
+        ATMOS._corePos.setFromMatrixPosition(eye.matrixWorld);
+        const d = Math.hypot(
+          ATMOS._corePos.x - CAMERA.pos.x,
+          ATMOS._corePos.z - CAMERA.pos.z);
+        if (d < S.coreRadius || ENTITY.state !== 'DORMANT') coreOn = 1;
+      }
+      cs.op += (coreOn - cs.op) * ease;
+      if (cs.op < 0.004) cs.op = 0;
+      cs.mesh.visible = cs.op > 0;
+      if (cs.mesh.visible) {
+        cs.mesh.material.opacity = S.opacity * 1.5 * cs.op;
+        const tip = ATMOS._corePos.y;
+        if (tip >= S.coreLen) {
+          cs.mesh.scale.y = 1;
+          cs.mesh.position.set(
+            ATMOS._corePos.x, tip - S.coreLen * 0.5, ATMOS._corePos.z);
+        } else {
+          cs.mesh.scale.y = tip / S.coreLen;
+          cs.mesh.position.set(
+            ATMOS._corePos.x, tip * 0.5, ATMOS._corePos.z);
+        }
+      }
     }
   },
 

@@ -242,6 +242,26 @@
  *     the core zone (shots/m82-fog-{core,outer}.png)
  *   - no allocation per frame (heap flat)
  *
+ *   M8.3 checks (volumetric-ish light shafts — spires + creature core):
+ *   - registered: additive fog-off cone meshes in ATMOS.shaftGroup
+ *     (tiers.high spire slots + 1 creature core shaft), hidden at boot
+ *   - absent far away: at a pose with zero fiber spires in the shaft
+ *     radius every shaft is hidden and the draw-call delta vs the
+ *     group hidden is exactly 0 (no permanent draw calls)
+ *   - visible near a spire: at a street pose with a fiber spire
+ *     30–45 m out (readable silhouette, not a wall)
+ *     ≥ 1 shaft is visible, every visible anchor replays through
+ *     WORLD.buildingAt as a real fiber spire, draw-call delta equals
+ *     the visible count, and an on/off screenshot pair shows the
+ *     shaft adding light in a strip around the spire
+ *     (shots/m83-shafts-near.png)
+ *   - tier cap: TIER low trims spire shafts to the low cap, HIGH
+ *     restores
+ *   - awakening seam: ENTITY.state = 'AWAKE' at the far pose forces
+ *     the creature core shaft on (+1 draw call), restoring 'DORMANT'
+ *     hides it again
+ *   - no allocation per frame (heap flat)
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -3456,6 +3476,7 @@ try {
       return {
         inSystems: S.systems.map(x => x.name).includes('ATMOS'),
         children: A.root.children.length,
+        shaftGroup: !!A.shaftGroup && A.root.children.includes(A.shaftGroup),
         dome: A.dome.geometry.type === 'SphereGeometry' &&
           domeM.side === 1 && domeM.fog === false &&   // 1 = BackSide
           domeM.depthWrite === false && domeM.map !== null,
@@ -3474,8 +3495,8 @@ try {
       };
     });
     check('M8.1: ATMOS registered — gradient dome (BackSide, fog-off), additive stars, faint additive aurora band',
-      reg.inSystems && reg.children === 3 && reg.dome && reg.stars &&
-      reg.aurora && reg.radius < reg.far,
+      reg.inSystems && reg.children === 4 && reg.dome && reg.stars &&
+      reg.aurora && reg.shaftGroup && reg.radius < reg.far,
       `stars=${reg.starCount}, drawRange=${reg.drawRange}`);
 
     /* camera follow: move the camera to a fixed pose — the dome and
@@ -3872,6 +3893,445 @@ try {
       `before=${Math.round(heapBefore / 1024)}KB,` +
       ` after=${Math.round(heapAfter / 1024)}KB`);
   }
+
+  /* ------------------------------------------------------------------
+   * M8.3 — volumetric-ish light shafts (key spires + creature core)
+   *
+   *  ATMOS.shaftGroup holds tiers.high additive spire cones + one
+   *  creature core cone. A shaft is only visible when its source is
+   *  near (spire radius / core radius) or, for the core, during
+   *  awakening (ENTITY.state !== 'DORMANT' — M9 seam). Hidden shafts
+   *  cost 0 draw calls ⇒ far away the group is free.
+   * ------------------------------------------------------------------ */
+  {
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, A = S.ATMOS;
+      const m = s => s.mesh.material;
+      return {
+        group: !!A.shaftGroup && !!A.shaftGroup.name,
+        spires: A.shafts.length,
+        capHigh: S.CFG.atmos.shaft.tiers.high,
+        allAdditive: A.shafts.every(s =>
+          m(s).blending === 2 && m(s).fog === false &&
+          m(s).depthWrite === false && m(s).transparent === true &&
+          m(s).map !== null && s.mesh.geometry.type === 'CylinderGeometry'),
+        core: !!A.coreShaft &&
+          A.coreShaft.mesh.geometry.type === 'CylinderGeometry' &&
+          m(A.coreShaft).blending === 2 && m(A.coreShaft).fog === false,
+        preAlloc: Array.isArray(A._best) && A._best.length ===
+          S.CFG.atmos.shaft.tiers.high,
+      };
+    });
+    check('M8.3: light shafts registered — additive fog-off cones in ATMOS.shaftGroup (spire slots + creature core), scan scratch pre-allocated',
+      reg.group && reg.spires === reg.capHigh && reg.allAdditive &&
+      reg.core && reg.preAlloc,
+      `spireShafts=${reg.spires} (cap high=${reg.capHigh}), coreShaft=${reg.core ? 1 : 0}`);
+
+    /* shared helpers */
+    /* draw-call measurement: per-pair (group on → off) deltas, median of
+     * n pairs — robust against transient one-frame dips from other
+     * systems (vehicles, drones); abs = median of the on-samples */
+    const medDelta = async n => page.evaluate(async (n) => {
+      const S = window.SIM, A = S.ATMOS;
+      const d = [], abs = [];
+      for (let i = 0; i < n; i++) {
+        A.shaftGroup.visible = true;
+        await new Promise(r => setTimeout(r, 110));
+        const a = S.renderer.info.render.calls;
+        abs.push(a);
+        A.shaftGroup.visible = false;
+        await new Promise(r => setTimeout(r, 110));
+        const b = S.renderer.info.render.calls;
+        d.push(a - b);
+      }
+      A.shaftGroup.visible = true;
+      d.sort((x, y) => x - y);
+      abs.sort((x, y) => x - y);
+      return { delta: d[n >> 1], abs: abs[n >> 1] };
+    }, n);
+    const setPose = (mode, x, y, z, yaw, pitch) => page.evaluate(
+      ({ mode, x, y, z, yaw, pitch }) => {
+        const C = window.SIM.CAMERA;
+        C.setMode(mode);
+        C.pos.set(x, y, z);
+        C.vel.set(0, 0, 0);
+        C.fov = 60;                     // reset wheel zoom ⇒ deterministic
+        C.yaw = yaw;
+        C.pitch = pitch;
+      }, { mode, x, y, z, yaw, pitch });
+
+    /* far pose: a deterministic pose with ZERO fiber spires in the
+     * shaft radius. The city always regenerates around the camera, so
+     * "far" = a 130 m disc the seeded city happens to leave spire-
+     * free — searched on a golden-angle spiral (deterministic, the
+     * first zero is stable across runs). */
+    const farPose = await page.evaluate(() => {
+      const S = window.SIM, W = S.WORLD;
+      const R = S.CFG.atmos.shaft.radius, B = W.BLOCK, K = W.CHUNK;
+      const cands = [];
+      for (let i = 0; i < 2000; i++) {
+        const d = 200 + 1400 * Math.sqrt((i + 0.5) / 2000);
+        const az = i * 2.399963;
+        cands.push([Math.cos(az) * d, 80, Math.sin(az) * d]);
+      }
+      const count = (px, pz) => {
+        const pcx = Math.floor(px / B), pcz = Math.floor(pz / B);
+        const pcx2 = Math.floor(pcx / K), pcz2 = Math.floor(pcz / K);
+        const n = Math.ceil(R / B);
+        let c = 0;
+        for (let bx = pcx - n; bx <= pcx + n; bx++)
+          for (let bz = pcz - n; bz <= pcz + n; bz++) {
+            const ring = Math.max(
+              Math.abs(Math.floor(bx / K) - pcx2),
+              Math.abs(Math.floor(bz / K) - pcz2));
+            if (W.buildingAt(bx, bz, ring, ['fiber'], 0)) c++;
+          }
+        return c;
+      };
+      for (const [x, y, z] of cands) if (count(x, z) === 0)
+        return { x, y, z };
+      return null;
+    });
+    check('M8.3: far pose exists (a deterministic pose with no spire in the shaft radius)',
+      farPose !== null);
+
+    /* near pose: a street-level deterministic candidate with a fiber
+     * spire ≤ 45 m away (prefer a tall spire for the visual gate) */
+    const nearPose = await page.evaluate(() => {
+      const S = window.SIM, W = S.WORLD;
+      const B = W.BLOCK, K = W.CHUNK, R = 45;
+      const cands = [];
+      for (const d of [180, 280, 380])
+        for (let a = 0; a < 16; a++) {
+          const az = a * Math.PI / 8;
+          cands.push([Math.cos(az) * d, 4, Math.sin(az) * d]);
+        }
+      const scan = (px, pz) => {
+        const pcx = Math.floor(px / B), pcz = Math.floor(pz / B);
+        const pcx2 = Math.floor(pcx / K), pcz2 = Math.floor(pcz / K);
+        const n = Math.ceil(R / B);
+        let best = null, total = 0;
+        for (let bx = pcx - n; bx <= pcx + n; bx++)
+          for (let bz = pcz - n; bz <= pcz + n; bz++) {
+            const ring = Math.max(
+              Math.abs(Math.floor(bx / K) - pcx2),
+              Math.abs(Math.floor(bz / K) - pcz2));
+            const c = W.buildingAt(bx, bz, ring, ['fiber'], 0);
+            if (!c) continue;
+            total++;
+            const dx = c.x - px, dz = c.z - pz;
+            const d2 = dx * dx + dz * dz;
+            /* 30–45 m: near enough for the shaft to read, far enough
+             * that the spire + cone are a silhouette, not a wall */
+            if (d2 > R * R || d2 < 900) continue;
+            if (!best || d2 < best.d2)
+              best = { x: c.x, z: c.z, tip: c.hTop, d2 };
+          }
+        return { best, total };
+      };
+      let fallback = null;
+      for (const [x, y, z] of cands) {
+        const { best, total } = scan(x, z);
+        if (!best) continue;
+        if (!fallback) fallback = { x, y, z, spire: best, total };
+        if (best.tip >= 25)
+          return { x, y, z, spire: best, total };
+      }
+      return fallback;
+    });
+    check('M8.3: near pose exists (a street pose with a fiber spire 30–45 m out)',
+      nearPose !== null,
+      nearPose ?
+        `spire tip=${nearPose.spire.tip.toFixed(1)} m,` +
+        ` d=${Math.sqrt(nearPose.spire.d2).toFixed(1)} m,` +
+        ` spiresIn45m=${nearPose.total}` : '');
+
+    if (!farPose || !nearPose) {
+      /* the two pose checks above already recorded the failure — the
+       * remaining M8.3 checks need both poses */
+      console.log('  [SKIP] M8.3: remaining checks skipped (pose missing)');
+    } else {
+      const sp = nearPose.spire;
+      /* aim the far pose at the plaza — the AWAKE seam's core shaft
+       * (at the plaza) must be in frame to be drawn */
+      const farYaw = Math.atan2(farPose.x, farPose.z);
+
+      /* absent far away: every shaft hidden, 0 draw-call delta vs the
+       * group hidden (no permanent draw calls) */
+      await setPose('CINE', farPose.x, farPose.y, farPose.z, farYaw, -0.1);
+      await page.evaluate(() => window.SIM.ATMOS._refreshShafts());
+      await sleep(3400);   // forced scan + full opacity ease-out (τ ≈ 2.9 s)
+      const farState = await page.evaluate(() => {
+        const S = window.SIM, A = S.ATMOS;
+        return {
+          spireVisible: A.shafts.filter(s => s.mesh.visible).length,
+          coreVisible: A.coreShaft.mesh.visible,
+        };
+      });
+      const farCalls = await medDelta(7);
+      check('M8.3: absent far away — every shaft hidden, 0 permanent draw calls',
+        farState.spireVisible === 0 && farState.coreVisible === false &&
+        farCalls.delta === 0 && farCalls.abs < 150,
+        `shown=${farCalls.abs}, delta=${farCalls.delta}`);
+      await page.screenshot({ path: `${here}/shots/m83-shafts-far.png` });
+
+      /* stand near the spire looking at its tip */
+      const nd = Math.sqrt(sp.d2);
+      const yaw = Math.atan2(-(sp.x - nearPose.x), -(sp.z - nearPose.z));
+      /* positive pitch = look up (CAMERA._camDir convention) */
+      const pitch = Math.min(
+        1.2, Math.max(0.1, Math.atan2(sp.tip - nearPose.y, nd) * 0.85));
+      await setPose('GROUND', nearPose.x, nearPose.y, nearPose.z, yaw, pitch);
+      await page.evaluate(() => window.SIM.ATMOS._refreshShafts());
+      await sleep(3000);   // forced scan + opacity ease-in settle
+      const nearState = await page.evaluate(() => {
+        const S = window.SIM, A = S.ATMOS;
+        const vis = A.shafts.filter(s => s.mesh.visible);
+        /* frustum-culled cones are not drawn — count only the visible
+         * shafts whose tip projects inside NDC (scratch vector, no
+         * allocation) */
+        /* exact renderer culling: the 6 frustum planes of P×V vs the
+         * cone bounding sphere — the same test WebGLRenderer runs
+         * (a cone is drawn even when its tip projects off-frame) */
+        const P = S.camera.projectionMatrix.elements;
+        const V = S.camera.matrixWorldInverse.elements;
+        const M = new Array(16);
+        for (let r = 0; r < 4; r++)
+          for (let c = 0; c < 4; c++) {
+            let acc = 0;
+            for (let k = 0; k < 4; k++) acc += P[r + 4 * k] * V[k + 4 * c];
+            M[r + 4 * c] = acc;
+          }
+        /* same extraction as Frustum.setFromProjectionMatrix:
+         * plane i = row3 ± rowi, normalised (constant from the w part) */
+        const row = i => [M[i], M[i + 4], M[i + 8], M[i + 12]];
+        const r3 = row(3);
+        const planes = [];
+        for (const i of [0, 1, 2])
+          for (const sgn of [1, -1]) {
+            const ri = row(i);
+            const nx = r3[0] + sgn * ri[0], ny = r3[1] + sgn * ri[1],
+                  nz = r3[2] + sgn * ri[2];
+            const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+            const nw = r3[3] + sgn * ri[3];
+            planes.push([nx / len, ny / len, nz / len, nw / len]);
+          }
+        const L = S.CFG.atmos.shaft.len,
+              RB = S.CFG.atmos.shaft.rBottom;
+        const bRadius = Math.sqrt((L / 2) * (L / 2) + RB * RB);
+        let inFrame = 0;
+        for (const s of vis) {
+          const p = s.mesh.position;
+          let out = false;
+          for (const pl of planes)
+            if (pl[0] * p.x + pl[1] * p.y + pl[2] * p.z + pl[3] < -bRadius) {
+              out = true;
+              break;
+            }
+          if (!out) inFrame++;
+        }
+        return {
+          visible: vis.length,
+          inFrame,
+          coreVisible: A.coreShaft.mesh.visible,
+          anchors: vis.map(s => ({ x: s.x, z: s.z, tip: s.tip })),
+          cap: S.CFG.atmos.shaft.tiers.high,
+        };
+      });
+      /* every visible anchor must replay through the seeded path as a
+       * real fiber spire (the same buildingAt replay the system uses) */
+      const anchorsReal = await page.evaluate(anchors => {
+        const S = window.SIM, W = S.WORLD;
+        const B = W.BLOCK, K = W.CHUNK;
+        const pcx2 = Math.floor(Math.floor(S.CAMERA.pos.x / B) / K);
+        const pcz2 = Math.floor(Math.floor(S.CAMERA.pos.z / B) / K);
+        return anchors.every(a => {
+          const bx = Math.floor(a.x / B), bz = Math.floor(a.z / B);
+          const ring = Math.max(
+            Math.abs(Math.floor(bx / K) - pcx2),
+            Math.abs(Math.floor(bz / K) - pcz2));
+          const c = W.buildingAt(bx, bz, ring, ['fiber'], 0);
+          return c && c.x === a.x && c.z === a.z && c.hTop === a.tip;
+        });
+      }, nearState.anchors);
+      const nearCalls = await medDelta(7);
+      check('M8.3: visible near a spire — ≥ 1 shaft, anchors are real seeded fiber spires, +N draw calls (N = in-frame)',
+        nearState.visible >= 1 && nearState.visible <= nearState.cap &&
+        anchorsReal && nearState.inFrame >= 1 &&
+        nearCalls.delta === nearState.inFrame &&
+        nearCalls.abs < 150,
+        `visible=${nearState.visible} (cap ${nearState.cap}),` +
+        ` inFrame=${nearState.inFrame}, shown=${nearCalls.abs},` +
+        ` delta=${nearCalls.delta}`);
+
+      /* tier cap: LOW trims spire shafts to the low cap, HIGH restores
+       * the full nearest-N (the scan keeps the nearest N, so the
+       * surviving shaft is always the nearest spire) */
+      const tierCap = await page.evaluate(async () => {
+        const S = window.SIM, A = S.ATMOS;
+        const vis = () => A.shafts.filter(s => s.mesh.visible).length;
+        /* actual candidate count at the shaft radius (the 45 m search
+         * radius above is smaller than the 130 m shaft radius) */
+        const W = S.WORLD, R = S.CFG.atmos.shaft.radius,
+          B = W.BLOCK, K = W.CHUNK;
+        const pcx = Math.floor(S.CAMERA.pos.x / B),
+          pcz = Math.floor(S.CAMERA.pos.z / B);
+        const pcx2 = Math.floor(pcx / K), pcz2 = Math.floor(pcz / K);
+        const n = Math.ceil(R / B);
+        let total = 0;
+        for (let bx = pcx - n; bx <= pcx + n; bx++)
+          for (let bz = pcz - n; bz <= pcz + n; bz++) {
+            const ring = Math.max(
+              Math.abs(Math.floor(bx / K) - pcx2),
+              Math.abs(Math.floor(bz / K) - pcz2));
+            const c = W.buildingAt(bx, bz, ring, ['fiber'], 0);
+            if (!c) continue;
+            const dx = c.x - S.CAMERA.pos.x, dz = c.z - S.CAMERA.pos.z;
+            if (dx * dx + dz * dz <= R * R) total++;
+          }
+        S.TIER.set('low');
+        await new Promise(r => setTimeout(r, 3200));
+        const low = vis();
+        const lowCap = S.CFG.atmos.shaft.tiers.low;
+        S.TIER.set('high');
+        await new Promise(r => setTimeout(r, 3200));
+        const high = vis();
+        const highCap = S.CFG.atmos.shaft.tiers.high;
+        return { low, lowCap, high, highCap, total };
+      });
+      check('M8.3: tier cap — LOW trims spire shafts to the low cap, HIGH restores',
+        tierCap.low === Math.min(tierCap.total, tierCap.lowCap) &&
+        tierCap.high === Math.min(tierCap.total, tierCap.highCap),
+        `low=${tierCap.low} (cap ${tierCap.lowCap}),` +
+        ` high=${tierCap.high} (cap ${tierCap.highCap}),` +
+        ` spiresInRadius=${tierCap.total}`);
+
+      /* visual gate: on/off screenshot pair — the shaft adds light in
+       * a vertical strip around the spire (tip projected in-page) */
+      const proj = await page.evaluate(({ x, z, tip }) => {
+        const S = window.SIM;
+        const v = S.ATMOS._corePos.set(x, tip, z);   // scratch, no alloc
+        v.project(S.camera);
+        return { nx: v.x, ny: v.y };
+      }, { x: sp.x, z: sp.z, tip: sp.tip });
+      const stripStats = b64 => page.evaluate(async ({ b64, proj }) => {
+        const img = new Image();
+        await new Promise((res, rej) => {
+          img.onload = res; img.onerror = rej;
+          img.src = 'data:image/png;base64,' + b64;
+        });
+        const c = document.createElement('canvas');
+        c.width = img.width; c.height = img.height;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        /* vertical strip centred on the projected spire: x ± 8 % of
+         * the frame (the light column), top 75 % (the cone hangs
+         * below the tip) */
+        const cx = Math.round((proj.nx * 0.5 + 0.5) * c.width);
+        const x0 = Math.max(0, Math.round(cx - c.width * 0.08));
+        const x1 = Math.min(c.width, Math.round(cx + c.width * 0.08));
+        const h = Math.floor(c.height * 0.75);
+        const d = ctx.getImageData(x0, 0, x1 - x0, h).data;
+        let sum = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+        }
+        return sum / (d.length / 4);
+      }, { b64, proj });
+      /* 2 on/off pairs, averaged — the scene animates (stars, LEDs,
+       * particles) so a single pair is noisier than the faint shaft */
+      let offSum = 0, onSum = 0;
+      for (let i = 0; i < 2; i++) {
+        await page.evaluate(() => {
+          window.SIM.ATMOS.shaftGroup.visible = false;
+        });
+        await sleep(150);
+        offSum += await stripStats(
+          (await page.screenshot()).toString('base64'));
+        await page.evaluate(() => {
+          window.SIM.ATMOS.shaftGroup.visible = true;
+        });
+        await sleep(150);
+        const nearShot = await page.screenshot(
+          { path: `${here}/shots/m83-shafts-near.png` });
+        onSum += await stripStats(nearShot.toString('base64'));
+      }
+      const offStrip = offSum / 2, onStrip = onSum / 2;
+      check('M8.3: shaft visible standing near a spire (shots/m83-shafts-near.png) — the cone adds light in the strip',
+        fs.existsSync(`${here}/shots/m83-shafts-near.png`) &&
+        onStrip > offStrip + 0.5,
+        `strip mean ${offStrip.toFixed(2)} → ${onStrip.toFixed(2)}`);
+
+      /* awakening seam (M9): at the far pose, ENTITY.state = 'AWAKE'
+       * forces the creature core shaft on even with no spire nearby;
+       * restoring 'DORMANT' hides it again */
+      await setPose('CINE', farPose.x, farPose.y, farPose.z, farYaw, -0.1);
+      await page.evaluate(() => window.SIM.ATMOS._refreshShafts());
+      await sleep(3400);   // forced scan + fade the near-pose shafts out
+      const awake = await page.evaluate(async () => {
+        const S = window.SIM, A = S.ATMOS;
+        /* per-pair (group on → off) delta, median of n pairs */
+        const medDelta = async n => {
+          const d = [];
+          for (let i = 0; i < n; i++) {
+            A.shaftGroup.visible = true;
+            await new Promise(r => setTimeout(r, 110));
+            const a = S.renderer.info.render.calls;
+            A.shaftGroup.visible = false;
+            await new Promise(r => setTimeout(r, 110));
+            const b = S.renderer.info.render.calls;
+            d.push(a - b);
+          }
+          A.shaftGroup.visible = true;
+          d.sort((x, y) => x - y);
+          return d[n >> 1];
+        };
+        S.ENTITY.state = 'AWAKE';
+        await new Promise(r => setTimeout(r, 3200));
+        const coreOn = A.coreShaft.mesh.visible;
+        const spireOn = A.shafts.filter(s => s.mesh.visible).length;
+        const coreDelta = await medDelta(7);
+        S.ENTITY.state = 'DORMANT';
+        await new Promise(r => setTimeout(r, 3200));
+        const allHidden =
+          A.shafts.every(s => !s.mesh.visible) && !A.coreShaft.mesh.visible;
+        const restoredDelta = await medDelta(7);
+        return {
+          coreOn, spireOn, coreDelta,
+          allHidden, restoredDelta,
+        };
+      });
+      check('M8.3: awakening seam — AWAKE forces the core shaft on (+1 draw call) far away, DORMANT hides it',
+        awake.coreOn && awake.spireOn === 0 && awake.coreDelta === 1 &&
+        awake.allHidden && awake.restoredDelta === 0,
+        `coreOn=${awake.coreOn}, coreDelta=${awake.coreDelta},` +
+        ` restoredDelta=${awake.restoredDelta}`);
+
+      /* back to a neutral pose for the tail checks */
+      await setPose('GROUND', -180, 40, 180, 2.22, -0.35);
+    }
+
+    /* heap flat across pure animation frames (the camera teleports
+     * and screenshots above are harness costs, not ATMOS) */
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const heapBefore = await heapMin();
+    await sleep(600);
+    const heapAfter = await heapMin();
+    check('M8.3: no allocation per frame (heap flat across the shaft sequence)',
+      heapBefore > 0 && heapAfter > 0 &&
+      heapAfter - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,` +
+      ` after=${Math.round(heapAfter / 1024)}KB`);
+  }
+
 
   /* ---- 10. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
