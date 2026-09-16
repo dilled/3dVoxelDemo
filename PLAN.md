@@ -61,7 +61,7 @@ smoke-test evidence.
 | **M7.4** ✅ | Screen-space flash: overlay-scene additive plane (or DOM div) driven by `FX.flash(intensity)` | Manual key flashes screen; decays to zero; costs nothing idle |
 | **M7.5** ✅ | Camera shake: impulse-decay system consumed by `CAMERA` | Manual key shakes camera with clean decay to still; never accumulates |
 | **M8.1** ✅ | Night sky: gradient sky dome (big sphere, canvas/shader texture), stars, faint aurora band | Night mood readable from street level; dome correct from street, orbit, and far fly |
-| **M8.2** | Fog depth tune + zone-tinted haze (cyan core / warm avenues) via fog color lerp | Depth readable at 500 m; zone tint visible flying across zones |
+| **M8.2** ✅ | Fog depth tune + zone-tinted haze (cyan core / warm avenues) via fog color lerp | Depth readable at 500 m; zone tint visible flying across zones |
 | **M8.3** | Volumetric-ish light shafts: a few additive cone/cylinder meshes from key spires + creature core (only when near / during awakening) | Shafts visible near spire, absent far away (no permanent draw calls) |
 | **M8.4** | Distant lightning: random far point + brief hemi bump + flash + EM discharge ring across the city | Lightning event visible from inside the city; fires on timer + manual key |
 | **M9.1** | Idle/dormant animation: tensor-ring rotation, antenna sway, breathing core, periodic "dream" LED wave across the node grid (instance-color waves) | Dream wave sweeps the node grid visibly; dormant state stays dim and still-ish |
@@ -475,11 +475,35 @@ nothing while idle.
   {street,orbit,far}.png`.
 
 #### M8.2 — Fog depth + zone tint
-- [ ] Fog tuned for depth; haze tinted by zone (cyan core / warm avenues)
+- [x] Fog tuned for depth; haze tinted by zone (cyan core / warm avenues)
       via fog color lerp.
 - **Test:** depth readable at 500 m; zone tint visible while flying
       across zones.
 - **Commit when:** both verified on screen.
+- **Verified:** smoke M8.2 section green — fog depth tuned (FogExp2
+  ρ 0.004 → 0.0028 in `CFG.atmos.fog.density`: analytic factor
+  f(100 m) = 7.5 % ⇒ street range clear, f(500 m) = 85.9 % ⇒ distant
+  structures survive as readable silhouettes instead of the old 98 %
+  swallow); zone-tinted haze in `ATMOS.update` — `scene.fog.color`
+  smoothstep-lerps by camera XZ distance from the plaza across the M3
+  zone boundaries (220/520 m): cyan core `0x081726` → warm outer
+  avenues `0x241a10`, all colors pre-allocated at init (heap flat,
+  zero per-frame allocation); dome horizon tint syncs so sky and haze
+  never disagree (cool in the core, warm outside); analytic zone check
+  (fog color at core/mid/outer poses: cyan-dominant → warm-dominant,
+  mid-zone exactly the lerp midpoint at k = 0.5); visual gates:
+  500 m fog-on/fog-off screenshot pair — city region keeps a solid
+  share of mean luminance and edge detail through the haze
+  (`shots/m82-fog-500m.png`), zone tint visible flying across zones —
+  city-region warmth (mean R − mean B) core −21.8 → outer −1.0
+  (`shots/m82-fog-{core,outer}.png`); fog-off reference uses density 0
+  (nulling `scene.fog` would throw in ATMOS and disable the subsystem)
+  with a no-disabled-subsystems assert. Note: the pre-existing
+  timing-sensitive smoke checks (M6.2 heap-flat, M6.3 fleet growth,
+  M7.5 key-N shake) flake in this headless environment (rAF timing /
+  GC noise) — baseline runs at the pre-M8.2 HEAD failed the M6.3
+  fleet check, the M6.2 heap flake is documented since M7.4/M7.5, and
+  both pass on other runs; environmental, not M8.2 regressions.
 
 #### M8.3 — Light shafts
 - [ ] A few additive cone/cylinder meshes from key spires and the

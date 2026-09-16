@@ -229,6 +229,19 @@
  *     more bright star pixels (stars), more greenish pixels
  *     (aurora band); shots saved as m81-sky-*.png
  *
+ *   M8.2 checks (fog depth tune + zone-tinted haze):
+ *   - fog depth tuned: FogExp2 factor analytic — street range clear,
+ *     500 m hazed but structures still readable (fog on/off screenshot
+ *     pair at 500 m: city-region mean + edge detail survive the haze)
+ *   - zone tint: fog color smoothstep-lerps cyan (core) → warm
+ *     (outer avenues) across the M3 zone boundaries (220/520 m from
+ *     the plaza) — analytic at core/mid/outer poses, mid-zone color is
+ *     the lerp midpoint; dome horizon tint syncs (cool → warm)
+ *   - zone tint visible flying across zones: city-region warmth
+ *     (mean R − mean B) measurably higher in the outer zone than in
+ *     the core zone (shots/m82-fog-{core,outer}.png)
+ *   - no allocation per frame (heap flat)
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -3658,6 +3671,202 @@ try {
     await sleep(600);
     const heapAfter = await heapMin();
     check('M8.1: no allocation per frame (heap flat across the sky sequence)',
+      heapBefore > 0 && heapAfter > 0 &&
+      heapAfter - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,` +
+      ` after=${Math.round(heapAfter / 1024)}KB`);
+  }
+
+  /* ------------------------------------------------------------------
+   * M8.2 — fog depth tune + zone-tinted haze (cyan core / warm avenues)
+   *
+   *  The scene FogExp2 density is tuned so depth stays readable at
+   *  500 m, and the fog color smoothstep-lerps (pre-allocated
+   *  colors, zero per-frame allocation) from a cyan haze in the core
+   *  to a warm haze in the outer avenues as the camera crosses the
+   *  M3 zone boundaries (220 / 520 m from the plaza). The dome
+   *  horizon tint syncs with the haze.
+   * ------------------------------------------------------------------ */
+  {
+    /* depth tune: analytic FogExp2 factor bounds (three.js FogExp2:
+     * factor(d) = 1 − exp(−(ρ·d)²)) */
+    const fogTune = await page.evaluate(() => {
+      const S = window.SIM;
+      const f = d => 1 - Math.exp(-Math.pow(S.scene.fog.density * d, 2));
+      return { density: S.scene.fog.density, f100: f(100), f500: f(500) };
+    });
+    check('M8.2: fog depth tuned — street range clear, 500 m hazed but readable',
+      fogTune.density < 0.004 && fogTune.f100 <= 0.15 &&
+      fogTune.f500 >= 0.70 && fogTune.f500 <= 0.92,
+      `ρ=${fogTune.density}, f(100)=${(fogTune.f100 * 100).toFixed(1)}%,` +
+      ` f(500)=${(fogTune.f500 * 100).toFixed(1)}%`);
+
+    /* zone lerp: analytic fog color at core / mid / outer poses
+     * (camera XZ distance from the plaza: 150 / 370 / 700 m ⇒
+     *  k = 0 / 0.5 / 1 on the 220–520 m smoothstep) */
+    const zoneLerp = await page.evaluate(async () => {
+      const S = window.SIM, A = S.ATMOS;
+      const fogAt = async (x, y, z) => {
+        const C = S.CAMERA;
+        C.setMode('CINE');
+        C.pos.set(x, y, z); C.vel.set(0, 0, 0);
+        C.fov = 60; C.yaw = 0; C.pitch = -0.12;
+        await new Promise(r => setTimeout(r, 150));
+        const f = S.scene.fog.color, m = A.dome.material.color;
+        return { r: f.r, g: f.g, b: f.b, domeR: m.r, domeG: m.g, domeB: m.b };
+      };
+      const core = await fogAt(0, 60, 150);     // d = 150 < 220 ⇒ k = 0
+      const mid = await fogAt(0, 60, 370);      // d = 370 ⇒ k = 0.5
+      const outer = await fogAt(0, 60, 700);    // d = 700 > 520 ⇒ k = 1
+      return { core, mid, outer };
+    });
+    check('M8.2: fog color lerps cyan (core) → warm (outer avenues) across zones',
+      zoneLerp.core.b > zoneLerp.core.r &&
+      zoneLerp.outer.r > zoneLerp.outer.b &&
+      zoneLerp.core.r < zoneLerp.mid.r && zoneLerp.mid.r < zoneLerp.outer.r &&
+      zoneLerp.core.b > zoneLerp.mid.b && zoneLerp.mid.b > zoneLerp.outer.b,
+      `core=(${zoneLerp.core.r.toFixed(4)},${zoneLerp.core.g.toFixed(4)},${zoneLerp.core.b.toFixed(4)},` +
+      ` outer=(${zoneLerp.outer.r.toFixed(4)},${zoneLerp.outer.g.toFixed(4)},${zoneLerp.outer.b.toFixed(4)})`);
+    check('M8.2: mid-zone fog color is the lerp midpoint (smoothstep k = 0.5)',
+      Math.abs(zoneLerp.mid.r - (zoneLerp.core.r + zoneLerp.outer.r) / 2) < 0.002 &&
+      Math.abs(zoneLerp.mid.g - (zoneLerp.core.g + zoneLerp.outer.g) / 2) < 0.002 &&
+      Math.abs(zoneLerp.mid.b - (zoneLerp.core.b + zoneLerp.outer.b) / 2) < 0.002,
+      `mid=(${zoneLerp.mid.r.toFixed(4)},${zoneLerp.mid.g.toFixed(4)},${zoneLerp.mid.b.toFixed(4)})`);
+    check('M8.2: dome horizon tint syncs with the haze (cool in the core, warm outside)',
+      zoneLerp.core.domeB > zoneLerp.core.domeR &&
+      zoneLerp.outer.domeR > zoneLerp.outer.domeB,
+      `core dome=(${zoneLerp.core.domeR.toFixed(3)},${zoneLerp.core.domeG.toFixed(3)},${zoneLerp.core.domeB.toFixed(3)},` +
+      ` outer dome=(${zoneLerp.outer.domeR.toFixed(3)},${zoneLerp.outer.domeG.toFixed(3)},${zoneLerp.outer.domeB.toFixed(3)})`);
+
+    /* city-region pixel stats: bottom 55 % of the frame (the city,
+     * below the horizon) — mean luminance, horizontal edge detail
+     * (structure survives ⇒ readable), and warmth (mean R − mean B)
+     * for the zone-tint check. Decoded in-page via dataURL → 2D
+     * canvas. */
+    const cityStats = b64 => page.evaluate(async (b64) => {
+      const img = new Image();
+      await new Promise((res, rej) => {
+        img.onload = res; img.onerror = rej;
+        img.src = 'data:image/png;base64,' + b64;
+      });
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const y0 = Math.floor(c.height * 0.45);
+      const h = c.height - y0;
+      const d = ctx.getImageData(0, y0, c.width, h).data;
+      const prev = new Float32Array(c.width);
+      let sum = 0, rSum = 0, bSum = 0, edges = 0;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < c.width; x++) {
+          const i = (y * c.width + x) * 4;
+          const l = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+          sum += l; rSum += d[i]; bSum += d[i + 2];
+          if (x > 0 && Math.abs(l - prev[x - 1]) > 10) edges++;
+          prev[x] = l;
+        }
+      }
+      const n = c.width * h;
+      return { mean: sum / n, warmth: (rSum - bSum) / n, edges };
+    }, b64);
+
+    /* visual gate 1 — depth readable at 500 m: deterministic pose
+     * 520 m from the plaza looking back at the city; fog-on vs
+     * fog-off screenshot pair. The city region must keep a solid
+     * share of its mean luminance AND its edge detail through the
+     * haze (swallowed city ⇒ flat haze ⇒ detail collapses). The
+     * on-shot is saved as the milestone screenshot. */
+    await page.evaluate(() => {
+      const S = window.SIM, C = S.CAMERA;
+      C.setMode('CINE');
+      C.pos.set(0, 80, 520); C.vel.set(0, 0, 0);
+      C.fov = 60; C.yaw = 0; C.pitch = -0.15;
+    });
+    await sleep(450);
+    const depthOnShot = await page.screenshot(
+      { path: `${here}/shots/m82-fog-500m.png` });
+    /* fog-off reference via density 0 (NOT scene.fog = null — ATMOS
+     * reads scene.fog.color every frame, and a null fog would throw
+     * and disable the subsystem for the rest of the session) */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S._fogDensityBackup = S.scene.fog.density;
+      S.scene.fog.density = 0;
+    });
+    await sleep(150);
+    const depthOffB64 = (await page.screenshot()).toString('base64');
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.scene.fog.density = S._fogDensityBackup;
+    });
+    await sleep(150);
+    /* a subsystem that throws gets permanently disabled (update =
+     * null) — the fog-off reference above must not have triggered it */
+    const intact = await page.evaluate(() =>
+      window.SIM.systems.every(s => s.update !== null));
+    check('M8.2: fog-off reference leaves every subsystem intact (no runtime error)',
+      intact);
+    const depthOn = await cityStats(depthOnShot.toString('base64'));
+    const depthOff = await cityStats(depthOffB64);
+    check('M8.2: depth readable at 500 m (shots/m82-fog-500m.png) — city survives the haze',
+      fs.existsSync(`${here}/shots/m82-fog-500m.png`) &&
+      depthOn.mean >= 0.5 * depthOff.mean &&
+      depthOn.edges >= 0.25 * depthOff.edges,
+      `mean ${depthOff.mean.toFixed(1)} → ${depthOn.mean.toFixed(1)},` +
+      ` edges ${depthOff.edges} → ${depthOn.edges}`);
+
+    /* visual gate 2 — zone tint visible flying across zones: same
+     * look (CINE, yaw 0, pitch −0.12, fov 60) from inside the core
+     * zone (d = 150 m) and the outer zone (d = 700 m); the city
+     * region must be measurably warmer (mean R − mean B) in the
+     * outer zone. Both shots saved. */
+    const zoneShot = async (name, x, y, z) => {
+      await page.evaluate(([x, y, z]) => {
+        const S = window.SIM, C = S.CAMERA;
+        C.setMode('CINE');
+        C.pos.set(x, y, z); C.vel.set(0, 0, 0);
+        C.fov = 60; C.yaw = 0; C.pitch = -0.12;
+      }, [x, y, z]);
+      await sleep(450);
+      const shot = await page.screenshot({ path: `${here}/shots/${name}.png` });
+      return cityStats(shot.toString('base64'));
+    };
+    const tintCore = await zoneShot('m82-fog-core', 0, 60, 150);
+    const tintOuter = await zoneShot('m82-fog-outer', 0, 60, 700);
+    check('M8.2: zone tint visible flying across zones (shots/m82-fog-{core,outer}.png) — outer haze warmer than core',
+      fs.existsSync(`${here}/shots/m82-fog-core.png`) &&
+      fs.existsSync(`${here}/shots/m82-fog-outer.png`) &&
+      tintOuter.warmth - tintCore.warmth >= 3,
+      `warmth core=${tintCore.warmth.toFixed(2)},` +
+      ` outer=${tintOuter.warmth.toFixed(2)}`);
+
+    /* back to a neutral pose for the tail checks */
+    await page.evaluate(() => {
+      const S = window.SIM, C = S.CAMERA;
+      C.setMode('GROUND');
+      C.pos.set(-180, 40, 180);
+      C.vel.set(0, 0, 0);
+      C.fov = 60;
+      C.yaw = 2.22;
+      C.pitch = -0.35;
+    });
+
+    /* heap flat across pure animation frames (the camera teleports
+     * and screenshots above are harness costs, not ATMOS) */
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const heapBefore = await heapMin();
+    await sleep(600);
+    const heapAfter = await heapMin();
+    check('M8.2: no allocation per frame (heap flat across the fog sequence)',
       heapBefore > 0 && heapAfter > 0 &&
       heapAfter - heapBefore <= 2 * 1024 * 1024,
       `before=${Math.round(heapBefore / 1024)}KB,` +

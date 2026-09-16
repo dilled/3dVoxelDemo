@@ -192,8 +192,7 @@ const CFG = {
   bootWatchdogMs: 15000,
   color: {
     void: 0x05070d,        // M0/M1 empty-void background
-    fog: 0x060a14,
-    fogDensity: 0.004,
+    fog: 0x060a14,        // initial haze (ATMOS re-tints it per zone, M8.2)
   },
   input: {
     lookSens: 0.0022,          // radians per mouse pixel
@@ -433,6 +432,23 @@ const CFG = {
       opacity: 0.45,        // faint (texture alpha fades it further)
       spin: 0.012,           // rad/s — slow drift
     },
+
+    /* ---- M8.2: fog depth tune + zone-tinted haze ----
+     * density: tuned down from 0.004 — at 500 m the FogExp2 factor is
+     *   ≈ 0.86, so distant structures survive as readable silhouettes
+     *   (the old 0.004 swallowed 98 % at 500 m: the void took over).
+     * zone: the haze color lerps (smoothstep) by camera distance from
+     *   the central plaza across the M3 zone boundaries (core < 220 m
+     *   / mid < 520 m): cyan in the core, warm in the outer avenues.
+     * domeTint: subtle sync of the dome horizon tint so sky and haze
+     *   never disagree (material color multiplies the gradient map). */
+    fog: {
+      density: 0.0028,
+      zone: { core: 220, outer: 520 },   // m — M3 zone boundaries
+      core: 0x081726,                    // cyan haze (core)
+      outer: 0x241a10,                   // warm haze (outer avenues)
+      domeTint: { core: 0xd9e6ff, outer: 0xffe3d0 },
+    },
   },
 };
 
@@ -539,7 +555,7 @@ renderer.info.autoReset = false;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(CFG.color.void);
-scene.fog = new THREE.FogExp2(CFG.color.fog, CFG.color.fogDensity);
+scene.fog = new THREE.FogExp2(CFG.color.fog, CFG.atmos.fog.density);
 
 const camera = new THREE.PerspectiveCamera(
   60,
@@ -4510,6 +4526,11 @@ const ENTITY = {
  * - aurora: one open-ended additive cylinder band at fixed altitude
  *   with slow spin — faint green curtains (static canvas texture).
  * - exactly 3 draw calls total, zero per-frame allocation.
+ * - fog (M8.2): tuned FogExp2 depth (readable at 500 m) + zone-tinted
+ *   haze — scene.fog.color smoothstep-lerps cyan (core) → warm (outer
+ *   avenues) by camera distance from the plaza across the M3 zone
+ *   boundaries; the dome horizon tint syncs so sky and haze match.
+ *   All fog colors pre-allocated in init ⇒ zero per-frame allocation.
  * ==================================================================== */
 const ATMOS = {
   name: 'ATMOS',
@@ -4521,6 +4542,17 @@ const ATMOS = {
   init() {
     const A = CFG.atmos;
     ATMOS.root = new THREE.Group();
+
+    /* M8.2: zone-tinted haze — pre-allocated fog colors (zero per-frame
+     * allocation); the scene fog color lerps cyan (core) → warm (outer
+     * avenues) with camera distance from the plaza and the dome
+     * horizon tint syncs so sky and haze match. */
+    const F = CFG.atmos.fog;
+    ATMOS._fogCore = new THREE.Color(F.core);
+    ATMOS._fogOuter = new THREE.Color(F.outer);
+    ATMOS._fog = new THREE.Color(F.core);
+    ATMOS._tintCore = new THREE.Color(F.domeTint.core);
+    ATMOS._tintOuter = new THREE.Color(F.domeTint.outer);
 
     /* dome: vertical gradient — canvas top (v = 1) is the zenith,
      * v = 0.5 is the horizon (where the fog-tinted city sits), below
@@ -4648,6 +4680,21 @@ const ATMOS = {
     ATMOS.aurora.rotation.y = t * A.aurora.spin;
     /* tier cap: drawRange only (no allocation) */
     ATMOS.stars.geometry.setDrawRange(0, A.stars.tiers[TIER.active()]);
+
+    /* M8.2: zone-tinted haze — smoothstep the fog color across the M3
+     * zone boundaries by camera distance from the plaza (cyan core →
+     * warm outer avenues) and sync the dome horizon tint. No
+     * allocation: every color is pre-allocated in init. */
+    {
+      const F = A.fog;
+      const d = Math.hypot(camera.position.x, camera.position.z);
+      let s = (d - F.zone.core) / (F.zone.outer - F.zone.core);
+      s = s < 0 ? 0 : s > 1 ? 1 : s;
+      const k = s * s * (3 - 2 * s);
+      ATMOS._fog.copy(ATMOS._fogCore).lerp(ATMOS._fogOuter, k);
+      scene.fog.color.copy(ATMOS._fog);
+      ATMOS.dome.material.color.copy(ATMOS._tintCore).lerp(ATMOS._tintOuter, k);
+    }
   },
 
   dispose() {
