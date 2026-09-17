@@ -288,6 +288,17 @@ const CFG = {
       glow: 0.4,             // absolute brightness added at the front peak
       origin: [0, 44, 0],   // wave centre (creature head level)
     },
+    /* M9.2: wake state machine — DORMANT → STIR → AWAKE → DECAY →
+     * DORMANT, per-state hooks, pose driven by the state level. */
+    wake: {
+      stir: 2,              // s: STIR → AWAKE (head lift, jaw, rings up)
+      awake: [10, 20],     // s: AWAKE hold (seeded jitter)
+      decay: 3,            // s: DECAY → DORMANT
+      headLift: 0.10,      // rad — head up-tilt at full wake
+      headRise: 0.8,       // m — head position lift at full wake
+      jawOpen: 0.22,       // rad — jaw drop at full wake
+      ringBoost: 8,        // ring speed multiplier at full wake
+    },
   },
 
   /* ---- M6.2: traffic — drones & sky vehicles (M6.2 drones, M6.3
@@ -4181,7 +4192,12 @@ const FX = {
  * --------------------------------------------------------------------- */
 const ENTITY = {
   name: 'ENTITY',
-  state: 'DORMANT',                 // M9 extends: DORMANT → STIR → AWAKE → DECAY
+  state: 'DORMANT',                 // M9.2: DORMANT → STIR → AWAKE → DECAY
+  stateT: 0,                       // M9.2: time the current state was entered (s)
+  _wakeHooks: null,               // M9.2: per-state enter hooks {STATE: [fn]}
+  _wakeCount: 0,                  // M9.2: awakenings triggered (smoke/dev)
+  _awakeDur: 0,                   // M9.2: picked AWAKE hold (s, seeded)
+  _ringAng: [0, 0, 0],           // M9.2: integrated ring angles (rad)
   root: null,
   parts: {},
   core: null,                       // breathing group (torso/head/jaw/coreEye)
@@ -4442,6 +4458,10 @@ const ENTITY = {
     ENTITY._nodeBase = new Float32Array(
       N.mesh.instanceColor.array.subarray(0, nn * 3));
     ENTITY._dreamRng = ENTITY._mulb();
+    /* M9.2: seeded rng for the AWAKE hold duration (distinct xor so the
+     * sequence decorrelates from the dream-wave interval). */
+    ENTITY._wakeRng = WORLD.mulberry(CFG.city.seed ^ 0x51A7E5 ^ 0xA9C2);
+    ENTITY._wakeHooks = { DORMANT: [], STIR: [], AWAKE: [], DECAY: [] };
     ENTITY._dream = {
       active: false,
       t0: 0,
@@ -4490,6 +4510,31 @@ const ENTITY = {
   /* seeded rng — the node layout is deterministic (smoke regenerates it) */
   _mulb() {
     return WORLD.mulberry(CFG.city.seed ^ 0x51A7E5);
+  },
+
+  /* M9.2: per-state hooks — ENTITY.hook('AWAKE', fn) fires fn(state, t)
+   * when the state machine enters that state. */
+  hook(state, fn) {
+    if (ENTITY._wakeHooks[state]) ENTITY._wakeHooks[state].push(fn);
+  },
+
+  /* M9.2: trigger the awakening sequence (M9.6 wires key/button/auto).
+   * Safe: a no-op unless the creature is DORMANT. */
+  wake() {
+    if (ENTITY.state !== 'DORMANT') return;
+    ENTITY._enterState('STIR', performance.now() / 1000);
+  },
+
+  /* M9.2: state entry — sets state + entry time, fires the per-state
+   * hooks, and (on STIR) every system's onAwaken() hook. */
+  _enterState(s, t) {
+    ENTITY.state = s;
+    ENTITY.stateT = t;
+    if (s === 'STIR') {
+      ENTITY._wakeCount++;
+      for (const sys of systems) if (sys.onAwaken) sys.onAwaken();
+    }
+    for (const h of ENTITY._wakeHooks[s]) h(s, t);
   },
 
   /* thousands of node voxels on torso / spine / head faces, ring bands,
@@ -4608,14 +4653,46 @@ const ENTITY = {
   },
 
   update(dt, t) {
+    /* wake state machine (M9.2): DORMANT → STIR (2 s) → AWAKE (10–20 s)
+     * → DECAY (3 s) → DORMANT. wakeP is the 0..1 pose level: smoothstep
+     * up in STIR, 1 in AWAKE, smoothstep down in DECAY, 0 in DORMANT
+     * (the pose restores EXACTLY at DORMANT entry). */
+    const W = CFG.entity.wake;
+    if (ENTITY.state === 'STIR' && t - ENTITY.stateT >= W.stir) {
+      ENTITY._awakeDur = W.awake[0] +
+        ENTITY._wakeRng() * (W.awake[1] - W.awake[0]);
+      ENTITY._enterState('AWAKE', t);
+    } else if (ENTITY.state === 'AWAKE' &&
+      t - ENTITY.stateT >= ENTITY._awakeDur)
+      ENTITY._enterState('DECAY', t);
+    else if (ENTITY.state === 'DECAY' && t - ENTITY.stateT >= W.decay)
+      ENTITY._enterState('DORMANT', t);
+    let wakeP = 0;
+    if (ENTITY.state === 'STIR') {
+      const p = Math.min(1, Math.max(0, (t - ENTITY.stateT) / W.stir));
+      wakeP = p * p * (3 - 2 * p);
+    } else if (ENTITY.state === 'AWAKE') {
+      wakeP = 1;
+    } else if (ENTITY.state === 'DECAY') {
+      const p = Math.min(1, Math.max(0, (t - ENTITY.stateT) / W.decay));
+      wakeP = 1 - p * p * (3 - 2 * p);
+    }
+    /* STIR pose: head lifts + tilts up, jaw drops (M9.2) */
+    const P = ENTITY.parts;
+    P.head.rotation.x = -wakeP * W.headLift;
+    P.head.position.y = 43.6 + wakeP * W.headRise;
+    P.jaw.rotation.x = wakeP * W.jawOpen;
     /* breathing: slow scale on the core (period ≈ 10.5 s) */
     const br = 1 + 0.008 * Math.sin(t * 0.6);
     ENTITY.core.scale.setScalar(br);
-    /* tensor rings: almost-still idle spin (absolute angle ⇒ deterministic) */
+    /* tensor rings: almost-still idle spin, boosted through the wake
+     * (M9.2) — integrated angle so the speed-up is continuous (no jump) */
     const rings = ['ringA', 'ringB', 'ringC'];
+    const ringM = 1 + (W.ringBoost - 1) * wakeP;
     for (let i = 0; i < 3; i++) {
+      ENTITY._ringAng[i] += dt * ENTITY.ringSpin[i] * ringM;
       const g = ENTITY.parts[rings[i]];
-      if (g) g.children[0].rotation.z = t * ENTITY.ringSpin[i];
+      if (g) g.children[0].rotation.z = ENTITY._ringAng[i];
     }
     /* antenna sway (M9.1): small deterministic tilt per mast group —
      * absolute in t ⇒ deterministic; the mast child stays put. */
@@ -4673,10 +4750,12 @@ const ENTITY = {
     /* coreEye: faint dormant pulse of the compute-core face (+ the
      * dream wave lifts the core as the front crosses it) */
     const k = 0.5 + 0.5 * Math.sin(t * 0.6);
-    ENTITY._hero.intensity = 0.9 + 0.3 * k + 0.5 * dreamLevel;
+    ENTITY._hero.intensity = 0.9 + 0.3 * k + 0.5 * dreamLevel +
+      1.5 * wakeP;
     if (ENTITY.parts.coreEye) {
       ENTITY._col.copy(ENTITY._coreA).lerp(
-        ENTITY._coreB, Math.min(1, 0.35 * k + 0.45 * dreamLevel));
+        ENTITY._coreB, Math.min(1, 0.35 * k + 0.45 * dreamLevel +
+        0.5 * wakeP));
       ENTITY.parts.coreEye.material.color.copy(ENTITY._col);
     }
     /* steam drip: 32 pooled puffs, 4 vents — rises, drifts, fades, re-enters */

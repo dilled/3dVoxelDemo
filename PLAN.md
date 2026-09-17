@@ -65,7 +65,7 @@ smoke-test evidence.
 | **M8.3** ✅ | Volumetric-ish light shafts: a few additive cone/cylinder meshes from key spires + creature core (only when near / during awakening) | Shafts visible near spire, absent far away (no permanent draw calls) |
 | **M8.4** ✅ | Distant lightning: random far point + brief hemi bump + flash + EM discharge ring across the city | Lightning event visible from inside the city; fires on timer + manual key |
 | **M9.1** ✅ | Idle/dormant animation: tensor-ring rotation, antenna sway, breathing core, periodic "dream" LED wave across the node grid (instance-color waves) | Dream wave sweeps the node grid visibly; dormant state stays dim and still-ish |
-| **M9.2** | Wake state machine: DORMANT → STIR (2 s head lift, jaw, rings speed up) → AWAKE (10–20 s) → DECAY → DORMANT, with per-state hooks | State machine smoke test: forced transitions in order, clean return to DORMANT, re-trigger safe |
+| **M9.2** ✅ | Wake state machine: DORMANT → STIR (2 s head lift, jaw, rings speed up) → AWAKE (10–20 s) → DECAY → DORMANT, with per-state hooks | State machine smoke test: forced transitions in order, clean return to DORMANT, re-trigger safe |
 | **M9.3** | Awakening beats 1–3: core-eye flare (emissive ramp + light + flash), node voxels ignite in radial waves, rings accelerate + limbs reposition (shake impulse) | Beats 1–3 play in sequence with correct timing on manual trigger |
 | **M9.4** | Awakening beats 4–5: energy pulse ring from plaza + city holo-signs/LEDs following the wave (per-ring scheduled ramps), substation arcs fire, steam bursts, drones scatter/re-route, vehicles avoid | The "thousands of compute nodes illuminate" moment lands; wave visibly travels ring by ring |
 | **M9.5** | Awakening beats 6–7 + decay: easter-egg reaction hook (M10), waves dim outward, hum settles, final pulse | Full sequence ends back in DORMANT with one final pulse; re-trigger immediately works |
@@ -606,12 +606,45 @@ lightning event visible from inside the city.
   0.2 s) and the wave never starts, and the sweep-travel `page.evaluate`
   must return `iA`/`iB` (an absent field makes `w2.iB >= 0` fail).
 
-#### M9.2 — Wake state machine
-- [ ] DORMANT → STIR (2 s: head lift, jaw, rings speed up) → AWAKE
+#### M9.2 — Wake state machine ✅
+- [x] DORMANT → STIR (2 s: head lift, jaw, rings speed up) → AWAKE
       (10–20 s) → DECAY → DORMANT, with per-state hooks.
 - **Test:** smoke test forces transitions in order, verifies clean
       return to DORMANT and safe immediate re-trigger.
 - **Commit when:** state-machine test green.
+- **Verified:** smoke M9.2 section green (9 checks, full suite ALL
+  PASS ×3) — the machine lives on `ENTITY` (no new system): `state` /
+  `stateT` (entry time, `performance.now()/1000` clock), durations in
+  `CFG.entity.wake` {stir: 2, awake: [10, 20], decay: 3, headLift
+  0.10 rad, headRise 0.8 m, jawOpen 0.22 rad, ringBoost 8}; transitions
+  are made only inside `ENTITY.update` when `t - stateT` passes the
+  duration — the smoke forces them by fast-forwarding `stateT` (no
+  teleport API); `ENTITY.wake()` is the trigger (no-op unless DORMANT;
+  M9.6 wires key/button/auto); `ENTITY._enterState(s, t)` is the only
+  entry point (on STIR: `_wakeCount++` + every system's `onAwaken()` —
+  verified once per sequence start via a fake system on `S.systems`);
+  per-state hooks `ENTITY.hook(state, fn)` fire `fn(state, t)` on entry
+  (order verified exactly `[STIR, AWAKE, DECAY, DORMANT]`); STIR pose
+  from the 0..1 level `wakeP` (smoothstep up / 1 / smoothstep down /
+  0): `head.rotation.x = -wakeP·headLift`, `head.position.y = 43.6 +
+  wakeP·headRise`, `jaw.rotation.x = wakeP·jawOpen` — restores EXACTLY
+  at DORMANT entry (verified byte-exact 0/43.6/0); rings moved from
+  absolute `t·ringSpin` to integrated `ENTITY._ringAng` with multiplier
+  `1 + (ringBoost-1)·wakeP` (continuous speed-up, no angle jump; AWAKE
+  Δang matches `spin·8·Δt` to 0.02 rad; DORMANT multiplier exactly 1);
+  AWAKE hold picked by seeded `ENTITY._wakeRng` into [10, 20] s
+  (verified 11.7 s, deterministic); hero light +1.5·wakeP / coreEye
+  lerp +0.5·wakeP on top of the dormant/dream terms (M9.3 builds the
+  flare on top; M9.5 reuses the DECAY pose); clean return verified —
+  node instance colors byte-exact at base, draw calls back to baseline
+  (51), hero light back to dormant range, mid-sequence `wake()` is a
+  no-op (count unchanged), and an immediate re-trigger runs a second
+  full forced cycle that resolves clean again (re-trigger safe).
+  Seams: raw `ENTITY.state` writes are invalid (stale `stateT` ⇒
+  self-transition on the next frame) — the M8.3 smoke seam now uses
+  `_enterState` + `_awakeDur = 1e9` hold; the M9.1 dream wave stays
+  gated on DORMANT (parked +60 s around the M9.2 section since M9.1
+  leaves its deadline 14–26 s out).
 
 #### M9.3 — Awakening beats 1–3 (creature-level power)
 - [ ] Beat 1: core eye flares (emissive ramp + light + flash).

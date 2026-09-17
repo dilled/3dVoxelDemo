@@ -4358,12 +4358,16 @@ try {
           d.sort((x, y) => x - y);
           return d[n >> 1];
         };
-        S.ENTITY.state = 'AWAKE';
+        /* M9.2: enter via the state machine (a raw state write would
+         * self-transition out on the next frame — stateT is stale);
+         * hold AWAKE with a huge picked duration for the 3.2 s window */
+        S.ENTITY._awakeDur = 1e9;
+        S.ENTITY._enterState('AWAKE', performance.now() / 1000);
         await new Promise(r => setTimeout(r, 3200));
         const coreOn = A.coreShaft.mesh.visible;
         const spireOn = A.shafts.filter(s => s.mesh.visible).length;
         const coreDelta = await medDelta(7);
-        S.ENTITY.state = 'DORMANT';
+        S.ENTITY._enterState('DORMANT', performance.now() / 1000);
         await new Promise(r => setTimeout(r, 3200));
         const allHidden =
           A.shafts.every(s => !s.mesh.visible) && !A.coreShaft.mesh.visible;
@@ -5088,6 +5092,285 @@ try {
       C.pitch = 0;
     });
     await sleep(250);
+  }
+
+  /* ------------------------------------------------------------------
+   * M9.2 — wake state machine: DORMANT → STIR (2 s: head lift, jaw,
+   *   rings speed up) → AWAKE (10–20 s) → DECAY → DORMANT, with
+   *   per-state hooks
+   *
+   *  Transitions are forced by fast-forwarding ENTITY.stateT past
+   *  each state's duration — the machine itself makes every
+   *  transition (no teleport API). The per-state hooks record their
+   *  firing order; a fake system on S.systems verifies the ground-rule
+   *  onAwaken() hook fires exactly once per sequence start.
+   * ------------------------------------------------------------------ */
+  {
+    const W = await page.evaluate(() => window.SIM.CFG.entity.wake);
+    const spinA = await page.evaluate(() => window.SIM.ENTITY.ringSpin[0]);
+
+    /* park the dream wave: M9.1 left its re-seeded deadline 14–26 s
+     * out — a wave could fire mid-section (it only starts in DORMANT,
+     * but it would still move instance colors / hero light) */
+    await page.waitForFunction(() => {
+      const E = window.SIM.ENTITY;
+      return E && E._dream && !E._dream.active;
+    }, { timeout: 20000 });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E._dream.nextAt = performance.now() / 1000 + 60;
+    });
+
+    /* 1. registered: config sane, machine idle at DORMANT, hooks API */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, W = S.CFG.entity.wake;
+      return {
+        cfg: W.stir > 0 && W.awake[1] > W.awake[0] > 0 && W.decay > 0 &&
+          W.ringBoost > 1 && W.headLift > 0 && W.jawOpen > 0 &&
+          W.headRise > 0,
+        dormant: E.state === 'DORMANT' && E._wakeCount === 0 &&
+          E._ringAng.length === 3 && E.stateT >= 0,
+        hooks: typeof E.hook === 'function' &&
+          Array.isArray(E._wakeHooks.DORMANT) &&
+          Array.isArray(E._wakeHooks.STIR) &&
+          Array.isArray(E._wakeHooks.AWAKE) &&
+          Array.isArray(E._wakeHooks.DECAY),
+        calls: S.renderer.info.render.calls,
+      };
+    });
+    check('M9.2: wake state machine registered — config sane, DORMANT idle, per-state hooks',
+      reg.cfg && reg.dormant && reg.hooks,
+      `calls=${reg.calls}, dormant=${reg.dormant}, hooks=${reg.hooks}`);
+
+    /* 2. register per-state hooks + a fake onAwaken system, then
+     *    trigger: wake() ⇒ STIR, onAwaken fired once, STIR hook fired */
+    await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      window.__m92 = { order: [], onAwaken: 0 };
+      for (const st of ['DORMANT', 'STIR', 'AWAKE', 'DECAY'])
+        E.hook(st, s => window.__m92.order.push(s));
+      S.systems.push({
+        name: '__m92smoke',
+        onAwaken() { window.__m92.onAwaken++; },
+      });
+      E.wake();
+    });
+    const st1 = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return {
+        state: E.state,
+        count: E._wakeCount,
+        onAwaken: window.__m92.onAwaken,
+        order: window.__m92.order.slice(),
+        rx: E.parts.head.rotation.x,
+        hy: E.parts.head.position.y,
+        jaw: E.parts.jaw.rotation.x,
+      };
+    });
+    check('M9.2: wake() triggers DORMANT → STIR (onAwaken + STIR hook fired)',
+      st1.state === 'STIR' && st1.count === 1 && st1.onAwaken === 1 &&
+      JSON.stringify(st1.order) === JSON.stringify(['STIR']),
+      `state=${st1.state}, onAwaken=${st1.onAwaken}, order=${st1.order}`);
+
+    /* 3. STIR animates toward the full pose: head tilts up + rises,
+     *    jaw drops, rings already spinning faster than the idle speed */
+    const stir = () => page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return {
+        rx: E.parts.head.rotation.x,
+        hy: E.parts.head.position.y,
+        jaw: E.parts.jaw.rotation.x,
+        ang: E._ringAng[0],
+        t: performance.now() / 1000,
+      };
+    });
+    const s0 = await stir();
+    await sleep(500);
+    const s1 = await stir();
+    const vA = (s1.ang - s0.ang) / (s1.t - s0.t);
+    check('M9.2: STIR — head lifts, jaw drops, rings speed up (2 s)',
+      s1.rx < s0.rx && s1.rx >= -W.headLift - 1e-6 &&
+      s1.hy > s0.hy && s1.hy <= 43.6 + W.headRise + 1e-6 &&
+      s1.jaw > s0.jaw && s1.jaw <= W.jawOpen + 1e-6 &&
+      vA > spinA,
+      `head ${s0.rx.toFixed(4)} → ${s1.rx.toFixed(4)} rad (want ≥ ${-W.headLift}),` +
+      ` jaw ${s0.jaw.toFixed(4)} → ${s1.jaw.toFixed(4)} rad,` +
+      ` ringA ${vA.toFixed(4)} rad/s > idle ${spinA}`);
+
+    /* 4. force STIR → AWAKE (fast-forward stateT past the 2 s STIR):
+     *    the machine makes the transition and picks the seeded
+     *    AWAKE hold into [10, 20] s */
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.stir - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'AWAKE', { timeout: 5000 });
+    const st2 = await page.evaluate(() => ({
+      dur: window.SIM.ENTITY._awakeDur,
+      order: window.__m92.order.slice(),
+    }));
+    check('M9.2: STIR → AWAKE on the 2 s timer (hold seeded into 10–20 s)',
+      st2.dur >= W.awake[0] && st2.dur <= W.awake[1] &&
+      JSON.stringify(st2.order) === JSON.stringify(['STIR', 'AWAKE']),
+      `awake hold ${st2.dur.toFixed(1)} s (want ${W.awake[0]}–${W.awake[1]} s),` +
+      ` order=${st2.order}`);
+
+    /* 5. AWAKE holds the full pose exactly: head lifted, jaw open,
+     *    rings at the boost speed, hero light lifted; a re-trigger
+     *    mid-sequence is a safe no-op (no double trigger) */
+    const awake = () => page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return {
+        rx: E.parts.head.rotation.x,
+        hy: E.parts.head.position.y,
+        jaw: E.parts.jaw.rotation.x,
+        ang: E._ringAng[0],
+        t: performance.now() / 1000,
+        state: E.state,
+        count: E._wakeCount,
+        hero: E._hero.intensity,
+      };
+    });
+    const a0 = await awake();
+    await page.evaluate(() => window.SIM.ENTITY.wake());
+    const a1 = await awake();
+    await sleep(300);
+    const a2 = await awake();
+    const dAng = a2.ang - a1.ang, dT = a2.t - a1.t;
+    check('M9.2: AWAKE holds the full pose (rings at boost), re-trigger mid-sequence is a no-op',
+      a1.state === 'AWAKE' && a1.count === 1 &&
+      Math.abs(a1.rx + W.headLift) < 1e-4 &&
+      Math.abs(a1.hy - (43.6 + W.headRise)) < 1e-4 &&
+      Math.abs(a1.jaw - W.jawOpen) < 1e-4 &&
+      a1.hero >= 0.9 + 1.5 - 1e-6 && a1.hero <= 1.2 + 1.5 + 1e-6 &&
+      Math.abs(dAng - spinA * W.ringBoost * dT) < 0.02,
+      `hero ${a1.hero.toFixed(2)}, ringA Δang ${dAng.toFixed(3)} vs` +
+      ` ${(spinA * W.ringBoost * dT).toFixed(3)} expected, count=${a1.count}`);
+
+    /* 6. force AWAKE → DECAY (fast-forward past the picked hold):
+     *    DECAY hook fires, order still exact */
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 - E._awakeDur - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DECAY', { timeout: 5000 });
+    const st3 = await page.evaluate(() => ({
+      state: window.SIM.ENTITY.state,
+      order: window.__m92.order.slice(),
+    }));
+    check('M9.2: AWAKE → DECAY on the hold timer (DECAY hook fired)',
+      st3.state === 'DECAY' &&
+      JSON.stringify(st3.order) ===
+      JSON.stringify(['STIR', 'AWAKE', 'DECAY']),
+      `order=${st3.order}`);
+
+    /* 7. force DECAY → DORMANT (fast-forward the 3 s decay): the pose
+     *    restores EXACTLY, node colors byte-exact, hooks in order,
+     *    draw calls back to the pre-trigger count */
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.decay - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    const d1 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      const ic = E.nodes.instanceColor.array;
+      let same = true;
+      for (let i = 0; i < E._nodeBase.length; i++)
+        if (ic[i] !== E._nodeBase[i]) { same = false; break; }
+      return {
+        order: window.__m92.order.slice(),
+        rx: E.parts.head.rotation.x,
+        jaw: E.parts.jaw.rotation.x,
+        hy: E.parts.head.position.y,
+        same,
+        count: E._wakeCount,
+        calls: S.renderer.info.render.calls,
+        hero: E._hero.intensity,
+      };
+    });
+    check('M9.2: DECAY → DORMANT clean — pose restored exactly, no leftover state',
+      d1.rx === 0 && d1.jaw === 0 && d1.hy === 43.6 && d1.same &&
+      d1.count === 1 && d1.calls === reg.calls &&
+      d1.hero >= 0.9 - 1e-6 && d1.hero <= 1.2 + 1e-6 &&
+      JSON.stringify(d1.order) ===
+      JSON.stringify(['STIR', 'AWAKE', 'DECAY', 'DORMANT']),
+      `hero ${d1.hero.toFixed(2)}, calls ${d1.calls} (want ${reg.calls}),` +
+      ` order=${d1.order}`);
+
+    /* 8. safe immediate re-trigger: wake() right back into STIR,
+     *    then force the whole cycle through again — it resolves clean
+     *    a second time (re-trigger-safe state machine) */
+    await page.evaluate(() => {
+      window.SIM.ENTITY.wake();
+    });
+    const r1 = await page.evaluate(() => ({
+      state: window.SIM.ENTITY.state,
+      count: window.SIM.ENTITY._wakeCount,
+      onAwaken: window.__m92.onAwaken,
+    }));
+    check('M9.2: immediate re-trigger works (STIR again, onAwaken again)',
+      r1.state === 'STIR' && r1.count === 2 && r1.onAwaken === 2,
+      `count=${r1.count}, onAwaken=${r1.onAwaken}`);
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.stir - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'AWAKE', { timeout: 5000 });
+    const r2 = await page.evaluate(() => ({
+      dur: window.SIM.ENTITY._awakeDur,
+    }));
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 - E._awakeDur - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DECAY', { timeout: 5000 });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.decay - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    const r3 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      const ic = E.nodes.instanceColor.array;
+      let same = true;
+      for (let i = 0; i < E._nodeBase.length; i++)
+        if (ic[i] !== E._nodeBase[i]) { same = false; break; }
+      return {
+        same,
+        rx: E.parts.head.rotation.x,
+        jaw: E.parts.jaw.rotation.x,
+        hy: E.parts.head.position.y,
+        count: E._wakeCount,
+        calls: S.renderer.info.render.calls,
+        order: window.__m92.order.slice(),
+      };
+    });
+    check('M9.2: second full cycle resolves back to DORMANT clean (re-trigger safe)',
+      r3.rx === 0 && r3.jaw === 0 && r3.hy === 43.6 && r3.same &&
+      r3.count === 2 && r3.calls === reg.calls &&
+      r2.dur >= W.awake[0] && r2.dur <= W.awake[1] &&
+      JSON.stringify(r3.order.slice(4)) ===
+      JSON.stringify(['STIR', 'AWAKE', 'DECAY', 'DORMANT']),
+      `calls ${r3.calls} (want ${reg.calls}), order=${r3.order}`);
+
+    /* cleanup: pop the fake system, park the dream wave again */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      const sys = S.systems[S.systems.length - 1];
+      if (sys && sys.name === '__m92smoke') S.systems.pop();
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+    });
   }
 
   /* ---- 10. No errors anywhere ---- */

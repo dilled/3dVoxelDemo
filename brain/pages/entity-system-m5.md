@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [entity, m5, creature, instancing]
 created: "2026-09-15T08:12:39"
-updated: "2026-09-17T08:06:14"
+updated: "2026-09-17T19:30:07"
 ---
 
 <!-- compiled_truth -->
@@ -62,3 +62,9 @@ ENTITY is the 6th system in the fixed boot order (INPUT → CAMERA → KIT → W
   kind: note
   summary: "M9.1 extended the dormant idle: antenna sway (per-mast deterministic tilt) + periodic dream LED wave across the node grid (shader-less instance-color animation, byte-exact base restore, all per-node data pre-allocated, _dreamFrozen seam, DORMANT state gate) — see [[m91-idle-dormant-animation]]"
   affects: [entity-system-m5]
+
+- time: 2026-09-17T19:30:07
+  kind: note
+  summary: "M9.2 landed the wake state machine on ENTITY (the M9-ready rig parts are now consumed): state/stateT on ENTITY, wake() trigger, per-state hooks + onAwaken, wakeP pose drives head/jaw/rings; ring spin moved from absolute t·spin to integrated _ringAng (continuous speed-up). See m92-wake-state-machine."
+  source: M9.2 implementation
+  affects: [entity-system-m5, m92-wake-state-machine]
