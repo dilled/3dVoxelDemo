@@ -4752,10 +4752,14 @@ try {
    *  group. All per-node data pre-allocated at init ⇒ heap flat.
    * ------------------------------------------------------------------ */
   {
-    /* wait for any in-flight auto-timer wave to resolve first */
+    /* wait for any in-flight auto-timer wave to resolve AND its
+     * deadline to be re-armed in the future — a deadline landing in
+     * the poll gap would read active=false + nextAt<=now (the frame
+     * before the wave starts) and flake the idle assertion below */
     await page.waitForFunction(() => {
       const E = window.SIM.ENTITY;
-      return E && E._dream && !E._dream.active;
+      return E && E._dream && !E._dream.active &&
+        E._dream.nextAt > performance.now() / 1000;
     }, { timeout: 20000 });
 
     /* 1. registered: config + pre-allocated per-node data, wave idle,
@@ -5111,14 +5115,17 @@ try {
 
     /* park the dream wave: M9.1 left its re-seeded deadline 14–26 s
      * out — a wave could fire mid-section (it only starts in DORMANT,
-     * but it would still move instance colors / hero light) */
+     * but it would still move instance colors / hero light). Also park
+     * the lightning auto-timer: an M8.4 event would add a flash draw
+     * call mid-section and break the draw-call comparisons below. */
     await page.waitForFunction(() => {
       const E = window.SIM.ENTITY;
       return E && E._dream && !E._dream.active;
     }, { timeout: 20000 });
     await page.evaluate(() => {
-      const E = window.SIM.ENTITY;
-      E._dream.nextAt = performance.now() / 1000 + 60;
+      const S = window.SIM;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      S.ATMOS._ltTimer = 1e9;
     });
 
     /* 1. registered: config sane, machine idle at DORMANT, hooks API */
@@ -5239,12 +5246,17 @@ try {
     await sleep(300);
     const a2 = await awake();
     const dAng = a2.ang - a1.ang, dT = a2.t - a1.t;
+    /* M9.3: beat 1 builds the core-eye flare on top of this baseline
+     * (+ CFG.entity.beats.flare.hero × wakeP = 1 in AWAKE). */
+    const flareHero = await page.evaluate(
+      () => window.SIM.CFG.entity.beats.flare.hero);
     check('M9.2: AWAKE holds the full pose (rings at boost), re-trigger mid-sequence is a no-op',
       a1.state === 'AWAKE' && a1.count === 1 &&
       Math.abs(a1.rx + W.headLift) < 1e-4 &&
       Math.abs(a1.hy - (43.6 + W.headRise)) < 1e-4 &&
       Math.abs(a1.jaw - W.jawOpen) < 1e-4 &&
-      a1.hero >= 0.9 + 1.5 - 1e-6 && a1.hero <= 1.2 + 1.5 + 1e-6 &&
+      a1.hero >= 0.9 + 1.5 + flareHero - 1e-6 &&
+      a1.hero <= 1.2 + 1.5 + flareHero + 1e-6 &&
       Math.abs(dAng - spinA * W.ringBoost * dT) < 0.02,
       `hero ${a1.hero.toFixed(2)}, ringA Δang ${dAng.toFixed(3)} vs` +
       ` ${(spinA * W.ringBoost * dT).toFixed(3)} expected, count=${a1.count}`);
@@ -5277,6 +5289,10 @@ try {
     });
     await page.waitForFunction(
       () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    /* M9.3: beat 1's flash fires at the STIR→AWAKE peak — wait for it
+     * to fully decay (the flash plane is +1 draw call while live) */
+    await page.waitForFunction(
+      () => window.SIM.FX._flash === 0, { timeout: 5000 });
     const d1 = await page.evaluate(() => {
       const S = window.SIM, E = S.ENTITY;
       const ic = E.nodes.instanceColor.array;
@@ -5340,6 +5356,8 @@ try {
     });
     await page.waitForFunction(
       () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    await page.waitForFunction(
+      () => window.SIM.FX._flash === 0, { timeout: 5000 });
     const r3 = await page.evaluate(() => {
       const S = window.SIM, E = S.ENTITY;
       const ic = E.nodes.instanceColor.array;
@@ -5371,6 +5389,523 @@ try {
       if (sys && sys.name === '__m92smoke') S.systems.pop();
       S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
     });
+  }
+
+  /* ------------------------------------------------------------------
+   * M9.3 — Awakening beats 1–3 (creature-level power)
+   *
+   *  Beat 1: core-eye flare — emissive ramp toward the flare color +
+   *    hero-light boost through STIR; FX.flash fires at the
+   *    STIR→AWAKE peak. Beat 2: node voxels ignite in radial waves
+   *    from head level (front radius grows from the AWAKE entry; the
+   *    lit level holds). Beat 3: tensor rings tilt + arms lift — the
+   *    surge level ramps in `delay` s after AWAKE entry, fired with
+   *    a camera-shake impulse. Everything restores EXACTLY at DORMANT
+   *    entry.
+   *
+   *  Triggered via ENTITY.wake() (M9.6 wires the manual key to it);
+   *  transitions are forced by fast-forwarding stateT as in M9.2.
+   *  Beat start timestamps (ENTITY._beatAt) + wrapped FX.flash /
+   *  CAMERA.shake verify the sequence + correct timing.
+   * ------------------------------------------------------------------ */
+  {
+    const B = await page.evaluate(() => window.SIM.CFG.entity.beats);
+    const W = await page.evaluate(() => window.SIM.CFG.entity.wake);
+    const spinA = await page.evaluate(
+      () => window.SIM.ENTITY.ringSpin[0]);
+
+    /* park the dream wave (as in M9.2) + the lightning auto-timer, and
+     * wait out M9.2's last beat-1 flash before the draw-call baseline */
+    await page.waitForFunction(() => {
+      const E = window.SIM.ENTITY;
+      return E && E._dream && !E._dream.active;
+    }, { timeout: 20000 });
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      S.ATMOS._ltTimer = 1e9;
+    });
+    await page.waitForFunction(
+      () => window.SIM.FX._flash === 0, { timeout: 5000 });
+
+    /* 1. registered: config sane, beats idle at DORMANT */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, B = S.CFG.entity.beats;
+      const qSame = i => {
+        const q = E.parts[['ringA', 'ringB', 'ringC'][i]].quaternion;
+        const b = E._ringBaseQ[i];
+        return q.x === b.x && q.y === b.y && q.z === b.z && q.w === b.w;
+      };
+      return {
+        cfg: B.flare.eye > 0 && B.flare.hero > 0 && B.flare.flash > 0 &&
+          B.ignite.speed > 0 && B.ignite.width > 0 &&
+          B.ignite.bright > 0.1 && B.ignite.front > 0 &&
+          B.surge.delay > 0 && B.surge.ramp > 0 &&
+          B.surge.ringTilt > 0 && B.surge.armLift > 0 &&
+          B.surge.shake > 0,
+        idle: !E._ignited && E._surgeP === 0 && !E._surgeFired &&
+          E._beatAt.flare === 0 && E._beatAt.ignite === 0 &&
+          E._beatAt.surge === 0 &&
+          E.parts.armL.rotation.z === 0 && E.parts.armR.rotation.z === 0 &&
+          qSame(0) && qSame(1) && qSame(2),
+        hero: E._hero.intensity,
+        calls: S.renderer.info.render.calls,
+      };
+    });
+    check('M9.3: awakening beats registered — config sane, beats idle at DORMANT',
+      reg.cfg && reg.idle,
+      `hero=${reg.hero.toFixed(2)}, calls=${reg.calls}`);
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const hb = await heapMin();
+
+    /* street pose (the M9.1 pose) + dormant reference pair — the
+     * on-shot below is the same pose mid-beats */
+    await page.evaluate(() => {
+      const C = window.SIM.CAMERA;
+      C.pos.set(72, 1.7, 55);
+      C.vel.set(0, 0, 0);
+      C.yaw = 0.92;
+      C.pitch = 0.30;
+    });
+    /* the pose is applied by the next camera frame — project() reads
+     * the live camera, so a same-evaluate project would use the stale
+     * spawn pose and clamp the region off-frame */
+    await sleep(250);
+    const coreXY = await page.evaluate(() => {
+      const p = window.SIM.project(0, 44, 0);
+      return {
+        x: (p.x + 1) / 2 * window.innerWidth,
+        y: (1 - p.y) / 2 * window.innerHeight,
+        ok: p.x > -1 && p.x < 1 && p.y > -1 && p.y < 1,
+      };
+    });
+    /* visible-object baseline at the street pose — the resolve check
+     * below samples the same pose. (Draw-call counts in this pose
+     * drift ±2 over time — frustum/keep-set churn at render level —
+     * so the gate is the visible-object SET; calls are logged for
+     * reference.) */
+    const visStreet = await page.evaluate(() => {
+      const S = window.SIM;
+      const vis = [];
+      S.scene.traverse(o => {
+        if (o.isMesh || o.isPoints || o.isLine) {
+          let v = true;
+          for (let p = o; p; p = p.parent) v = v && p.visible;
+          if (v) vis.push(o.name || o.type);
+        }
+      });
+      vis.sort();
+      return { calls: S.renderer.info.render.calls, vis };
+    });
+    const regionStats = b64 => page.evaluate(async ({ b64, cx, cy }) => {
+      const img = new Image();
+      await new Promise((res2, rej) => {
+        img.onload = res2; img.onerror = rej;
+        img.src = 'data:image/png;base64,' + b64;
+      });
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      /* region: ±12 % of the frame around the projected creature core
+       * (0, 44, 0) — the node grid lives here */
+      const hw = Math.floor(c.width * 0.24) / 2;
+      const hh = Math.floor(c.height * 0.24) / 2;
+      const x0 = Math.max(0, Math.round(cx - hw));
+      const y0 = Math.max(0, Math.round(cy - hh));
+      const x1 = Math.min(c.width, Math.round(cx + hw));
+      const y1 = Math.min(c.height, Math.round(cy + hh));
+      const d = ctx.getImageData(x0, y0, x1 - x0, y1 - y0).data;
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4)
+        sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      return sum / (d.length / 4);
+    }, { b64, cx: coreXY.x, cy: coreXY.y });
+    let offSum = 0;
+    for (let i = 0; i < 2; i++) {
+      await sleep(150);
+      offSum += await regionStats(
+        (await page.screenshot()).toString('base64'));
+    }
+    const offReg = offSum / 2;
+
+    /* 2. beat 1 — core-eye flare ramps with wakeP during STIR: hero
+     *    light up + eye color moves toward the flare color. FX.flash
+     *    + CAMERA.shake are wrapped so the beat calls are recorded
+     *    exactly (restored at cleanup). */
+    const eyeHero = () => page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      const c = E.parts.coreEye.material.color;
+      const f = E._flareCol;
+      return {
+        state: E.state,
+        hero: E._hero.intensity,
+        d: Math.hypot(c.r - f.r, c.g - f.g, c.b - f.b),
+        flare: E._beatAt.flare,
+      };
+    });
+    const e0 = await eyeHero();
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.__m93 = { flash: 0, shake: 0 };
+      S.__m93f0 = S.FX.flash;
+      S.__m93s0 = S.CAMERA.shake;
+      S.FX.flash = (i, c) => {
+        S.__m93.flash = Math.max(S.__m93.flash, i);
+        return S.__m93f0(i, c);
+      };
+      S.CAMERA.shake = i => {
+        S.__m93.shake += i;
+        return S.__m93s0(i);
+      };
+      window.SIM.ENTITY.wake();
+    });
+    /* 400 ms in: wakeP ≈ 0.10 ⇒ hero +≈0.7 and the eye color already
+     * measurably closer to the flare color (150 ms leaves wakeP ≈ 0.02,
+     * inside the k-oscillation noise) */
+    await sleep(400);
+    const e1 = await eyeHero();
+    await sleep(600);
+    const e2 = await eyeHero();
+    check('M9.3: beat 1 — core eye flares during STIR (emissive ramp, hero light up)',
+      e1.state === 'STIR' && e1.flare > 0 &&
+      e1.hero > e0.hero + 0.05 && e2.hero > e1.hero &&
+      e2.d < e1.d && e1.d < e0.d - 0.01,
+      `hero ${e0.hero.toFixed(2)} → ${e1.hero.toFixed(2)} → ${e2.hero.toFixed(2)},` +
+      ` eye→flare ${e0.d.toFixed(3)} → ${e1.d.toFixed(3)} → ${e2.d.toFixed(3)}`);
+
+    /* 3. force STIR → AWAKE: beat 1 peak fires the flash, beat 2's
+     *    ignite wave starts — head-level node lit, far node still dim
+     *    (the front is mid-creature: r in [8, 30] m) */
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.stir - 0.05;
+    });
+    await page.waitForFunction(() => {
+      const S = window.SIM;
+      const E = S.ENTITY;
+      if (E.state !== 'AWAKE') return false;
+      const r = (performance.now() / 1000 - E._awakeT0) *
+        S.CFG.entity.beats.ignite.speed;
+      return r >= 8 && r <= 30;
+    }, { timeout: 8000 });
+    const aw1 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      const B = S.CFG.entity.beats;
+      const n = performance.now() / 1000;
+      const r = (n - E._awakeT0) * B.ignite.speed;
+      const dist = E._nodeDist;
+      const ic = E.nodes.instanceColor.array;
+      const nN = E.nodeCount;
+      let iA = -1, iB = -1;
+      for (let i = 0; i < nN; i++) {
+        if (iA < 0 && dist[i] < 12) iA = i;
+        if (iB < 0 && dist[i] > E._dream.maxR - 2) iB = i;
+      }
+      const bright = i => {
+        const i3 = i * 3;
+        return Math.max(ic[i3], ic[i3 + 1], ic[i3 + 2]);
+      };
+      return {
+        r, iA, iB,
+        litA: iA >= 0 ? bright(iA) : -1,
+        litB: iB >= 0 ? bright(iB) : 1,
+        flash: S.__m93.flash,
+        ignite: E._beatAt.ignite,
+        flare: E._beatAt.flare,
+      };
+    });
+    check('M9.3: beat 1 peak — flash fires at STIR→AWAKE; beat 2 wave starts (front node lit, far node dim)',
+      aw1.iA >= 0 && aw1.iB >= 0 &&
+      aw1.litA > 0.15 && aw1.litB < 0.12 &&
+      aw1.flash === B.flare.flash &&
+      aw1.ignite > 0 && aw1.ignite >= aw1.flare,
+      `r=${aw1.r.toFixed(1)} m, nodeA ${aw1.litA.toFixed(2)},` +
+      ` nodeB ${aw1.litB.toFixed(3)}, flash=${aw1.flash}`);
+
+    /* 4. beat 2 travels: ~1.6 s later the front has crossed the whole
+     *    grid — every node lit at the configured brightness */
+    await sleep(1600);
+    const aw2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      const B = S.CFG.entity.beats;
+      const n = performance.now() / 1000;
+      const r = (n - E._awakeT0) * B.ignite.speed;
+      const ic = E.nodes.instanceColor.array;
+      const nN = E.nodeCount;
+      let minc = Infinity;
+      for (let i = 0; i < nN; i++) {
+        const i3 = i * 3;
+        minc = Math.min(minc,
+          Math.max(ic[i3], ic[i3 + 1], ic[i3 + 2]));
+      }
+      return { r, minc, state: E.state };
+    });
+    check('M9.3: beat 2 — ignite wave reaches the whole grid (every node lit)',
+      aw2.state === 'AWAKE' && aw2.r >= 53 &&
+      aw2.minc >= B.ignite.bright - 0.02,
+      `r=${aw2.r.toFixed(1)} m, min node brightness ${aw2.minc.toFixed(2)}` +
+      ` (want ≥ ${(B.ignite.bright - 0.02).toFixed(2)})`);
+
+    /* 5. beat 3 — the surge lands `delay` s after AWAKE entry: rings
+     *    tilted off their base quaternions, arms lifted, shake fired
+     *    exactly once at the configured impulse */
+    await page.waitForFunction(
+      () => window.SIM.ENTITY._surgeP >= 1, { timeout: 8000 });
+    const s1 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      const B = S.CFG.entity.beats;
+      const qAng = i => {
+        const q = E.parts[['ringA', 'ringB', 'ringC'][i]].quaternion;
+        const b = E._ringBaseQ[i];
+        const d = Math.abs(
+          q.x * b.x + q.y * b.y + q.z * b.z + q.w * b.w);
+        return 2 * Math.acos(Math.min(1, d));
+      };
+      return {
+        surgeP: E._surgeP,
+        fired: E._surgeFired,
+        surgeAt: E._beatAt.surge,
+        igniteAt: E._beatAt.ignite,
+        armL: E.parts.armL.rotation.z,
+        armR: E.parts.armR.rotation.z,
+        qA: qAng(0), qB: qAng(1), qC: qAng(2),
+        shake: S.__m93.shake,
+      };
+    });
+    check('M9.3: beat 3 — rings tilt + arms reposition, shake impulse fired (delay after AWAKE)',
+      s1.surgeP === 1 && s1.fired &&
+      s1.shake === B.surge.shake &&
+      s1.surgeAt > 0 &&
+      s1.surgeAt - s1.igniteAt >= B.surge.delay - 0.05 &&
+      s1.surgeAt - s1.igniteAt <= B.surge.delay + 0.3 &&
+      Math.abs(s1.armL + B.surge.armLift) < 1e-4 &&
+      Math.abs(s1.armR - B.surge.armLift) < 1e-4 &&
+      s1.qA > 0.05 && s1.qB > 0.05 && s1.qC > 0.05,
+      `surgeAt−igniteAt=${(s1.surgeAt - s1.igniteAt).toFixed(2)} s` +
+      ` (want ${B.surge.delay}), arms ${s1.armL.toFixed(3)}/` +
+      `${s1.armR.toFixed(3)} rad, tilt ${s1.qA.toFixed(3)}/` +
+      `${s1.qB.toFixed(3)}/${s1.qC.toFixed(3)} rad, shake=${s1.shake}`);
+
+    /* 6. AWAKE holds the beats: surge pinned at 1, tilt stable
+     *    frame to frame, rings still at the boost speed, and the beat
+     *    timestamps are in order (flare < ignite < surge) */
+    const hold1 = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      const q = E.parts.ringA.quaternion;
+      const b = E._ringBaseQ[0];
+      const d = Math.abs(
+        q.x * b.x + q.y * b.y + q.z * b.z + q.w * b.w);
+      return {
+        surgeP: E._surgeP,
+        qA: 2 * Math.acos(Math.min(1, d)),
+        ang: E._ringAng[0],
+        t: performance.now() / 1000,
+        order: [E._beatAt.flare, E._beatAt.ignite, E._beatAt.surge],
+      };
+    });
+    await sleep(300);
+    const hold2 = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      const q = E.parts.ringA.quaternion;
+      const b = E._ringBaseQ[0];
+      const d = Math.abs(
+        q.x * b.x + q.y * b.y + q.z * b.z + q.w * b.w);
+      return {
+        surgeP: E._surgeP,
+        qA: 2 * Math.acos(Math.min(1, d)),
+        ang: E._ringAng[0],
+        t: performance.now() / 1000,
+      };
+    });
+    const dAng = hold2.ang - hold1.ang, dT = hold2.t - hold1.t;
+    check('M9.3: AWAKE holds the beats (surge pinned, tilt stable, rings at boost, beat order)',
+      hold1.surgeP === 1 && hold2.surgeP === 1 &&
+      Math.abs(hold2.qA - hold1.qA) < 1e-6 &&
+      Math.abs(dAng - spinA * W.ringBoost * dT) < 0.02 &&
+      hold1.order[0] < hold1.order[1] && hold1.order[1] < hold1.order[2],
+      `ringA Δang ${dAng.toFixed(3)} vs` +
+      ` ${(spinA * W.ringBoost * dT).toFixed(3)} expected,` +
+      ` order ${hold1.order.map(v => v.toFixed(1)).join(' < ')}`);
+
+    /* 7. heap flat across the whole beat sequence (all per-node data
+     *    + tilt scratch pre-allocated at init) — sampled BEFORE the
+     *    screenshot pair (page-side canvas decodes are harness cost,
+     *    not sim allocations) */
+    const ha = await heapMin();
+    check('M9.3: no allocation per frame (heap flat across the full beat sequence)',
+      hb > 0 && ha > 0 && ha - hb <= 2 * 1024 * 1024,
+      `before=${Math.round(hb / 1024)}KB, after=${Math.round(ha / 1024)}KB`);
+
+    /* 8. visual gate: same street pose — the dormant reference pair
+     *    vs the beats-on pair (shake decayed ⇒ stable camera). The lit
+     *    node grid + flared eye + boosted hero light raise the region
+     *    mean. shots/m93-awakening-beats.png */
+    await page.waitForFunction(
+      () => window.SIM.CAMERA.shakeEnergy === 0, { timeout: 8000 });
+    let onSum = 0;
+    for (let i = 0; i < 2; i++) {
+      await sleep(150);
+      onSum += await regionStats(
+        (await page.screenshot(
+          { path: `${here}/shots/m93-awakening-beats.png` }))
+          .toString('base64'));
+    }
+    const onReg = onSum / 2;
+    check('M9.3: beats visible on screen (shots/m93-awakening-beats.png) — lit grid + flared eye raise the region',
+      fs.existsSync(`${here}/shots/m93-awakening-beats.png`) && coreXY.ok &&
+      onReg > offReg + 1.0,
+      `region mean ${offReg.toFixed(2)} → ${onReg.toFixed(2)}`);
+
+    /* 9. force AWAKE → DECAY → DORMANT: everything restores EXACTLY —
+     *    arms 0, ring quaternions byte-exact at base, node colors
+     *    byte-exact, flash decayed, draw calls back to baseline */
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 - E._awakeDur - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DECAY', { timeout: 5000 });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.decay - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    /* stay in the street pose — same pose as the visStreet baseline
+     * (the keep-set / frustum is pose-dependent) */
+    const d1 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      const ic = E.nodes.instanceColor.array;
+      let same = true;
+      for (let i = 0; i < E._nodeBase.length; i++)
+        if (ic[i] !== E._nodeBase[i]) { same = false; break; }
+      const qSame = i => {
+        const q = E.parts[['ringA', 'ringB', 'ringC'][i]].quaternion;
+        const b = E._ringBaseQ[i];
+        return q.x === b.x && q.y === b.y && q.z === b.z &&
+          q.w === b.w;
+      };
+      const vis = [];
+      S.scene.traverse(o => {
+        if (o.isMesh || o.isPoints || o.isLine) {
+          let v = true;
+          for (let p = o; p; p = p.parent) v = v && p.visible;
+          if (v) vis.push(o.name || o.type);
+        }
+      });
+      vis.sort();
+      return {
+        same,
+        armL: E.parts.armL.rotation.z,
+        armR: E.parts.armR.rotation.z,
+        q: qSame(0) && qSame(1) && qSame(2),
+        ignited: E._ignited,
+        surgeP: E._surgeP,
+        flash: S.FX._flash,
+        hero: E._hero.intensity,
+        calls: S.renderer.info.render.calls,
+        vis,
+      };
+    });
+    const visA = new Set(d1.vis), visB = new Set(visStreet.vis);
+    const visOnlyD1 = d1.vis.filter(v => !visB.has(v));
+    const visOnlyBase = visStreet.vis.filter(v => !visA.has(v));
+    const visSame = JSON.stringify(d1.vis) ===
+      JSON.stringify(visStreet.vis);
+    check('M9.3: beats resolve clean at DORMANT — pose + colors byte-exact, no leftover state',
+      d1.same && d1.armL === 0 && d1.armR === 0 && d1.q &&
+      !d1.ignited && d1.surgeP === 0 && d1.flash === 0 &&
+      d1.hero >= 0.9 - 1e-6 && d1.hero <= 1.2 + 1e-6 && visSame,
+      `hero=${d1.hero.toFixed(2)}, calls=${d1.calls}` +
+      ` (baseline ${visStreet.calls}), visSet=${visSame ? 'identical' : `DIFFERS` +
+      ` (onlyAtD1=[${visOnlyD1.slice(0, 6)}])` +
+      ` (onlyAtBase=[${visOnlyBase.slice(0, 6)}])`}`);
+
+    /* 10. re-trigger re-arms the beats: STIR again, shake re-armed,
+     *    and a second forced cycle resolves clean again (the surge
+     *    does NOT re-fire — the forced AWAKE never reaches its delay) */
+    await page.evaluate(() => window.SIM.ENTITY.wake());
+    const r1 = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return {
+        state: E.state,
+        surgeFired: E._surgeFired,
+        flare: E._beatAt.flare,
+        count: E._wakeCount,
+      };
+    });
+    check('M9.3: re-trigger re-arms the beats (STIR again, shake re-armed)',
+      r1.state === 'STIR' && !r1.surgeFired && r1.flare > 0 &&
+      r1.count === 4,   // 2 cycles in M9.2 + 1 in this section + this one
+      `count=${r1.count}, surgeFired=${r1.surgeFired}`);
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.stir - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'AWAKE', { timeout: 5000 });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 - E._awakeDur - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DECAY', { timeout: 5000 });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.decay - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    const r2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      const ic = E.nodes.instanceColor.array;
+      let same = true;
+      for (let i = 0; i < E._nodeBase.length; i++)
+        if (ic[i] !== E._nodeBase[i]) { same = false; break; }
+      return {
+        same,
+        armL: E.parts.armL.rotation.z,
+        armR: E.parts.armR.rotation.z,
+        ignited: E._ignited,
+        surgeP: E._surgeP,
+        shake: S.__m93.shake,
+      };
+    });
+    check('M9.3: second full cycle resolves clean (re-trigger safe)',
+      r2.same && r2.armL === 0 && r2.armR === 0 && !r2.ignited &&
+      r2.surgeP === 0 && r2.shake === B.surge.shake,
+      `shake total=${r2.shake} (want ${B.surge.shake} — one surge)`);
+
+    /* cleanup: restore the wrapped APIs, park the dream wave,
+     * reset the spawn pose */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.FX.flash = S.__m93f0;
+      S.CAMERA.shake = S.__m93s0;
+      delete S.__m93;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      const C = S.CAMERA;
+      C.pos.set(0, 4, 18);
+      C.vel.set(0, 0, 0);
+      C.yaw = 0;
+      C.pitch = 0;
+    });
+    await sleep(250);
   }
 
   /* ---- 10. No errors anywhere ---- */

@@ -299,6 +299,32 @@ const CFG = {
       jawOpen: 0.22,       // rad — jaw drop at full wake
       ringBoost: 8,        // ring speed multiplier at full wake
     },
+    /* M9.3: awakening beats 1–3 (creature-level power). Beat 1 ramps
+     * with wakeP over STIR and fires its flash at the STIR→AWAKE peak;
+     * beat 2's ignite wave starts at AWAKE entry; beat 3 surges
+     * `delay` s into AWAKE. Everything restores EXACTLY at DORMANT
+     * entry (wakeP/surgeP ⇒ 0). */
+    beats: {
+      flare: {             // beat 1: core-eye flare (emissive + light)
+        color: 0xd9f6ff,  // full-flare coreEye color
+        eye: 0.85,         // lerp amount toward the flare color (× wakeP)
+        hero: 6,           // extra hero-light intensity at full flare
+        flash: 1,          // FX.flash level fired at the STIR→AWAKE peak
+      },
+      ignite: {            // beat 2: node voxels ignite in radial waves
+        speed: 35,         // m/s wavefront (head level outward)
+        width: 6,          // m — ignition front width
+        bright: 0.9,       // lit node brightness (absolute, × hue)
+        front: 0.35,       // extra brightness at the hot front
+      },
+      surge: {             // beat 3: rings tilt + limbs reposition
+        delay: 1.0,        // s after AWAKE entry before the surge
+        ramp: 1.2,         // s ramp-in (and DECAY ramp-out rate)
+        ringTilt: 0.16,    // rad — ring tilt at full surge
+        armLift: 0.55,     // rad — arm outward lift at full surge
+        shake: 1.2,        // CAMERA.shake impulse at surge start
+      },
+    },
   },
 
   /* ---- M6.2: traffic — drones & sky vehicles (M6.2 drones, M6.3
@@ -4198,6 +4224,15 @@ const ENTITY = {
   _wakeCount: 0,                  // M9.2: awakenings triggered (smoke/dev)
   _awakeDur: 0,                   // M9.2: picked AWAKE hold (s, seeded)
   _ringAng: [0, 0, 0],           // M9.2: integrated ring angles (rad)
+  _awakeT0: 0,                  // M9.3: AWAKE entry time (beat 2 wave t0)
+  _ignited: false,              // M9.3: node grid lit (beat 2 in flight)
+  _surgeP: 0,                   // M9.3: beat-3 surge level 0..1
+  _surgeFired: false,           // M9.3: shake fired this sequence
+  _beatAt: { flare: 0, ignite: 0, surge: 0 },  // M9.3: beat start times
+  _tiltE: null,                 // M9.3: per-ring tilt Euler scratch
+  _tiltQ: null,                 // M9.3: per-ring tilt quaternion scratch
+  _surgeDir: null,              // M9.3: per-ring tilt directions (x, z)
+  _flareCol: null,              // M9.3: beat-1 flare color (pre-allocated)
   root: null,
   parts: {},
   core: null,                       // breathing group (torso/head/jaw/coreEye)
@@ -4469,6 +4504,21 @@ const ENTITY = {
       maxR,
     };
 
+    /* M9.3: awakening beats 1–3 — pre-allocated scratch (zero per-frame
+     * allocation). Beat 3 tilts each ring group by baseQ × tiltQ(level)
+     * along a fixed per-ring direction; the level is 0 in DORMANT ⇒
+     * quaternion = baseQ byte-exact (× identity). */
+    ENTITY._tiltE = [new THREE.Euler(), new THREE.Euler(), new THREE.Euler()];
+    ENTITY._tiltQ = [
+      new THREE.Quaternion(), new THREE.Quaternion(), new THREE.Quaternion(),
+    ];
+    ENTITY._surgeDir = [
+      { x: -1, z: 0 },     // ringA — pitch forward
+      { x: 0.7, z: 0.5 }, // ringB — pitch + roll
+      { x: -0.5, z: -0.3 }, // ringC — counter pitch/roll
+    ];
+    ENTITY._flareCol = new THREE.Color(CFG.entity.beats.flare.color);
+
     /* ---- steam drip: 32 pooled puffs from 4 vents (minimal, dormant) ---- */
     const vents = [
       [-12.5, 39.9, 0], [12.5, 39.9, 0],          // shoulder cooling caps
@@ -4533,6 +4583,10 @@ const ENTITY = {
     if (s === 'STIR') {
       ENTITY._wakeCount++;
       for (const sys of systems) if (sys.onAwaken) sys.onAwaken();
+      /* M9.3: beat 1 (core-eye flare) starts with the sequence; the
+       * beat-3 shake re-arms for this sequence. */
+      ENTITY._beatAt.flare = t;
+      ENTITY._surgeFired = false;
     }
     for (const h of ENTITY._wakeHooks[s]) h(s, t);
   },
@@ -4658,15 +4712,35 @@ const ENTITY = {
      * up in STIR, 1 in AWAKE, smoothstep down in DECAY, 0 in DORMANT
      * (the pose restores EXACTLY at DORMANT entry). */
     const W = CFG.entity.wake;
+    const B = CFG.entity.beats;
     if (ENTITY.state === 'STIR' && t - ENTITY.stateT >= W.stir) {
       ENTITY._awakeDur = W.awake[0] +
         ENTITY._wakeRng() * (W.awake[1] - W.awake[0]);
       ENTITY._enterState('AWAKE', t);
+      /* M9.3 beat 1 peak: core-eye flash at the STIR→AWAKE transition;
+       * beat 2's ignite wave starts now (t0 = AWAKE entry). A raw
+       * _enterState('AWAKE') (smoke seam) never sets _ignited ⇒ beats
+       * 2–3 stay off for forced non-sequence states. */
+      FX.flash(B.flare.flash, B.flare.color);
+      ENTITY._awakeT0 = t;
+      ENTITY._beatAt.ignite = t;
+      ENTITY._ignited = true;
     } else if (ENTITY.state === 'AWAKE' &&
       t - ENTITY.stateT >= ENTITY._awakeDur)
       ENTITY._enterState('DECAY', t);
-    else if (ENTITY.state === 'DECAY' && t - ENTITY.stateT >= W.decay)
+    else if (ENTITY.state === 'DECAY' && t - ENTITY.stateT >= W.decay) {
       ENTITY._enterState('DORMANT', t);
+      /* M9.3 beat 2 exit: restore the dormant node colors byte-exact;
+       * the beat state machine is fully idle again. */
+      if (ENTITY._ignited) {
+        ENTITY.nodes.instanceColor.array.set(ENTITY._nodeBase);
+        ENTITY.nodes.instanceColor.needsUpdate = true;
+        ENTITY._ignited = false;
+      }
+      ENTITY._beatAt.flare = 0;
+      ENTITY._beatAt.ignite = 0;
+      ENTITY._beatAt.surge = 0;
+    }
     let wakeP = 0;
     if (ENTITY.state === 'STIR') {
       const p = Math.min(1, Math.max(0, (t - ENTITY.stateT) / W.stir));
@@ -4682,6 +4756,82 @@ const ENTITY = {
     P.head.rotation.x = -wakeP * W.headLift;
     P.head.position.y = 43.6 + wakeP * W.headRise;
     P.jaw.rotation.x = wakeP * W.jawOpen;
+    /* M9.3 beat 2: node voxels ignite in radial waves from head level.
+     * The front radius grows from the AWAKE entry; each node's lit
+     * level smoothsteps in as the front passes, the hot front adds a
+     * Gaussian brightness bump, and the lit level HOLDS through
+     * AWAKE/DECAY (M9.5 dims it outward). DORMANT entry restores the
+     * base colors byte-exact (transition block above). */
+    if (ENTITY._ignited &&
+        (ENTITY.state === 'AWAKE' || ENTITY.state === 'DECAY')) {
+      const r = Math.min((t - ENTITY._awakeT0) * B.ignite.speed,
+        ENTITY._dream.maxR + B.ignite.width * 3);
+      const sig2 = 2 * B.ignite.width * B.ignite.width;
+      const ic = ENTITY.nodes.instanceColor.array;
+      const hue = ENTITY._nodeHue;
+      const nb = ENTITY._nodeBright;
+      const dist = ENTITY._nodeDist;
+      const n = ENTITY.nodeCount;
+      for (let i = 0; i < n; i++) {
+        let u = (r - dist[i]) / B.ignite.width;
+        u = u < 0 ? 0 : u > 1 ? 1 : u;
+        const ig = u * u * (3 - 2 * u);
+        const dd = dist[i] - r;
+        const b = nb[i] + (B.ignite.bright - nb[i]) * ig +
+          B.ignite.front * Math.exp(-(dd * dd) / sig2);
+        const i3 = i * 3;
+        ic[i3] = hue[i3] * b;
+        ic[i3 + 1] = hue[i3 + 1] * b;
+        ic[i3 + 2] = hue[i3 + 2] * b;
+      }
+      ENTITY.nodes.instanceColor.needsUpdate = true;
+    }
+    /* M9.3 beat 3: tensor rings tilt + limbs reposition, fired with a
+     * camera-shake impulse. The level ramps in `delay` s after AWAKE
+     * entry (integrated ⇒ a forced mid-ramp transition never jumps),
+     * holds through AWAKE, ramps out over DECAY, and is forced to
+     * exactly 0 in DORMANT (pose restores byte-exact: baseQ ×
+     * identity, arms 0). */
+    let surgeP = ENTITY._surgeP;
+    if (ENTITY.state === 'AWAKE' && ENTITY._ignited) {
+      const u = t - ENTITY._awakeT0 - B.surge.delay;
+      if (u > 0) {
+        if (!ENTITY._surgeFired) {
+          ENTITY._surgeFired = true;
+          ENTITY._beatAt.surge = t;
+          CAMERA.shake(B.surge.shake);
+        }
+        surgeP = Math.min(1, Math.max(0, surgeP + dt / B.surge.ramp));
+      }
+    } else if (ENTITY.state === 'DECAY' && ENTITY._ignited) {
+      surgeP = Math.max(0, surgeP - dt / W.decay);
+    } else if (ENTITY.state === 'DORMANT') {
+      surgeP = 0;
+    }
+    ENTITY._surgeP = surgeP;
+    {
+      const rings3 = ['ringA', 'ringB', 'ringC'];
+      for (let i = 0; i < 3; i++) {
+        const g = ENTITY.parts[rings3[i]];
+        if (!g) continue;
+        if (surgeP > 0) {
+          const d = ENTITY._surgeDir[i];
+          ENTITY._tiltE[i].x = d.x * B.surge.ringTilt * surgeP;
+          ENTITY._tiltE[i].z = d.z * B.surge.ringTilt * surgeP;
+          ENTITY._tiltQ[i].setFromEuler(ENTITY._tiltE[i]);
+          g.quaternion.copy(ENTITY._ringBaseQ[i]).multiply(ENTITY._tiltQ[i]);
+        } else {
+          g.quaternion.copy(ENTITY._ringBaseQ[i]);
+        }
+      }
+      if (surgeP > 0) {
+        P.armL.rotation.z = -surgeP * B.surge.armLift;
+        P.armR.rotation.z = surgeP * B.surge.armLift;
+      } else {
+        P.armL.rotation.z = 0;
+        P.armR.rotation.z = 0;
+      }
+    }
     /* breathing: slow scale on the core (period ≈ 10.5 s) */
     const br = 1 + 0.008 * Math.sin(t * 0.6);
     ENTITY.core.scale.setScalar(br);
@@ -4749,13 +4899,16 @@ const ENTITY = {
     }
     /* coreEye: faint dormant pulse of the compute-core face (+ the
      * dream wave lifts the core as the front crosses it) */
+    /* M9.3 beat 1: core-eye flare — emissive ramp toward the flare
+     * color + hero-light boost, both exactly 0 at wakeP = 0. */
     const k = 0.5 + 0.5 * Math.sin(t * 0.6);
     ENTITY._hero.intensity = 0.9 + 0.3 * k + 0.5 * dreamLevel +
-      1.5 * wakeP;
+      1.5 * wakeP + B.flare.hero * wakeP;
     if (ENTITY.parts.coreEye) {
       ENTITY._col.copy(ENTITY._coreA).lerp(
         ENTITY._coreB, Math.min(1, 0.35 * k + 0.45 * dreamLevel +
         0.5 * wakeP));
+      ENTITY._col.lerp(ENTITY._flareCol, B.flare.eye * wakeP);
       ENTITY.parts.coreEye.material.color.copy(ENTITY._col);
     }
     /* steam drip: 32 pooled puffs, 4 vents — rises, drifts, fades, re-enters */
