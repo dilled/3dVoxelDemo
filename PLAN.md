@@ -64,7 +64,7 @@ smoke-test evidence.
 | **M8.2** ✅ | Fog depth tune + zone-tinted haze (cyan core / warm avenues) via fog color lerp | Depth readable at 500 m; zone tint visible flying across zones |
 | **M8.3** ✅ | Volumetric-ish light shafts: a few additive cone/cylinder meshes from key spires + creature core (only when near / during awakening) | Shafts visible near spire, absent far away (no permanent draw calls) |
 | **M8.4** ✅ | Distant lightning: random far point + brief hemi bump + flash + EM discharge ring across the city | Lightning event visible from inside the city; fires on timer + manual key |
-| **M9.1** | Idle/dormant animation: tensor-ring rotation, antenna sway, breathing core, periodic "dream" LED wave across the node grid (instance-color waves) | Dream wave sweeps the node grid visibly; dormant state stays dim and still-ish |
+| **M9.1** ✅ | Idle/dormant animation: tensor-ring rotation, antenna sway, breathing core, periodic "dream" LED wave across the node grid (instance-color waves) | Dream wave sweeps the node grid visibly; dormant state stays dim and still-ish |
 | **M9.2** | Wake state machine: DORMANT → STIR (2 s head lift, jaw, rings speed up) → AWAKE (10–20 s) → DECAY → DORMANT, with per-state hooks | State machine smoke test: forced transitions in order, clean return to DORMANT, re-trigger safe |
 | **M9.3** | Awakening beats 1–3: core-eye flare (emissive ramp + light + flash), node voxels ignite in radial waves, rings accelerate + limbs reposition (shake impulse) | Beats 1–3 play in sequence with correct timing on manual trigger |
 | **M9.4** | Awakening beats 4–5: energy pulse ring from plaza + city holo-signs/LEDs following the wave (per-ring scheduled ramps), substation arcs fire, steam bursts, drones scatter/re-route, vehicles avoid | The "thousands of compute nodes illuminate" moment lands; wave visibly travels ring by ring |
@@ -573,12 +573,38 @@ lightning event visible from inside the city.
 ### M9 — Creature animation & awakening sequence (the climax)
 
 #### M9.1 — Idle/dormant animation
-- [ ] Slow tensor-ring rotation, antenna sway, breathing core, occasional
+- [x] Slow tensor-ring rotation, antenna sway, breathing core, occasional
       "dream" LED wave across the node grid (shader-less: animate
       instance colors in waves).
 - **Test:** dream wave visibly sweeps the node grid on its timer; dormant
       state stays dim and still-ish.
 - **Commit when:** wave verified on screen.
+- **Verified:** smoke M9.1 section green — `ENTITY` dormant idle: antenna
+  sway (deterministic per-mast tilt `0.02·sin/cos(t·0.35+ph)`, mast
+  children untouched) + dream wave, a shader-less radial LED sweep via
+  instance colors (`hue × (base + 0.4·exp(−dd²/2σ²)·env)`, front 16 m/s
+  from head level `(0,44,0)`, σ 5 m); dormant base colors restored
+  byte-exact when the front exits, interval re-seeded by a seeded rng into
+  14–26 s (first wave 8 s after boot); all per-node arrays pre-allocated
+  (capacity 4200) ⇒ heap flat and no per-frame instance upload between
+  waves; while active the hero light gets +0.5·env and the coreEye lerp
+  +0.45·env. Seams for M9.2: `ENTITY._dreamFrozen` (wave-time freeze,
+  same pattern as `ATMOS._ltFrozen`) and wave start gated on
+  `ENTITY.state === 'DORMANT'`. Gates: registration (pre-allocated data,
+  wave idle, grid dim maxc < 0.1); antennas sway within ±amp; timer fire
+  (front node lit, ahead node still dim); sweep travel (B lit after, A dim
+  again); resolves clean (base byte-exact, interval re-seeded, draw calls
+  unchanged); dormant idle byte-static; heap flat; visual gate — street
+  pose (72, 1.7, 55), wave frozen at r ≥ 18, off/on pair around the
+  projected core, 2-pair averaged 11.37 → 19.55
+  (`shots/m91-dream-wave.png`). Flake fixes folded in: M6.2 dock check
+  samples dock/airborne states over a 20×250 ms window instead of one
+  instant (dock 3–9 s vs. minutes of patrol ⇒ a single sample can catch
+  the whole fleet airborne); M9.1 section arms the timer idempotently —
+  a polling function that rewrites `nextAt = now+0.2` on every poll chases
+  its own tail (the frame after a poll is only ~1 frame later, never
+  0.2 s) and the wave never starts, and the sweep-travel `page.evaluate`
+  must return `iA`/`iB` (an absent field makes `w2.iB >= 0` fail).
 
 #### M9.2 — Wake state machine
 - [ ] DORMANT → STIR (2 s: head lift, jaw, rings speed up) → AWAKE

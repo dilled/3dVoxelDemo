@@ -268,6 +268,28 @@ const CFG = {
     ledTexture: 0,               // 0 = ledA / 1 = ledB (picked per building)
   },
 
+  /* ---- M5/M9: ENTITY — dormant creature animation (M9.1) ----
+   * Idle: tensor-ring spin (per-ring ENTITY.ringSpin, M5), breathing
+   * core scale (M5), antenna sway = small deterministic tilt on each
+   * mast group. Dream wave: a periodic radial sweep across the compute
+   * node grid — shader-less instance-color animation: per-node color =
+   * hue × (base brightness + glow × front envelope); the dormant base
+   * colors are restored byte-exact when the front exits. */
+  entity: {
+    antennaSway: {
+      amp: 0.02,              // rad — max tilt (≈ 0.24 m tip sway on a 12 m mast)
+      speed: 0.35,            // rad/s — slow sway
+    },
+    dream: {
+      every: [14, 26],       // s between dream waves (seeded jitter)
+      first: 8,              // s after boot until the first wave
+      speed: 16,             // m/s wavefront
+      width: 5,              // m — Gaussian front σ
+      glow: 0.4,             // absolute brightness added at the front peak
+      origin: [0, 44, 0],   // wave centre (creature head level)
+    },
+  },
+
   /* ---- M6.2: traffic — drones & sky vehicles (M6.2 drones, M6.3
    * sky vehicles: same cap/pool pattern) ----
    * Drones dock on tower rooftops (the M3 building seeds are replayed
@@ -4166,6 +4188,14 @@ const ENTITY = {
   nodes: null,                     // single InstancedMesh (thousands of nodes)
   nodeCount: 0,
   ringSpin: [0.06, -0.045, 0.035], // rad/s idle — "almost still, dim"
+  _antPh: [0, 1.7, 3.9, 5.4],   // M9.1: per-antenna sway phase (rad)
+  _dream: null,                 // M9.1: dream wave {active, t0, nextAt, maxR}
+  _dreamRng: null,              // M9.1: seeded rng (wave interval jitter)
+  _nodeBase: null,              // M9.1: dormant instance colors (byte-exact restore)
+  _nodeHue: null,               // M9.1: per-node normalized hue (3·n)
+  _nodeBright: null,            // M9.1: per-node dormant brightness (n)
+  _nodePos: null,               // M9.1: per-node position (3·n)
+  _nodeDist: null,              // M9.1: per-node distance from dream origin (n)
   _steam: null,
   _steamPars: null,
   _coreA: new THREE.Color(0x173d52),
@@ -4392,6 +4422,33 @@ const ENTITY = {
     ENTITY._placeNodes(N);
     ENTITY.nodeCount = N.count;
 
+    /* M9.1: dream wave state — per-node distance from the wave origin +
+     * the dormant base colors captured byte-exact from the instance
+     * buffer (restored when each wave exits). */
+    const D = CFG.entity.dream;
+    const o = D.origin;
+    const nn = N.count;
+    ENTITY._nodeDist = new Float32Array(nn);
+    let maxR = 0;
+    for (let i = 0; i < nn; i++) {
+      const i3 = i * 3;
+      const dx = ENTITY._nodePos[i3] - o[0];
+      const dy = ENTITY._nodePos[i3 + 1] - o[1];
+      const dz = ENTITY._nodePos[i3 + 2] - o[2];
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      ENTITY._nodeDist[i] = d;
+      if (d > maxR) maxR = d;
+    }
+    ENTITY._nodeBase = new Float32Array(
+      N.mesh.instanceColor.array.subarray(0, nn * 3));
+    ENTITY._dreamRng = ENTITY._mulb();
+    ENTITY._dream = {
+      active: false,
+      t0: 0,
+      nextAt: performance.now() / 1000 + D.first,
+      maxR,
+    };
+
     /* ---- steam drip: 32 pooled puffs from 4 vents (minimal, dormant) ---- */
     const vents = [
       [-12.5, 39.9, 0], [12.5, 39.9, 0],          // shoulder cooling caps
@@ -4440,6 +4497,12 @@ const ENTITY = {
    * per-frame upload; M9 animates these via instance color). */
   _placeNodes(N) {
     const rng = ENTITY._mulb();
+    /* M9.1: record per-node hue / brightness / position so the dream
+     * wave can animate the instance colors and restore them byte-exact. */
+    const cap = N.capacity;
+    ENTITY._nodeHue = new Float32Array(cap * 3);
+    ENTITY._nodeBright = new Float32Array(cap);
+    ENTITY._nodePos = new Float32Array(cap * 3);
     const add = (x, y, z) => {
       if (N.count >= N.capacity) return;
       const s = 0.62 + rng() * 0.4;
@@ -4450,6 +4513,12 @@ const ENTITY = {
       else c = [0.55, 0.62, 1];                  // dim blue-violet
       let b = 0.018 + rng() * 0.055;          // dormant dimness (~1 %)
       if (rng() < 0.07) b = 0.004;            // dead node
+      const i3 = N.count * 3;
+      ENTITY._nodeHue[i3] = c[0]; ENTITY._nodeHue[i3 + 1] = c[1];
+      ENTITY._nodeHue[i3 + 2] = c[2];
+      ENTITY._nodeBright[N.count] = b;
+      ENTITY._nodePos[i3] = x; ENTITY._nodePos[i3 + 1] = y;
+      ENTITY._nodePos[i3 + 2] = z;
       N.add(x, y, z, [s, s, s], ENTITY._col
         .setRGB(c[0], c[1], c[2]).multiplyScalar(b).getHex());
     };
@@ -4542,18 +4611,73 @@ const ENTITY = {
     /* breathing: slow scale on the core (period ≈ 10.5 s) */
     const br = 1 + 0.008 * Math.sin(t * 0.6);
     ENTITY.core.scale.setScalar(br);
-    /* coreEye: faint dormant pulse of the compute-core face */
-    const k = 0.5 + 0.5 * Math.sin(t * 0.6);
-    ENTITY._hero.intensity = 0.9 + 0.3 * k;
-    if (ENTITY.parts.coreEye) {
-      ENTITY._col.copy(ENTITY._coreA).lerp(ENTITY._coreB, 0.35 * k);
-      ENTITY.parts.coreEye.material.color.copy(ENTITY._col);
-    }
     /* tensor rings: almost-still idle spin (absolute angle ⇒ deterministic) */
     const rings = ['ringA', 'ringB', 'ringC'];
     for (let i = 0; i < 3; i++) {
       const g = ENTITY.parts[rings[i]];
       if (g) g.children[0].rotation.z = t * ENTITY.ringSpin[i];
+    }
+    /* antenna sway (M9.1): small deterministic tilt per mast group —
+     * absolute in t ⇒ deterministic; the mast child stays put. */
+    const AS = CFG.entity.antennaSway;
+    for (let i = 0; i < 4; i++) {
+      const g = ENTITY.parts['antenna' + (i + 1)];
+      if (!g) continue;
+      const ph = ENTITY._antPh[i];
+      g.rotation.x = AS.amp * Math.sin(t * AS.speed + ph);
+      g.rotation.z = AS.amp * Math.cos(t * AS.speed * 0.83 + ph * 1.7);
+    }
+    /* dream wave (M9.1): a periodic radial LED sweep across the node
+     * grid — shader-less: per-node color = hue × (base + glow × front
+     * envelope); the dormant base colors are restored byte-exact when
+     * the front exits. _dreamFrozen pauses time (smoke screenshot). */
+    const D = CFG.entity.dream;
+    const dr = ENTITY._dream;
+    let dreamLevel = 0;
+    if (!ENTITY._dreamFrozen) {
+      if (ENTITY.state === 'DORMANT' && !dr.active && t >= dr.nextAt) {
+        dr.active = true;
+        dr.t0 = t;
+        dr.nextAt = t + D.every[0] +
+          ENTITY._dreamRng() * (D.every[1] - D.every[0]);
+      }
+      if (dr.active) {
+        const r = (t - dr.t0) * D.speed;
+        if (r - D.width * 3 > dr.maxR) {
+          dr.active = false;
+          ENTITY.nodes.instanceColor.array.set(ENTITY._nodeBase);
+          ENTITY.nodes.instanceColor.needsUpdate = true;
+        } else {
+          const sig2 = 2 * D.width * D.width;
+          const env = Math.min(1, Math.max(
+            0, (dr.maxR + D.width * 3 - r) / (D.width * 3)));
+          const ic = ENTITY.nodes.instanceColor.array;
+          const hue = ENTITY._nodeHue;
+          const nb = ENTITY._nodeBright;
+          const dist = ENTITY._nodeDist;
+          const n = ENTITY.nodeCount;
+          for (let i = 0; i < n; i++) {
+            const dd = dist[i] - r;
+            const a = Math.exp(-(dd * dd) / sig2) * env;
+            const b = nb[i] + D.glow * a;
+            const i3 = i * 3;
+            ic[i3] = hue[i3] * b;
+            ic[i3 + 1] = hue[i3 + 1] * b;
+            ic[i3 + 2] = hue[i3 + 2] * b;
+          }
+          ENTITY.nodes.instanceColor.needsUpdate = true;
+          dreamLevel = env;
+        }
+      }
+    }
+    /* coreEye: faint dormant pulse of the compute-core face (+ the
+     * dream wave lifts the core as the front crosses it) */
+    const k = 0.5 + 0.5 * Math.sin(t * 0.6);
+    ENTITY._hero.intensity = 0.9 + 0.3 * k + 0.5 * dreamLevel;
+    if (ENTITY.parts.coreEye) {
+      ENTITY._col.copy(ENTITY._coreA).lerp(
+        ENTITY._coreB, Math.min(1, 0.35 * k + 0.45 * dreamLevel));
+      ENTITY.parts.coreEye.material.color.copy(ENTITY._col);
     }
     /* steam drip: 32 pooled puffs, 4 vents — rises, drifts, fades, re-enters */
     const pts = ENTITY._steam;

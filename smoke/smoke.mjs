@@ -1194,9 +1194,25 @@ try {
       `count=${a0.count}, poolCap=${a0.poolCap}, inUse=${a0.inUse}`);
     check('M6.2: every live drone is a pre-created pool item (zero `new` after init)',
       a0.zeroNew === true, `live=${a0.count}`);
+    /* dock/patrol is a slow cycle (dock 3–9 s vs. minutes of patrol):
+     * a single instant can catch the whole fleet airborne, so confirm
+     * both states over a short window, not one sample */
+    const dockSeen = await page.evaluate(async () => {
+      const T = window.SIM.TRAFFIC;
+      const seen = { docked: 0, airborne: 0 };
+      for (let i = 0; i < 20; i++) {
+        const live = T._live.slice(0, T.count);
+        if (live.some(it => it.state === 0)) seen.docked++;
+        if (live.some(it => it.state > 0)) seen.airborne++;
+        await new Promise(r => setTimeout(r, 250));
+      }
+      return seen;
+    });
     check('M6.2: drones dock at towers and patrol between them',
-      a0.docked > 0 && a0.airborne > 0 && a0.wpRouted > 0,
-      `docked=${a0.docked}, airborne=${a0.airborne}, routed=${a0.wpRouted}`);
+      (a0.docked > 0 || dockSeen.docked > 0) &&
+      (a0.airborne > 0 || dockSeen.airborne > 0) && a0.wpRouted > 0,
+      `docked=${a0.docked} (seen ${dockSeen.docked}/20), ` +
+      `airborne=${a0.airborne} (seen ${dockSeen.airborne}/20), routed=${a0.wpRouted}`);
 
     /* patrol movement + no per-frame allocation across a live-fleet window */
     await sleep(2500);
@@ -4718,6 +4734,360 @@ try {
       heapAfter - heapBefore <= 2 * 1024 * 1024,
       `before=${Math.round(heapBefore / 1024)}KB,` +
       ` after=${Math.round(heapAfter / 1024)}KB`);
+  }
+
+  /* ------------------------------------------------------------------
+   * M9.1 — idle/dormant animation: tensor-ring spin (M5), antenna
+   * sway, breathing core (M5), periodic "dream" LED wave across the
+   * node grid
+   *
+   *  Shader-less instance-color animation: per-node color =
+   *  hue × (base brightness + glow × Gaussian front envelope); the
+   *  dormant base colors are restored byte-exact when the front
+   *  exits. Antenna sway = small deterministic tilt on each mast
+   *  group. All per-node data pre-allocated at init ⇒ heap flat.
+   * ------------------------------------------------------------------ */
+  {
+    /* wait for any in-flight auto-timer wave to resolve first */
+    await page.waitForFunction(() => {
+      const E = window.SIM.ENTITY;
+      return E && E._dream && !E._dream.active;
+    }, { timeout: 20000 });
+
+    /* 1. registered: config + pre-allocated per-node data, wave idle,
+     *    node grid dim (dormant stays dim) */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, C = S.CFG.entity;
+      const n = E.nodeCount;
+      const a = E.nodes.instanceColor.array;
+      let maxc = 0;
+      for (let i = 0; i < a.length; i++) maxc = Math.max(maxc, a[i]);
+      return {
+        cfg: !!C && C.antennaSway.amp > 0 && C.antennaSway.speed > 0 &&
+          C.dream.every[1] > C.dream.every[0] > 0 && C.dream.speed > 0 &&
+          C.dream.width > 0 && C.dream.glow > 0 && C.dream.first > 0,
+        data: E._nodeBase.length === n * 3 &&
+          E._nodeHue.length >= n * 3 && E._nodeBright.length >= n &&
+          E._nodeDist.length === n && E._nodePos.length >= n * 3 &&
+          E._nodeBase.length <= a.length,
+        idle: !E._dream.active &&
+          E._dream.nextAt > performance.now() / 1000 &&
+          E._dream.maxR > 0,
+        dim: maxc < 0.1,
+        n,
+      };
+    });
+    check('M9.1: dormant animation registered — dream wave data pre-allocated, wave idle, node grid dim',
+      reg.cfg && reg.data && reg.idle && reg.dim,
+      `nodes=${reg.n}, cfg=${reg.cfg}, data=${reg.data},` +
+      ` idle=${reg.idle}, dim=${reg.dim}`);
+    /* diagnostic sub-values (always logged on failure above) */
+    console.log('  M9.1 reg detail:', JSON.stringify(reg));
+
+    /* 2. antenna sway: mast groups tilt within ±amp, mast children
+     *    stay put, slow (still-ish) */
+    const ant = () => page.evaluate(() => {
+      const P = window.SIM.ENTITY.parts;
+      const out = [];
+      for (let i = 1; i <= 4; i++) {
+        const g = P['antenna' + i];
+        out.push({
+          rx: g.rotation.x, rz: g.rotation.z,
+          mx: g.children[0].position.x,
+          my: g.children[0].position.y,
+          mz: g.children[0].position.z,
+        });
+      }
+      return out;
+    });
+    const a0 = await ant();
+    await sleep(1200);
+    const a1 = await ant();
+    const amp = await page.evaluate(() =>
+      window.SIM.CFG.entity.antennaSway.amp);
+    check('M9.1: antennas sway within ±amp (slow, still-ish)',
+      a1.every((v, i) =>
+        Math.abs(v.rx) <= amp + 1e-6 && Math.abs(v.rz) <= amp + 1e-6 &&
+        v.mx === a0[i].mx && v.my === a0[i].my && v.mz === a0[i].mz) &&
+      a1.some((v, i) => v.rx !== a0[i].rx || v.rz !== a0[i].rz),
+      `ant1 rx ${a0[0].rx.toFixed(4)} -> ${a1[0].rx.toFixed(4)}`);
+
+    /* 3. timer: force the next wave ~0.2 s out — it fires on the
+     *    timer and the front grows at the configured speed. The arm is
+     *    idempotent: only pull the deadline in when it is currently
+     *    further out than now+0.2 s — rewriting it on every poll would
+     *    chase its own tail (the frame after a poll is only ~one frame
+     *    later, never 0.2 s) and the wave could never start. An
+     *    auto-timer wave that is already running is fine — its own
+     *    re-seeded interval is what check 5 verifies. */
+    await page.waitForFunction(() => {
+      const E = window.SIM.ENTITY;
+      const n = performance.now() / 1000;
+      if (!E._dream.active && E._dream.nextAt > n + 0.2)
+        E._dream.nextAt = n + 0.2;
+      return E._dream.active;
+    }, { timeout: 8000 });
+    /* wait until the front is well inside the grid (r ≥ 3σ) so both
+     * test nodes exist: A just behind the front, B ahead of it.
+     * Self-arming: if the wave resolved before the first poll (a slow
+     * page can stall past the ~4 s wave), the next poll pulls the
+     * deadline back in and arms a fresh one instead of waiting for
+     * the 14–26 s auto timer. */
+    await page.waitForFunction(() => {
+      const E = window.SIM.ENTITY;
+      const D = window.SIM.CFG.entity.dream;
+      const n = performance.now() / 1000;
+      if (!E._dream.active && E._dream.nextAt > n + 0.2)
+        E._dream.nextAt = n + 0.2;
+      return E._dream.active &&
+        (performance.now() / 1000 - E._dream.t0) * D.speed >= 15;
+    }, { timeout: 8000 });
+    const w1 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      const D = S.CFG.entity.dream;
+      const t = performance.now() / 1000;
+      const r = (t - E._dream.t0) * D.speed;
+      const sig = D.width;
+      const dist = E._nodeDist;
+      const ic = E.nodes.instanceColor.array;
+      const base = E._nodeBase;
+      const n = E.nodeCount;
+      /* node A: just behind the front (lit); node B: ahead of it
+       * (still dim — the Gaussian tail there is negligible) */
+      let iA = -1, iB = -1;
+      for (let i = 0; i < n; i++) {
+        if (iA < 0 && dist[i] > r - 2 * sig && dist[i] < r - sig) iA = i;
+        if (iB < 0 && dist[i] > r + 3 * sig && dist[i] < r + 4 * sig)
+          iB = i;
+      }
+      const lit = i => {
+        const i3 = i * 3;
+        return Math.max(ic[i3] - base[i3], ic[i3 + 1] - base[i3 + 1],
+          ic[i3 + 2] - base[i3 + 2]);
+      };
+      return {
+        r, maxR: E._dream.maxR, t0: E._dream.t0, t,
+        iA, iB,
+        litA: iA >= 0 ? lit(iA) : -1,
+        litB: iB >= 0 ? lit(iB) : 1,
+        calls: S.renderer.info.render.calls,
+      };
+    });
+    check('M9.1: dream wave fires on its timer — front node lit, ahead node still dim',
+      w1.iA >= 0 && w1.iB >= 0 && w1.litA > 0.02 && w1.litB < 0.01 &&
+      w1.r > 0 && w1.r < w1.maxR,
+      `r=${w1.r.toFixed(1)} m (maxR ${w1.maxR.toFixed(0)} m),` +
+      ` nodeA +${w1.litA.toFixed(3)}, nodeB +${w1.litB.toFixed(4)}`);
+
+    /* 4. the sweep travels: ~1.5 s later the front has passed node B
+     *    (now lit) and left node A behind (dim again) */
+    await sleep(1500);
+    const w2 = await page.evaluate(({ iA, iB }) => {
+      const E = window.SIM.ENTITY;
+      const D = window.SIM.CFG.entity.dream;
+      const ic = E.nodes.instanceColor.array;
+      const base = E._nodeBase;
+      const lit = i => {
+        const i3 = i * 3;
+        return Math.max(ic[i3] - base[i3], ic[i3 + 1] - base[i3 + 1],
+          ic[i3 + 2] - base[i3 + 2]);
+      };
+      return {
+        iA, iB,
+        litB: iB >= 0 ? lit(iB) : -1,
+        litA: iA >= 0 ? lit(iA) : 1,
+        active: E._dream.active,
+        r: (performance.now() / 1000 - E._dream.t0) * D.speed,
+        maxR: E._dream.maxR,
+        calls: window.SIM.renderer.info.render.calls,
+      };
+    }, { iA: w1.iA, iB: w1.iB });
+    check('M9.1: dream wave sweeps the node grid (B lit after, A dim again)',
+      w2.iB >= 0 && w2.litB > 0.02 && w2.litA < 0.01 && w2.active,
+      `nodeB +${w2.litB.toFixed(3)}, nodeA +${w2.litA.toFixed(4)},` +
+      ` r=${w2.r.toFixed(1)} maxR=${w2.maxR} active=${w2.active}`);
+    console.log('  M9.1 sweep detail:', JSON.stringify(w2));
+
+    /* 5. the wave resolves: base colors restored byte-exact, interval
+     *    re-seeded into the configured range, no leftover state */
+    await page.waitForFunction(
+      () => !window.SIM.ENTITY._dream.active,
+      { timeout: 15000 });
+    const res = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      const D = S.CFG.entity.dream;
+      const ic = E.nodes.instanceColor.array;
+      let same = true;
+      for (let i = 0; i < E._nodeBase.length; i++)
+        if (ic[i] !== E._nodeBase[i]) { same = false; break; }
+      return {
+        same,
+        gap: E._dream.nextAt - E._dream.t0,
+        every: D.every,
+        calls: S.renderer.info.render.calls,
+      };
+    });
+    check('M9.1: wave resolves clean — instance colors byte-exact at base, interval re-seeded',
+      res.same && res.gap >= res.every[0] && res.gap <= res.every[1] &&
+      res.calls === w1.calls,
+      `next in ${res.gap.toFixed(1)} s (range ${res.every[0]}–${res.every[1]} s),` +
+      ` draw calls unchanged (${res.calls})`);
+
+    /* 6. idle = no per-frame upload: with the next wave parked far out,
+     *    instance colors + matrices are byte-static across frames */
+    await page.evaluate(() => {
+      window.SIM.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+    });
+    const idle = await page.evaluate(async () => {
+      const S = window.SIM, E = S.ENTITY;
+      const h = () => {
+        const a = E.nodes.instanceColor.array;
+        const m = E.nodes.instanceMatrix.array;
+        let x = 0;
+        for (let i = 0; i < a.length; i++) x = (x * 31 + a[i]) | 0;
+        for (let i = 0; i < 256; i++) x = (x * 31 + m[i]) | 0;
+        return x;
+      };
+      const h0 = h();
+      await new Promise(r => setTimeout(r, 1200));
+      return { h1: h(), h0 };
+    });
+    check('M9.1: dormant idle is still-ish — no per-frame instance upload between waves',
+      idle.h0 === idle.h1);
+
+    /* 7. heap flat across a whole wave sequence (all arrays are
+     *    pre-allocated at init) */
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const hb = await heapMin();
+    await page.evaluate(() => {
+      window.SIM.ENTITY._dream.nextAt = performance.now() / 1000 + 0.2;
+    });
+    await page.waitForFunction(
+      () => !window.SIM.ENTITY._dream.active,
+      { timeout: 15000 });
+    const ha = await heapMin();
+    check('M9.1: no allocation per frame (heap flat across the dream wave)',
+      hb > 0 && ha > 0 && ha - hb <= 2 * 1024 * 1024,
+      `before=${Math.round(hb / 1024)}KB, after=${Math.round(ha / 1024)}KB`);
+
+    /* 8. visual gate: street pose at ~90 m (the M5 street-full pose),
+     *    fire the wave, freeze it mid-sweep (_dreamFrozen), on/off
+     *    screenshot pair around the projected creature core (0, 44, 0).
+     *    2 pairs averaged (the scene animates: stars, LEDs, particles).
+     *    shots/m91-dream-wave.png */
+    await page.evaluate(() => {
+      const C = window.SIM.CAMERA;
+      C.pos.set(72, 1.7, 55);
+      C.vel.set(0, 0, 0);
+      C.yaw = 0.92;
+      C.pitch = 0.30;
+      window.SIM.ENTITY._dream.nextAt = performance.now() / 1000 + 0.15;
+    });
+    /* wait until the front is mid-creature (r ≥ 18 m), then freeze
+     * (self-arming, as above) */
+    await page.waitForFunction(() => {
+      const E = window.SIM.ENTITY;
+      const D = window.SIM.CFG.entity.dream;
+      const n = performance.now() / 1000;
+      if (!E._dream.active && E._dream.nextAt > n + 0.2)
+        E._dream.nextAt = n + 0.2;
+      return E._dream.active &&
+        (performance.now() / 1000 - E._dream.t0) * D.speed >= 18;
+    }, { timeout: 15000 });
+    await page.evaluate(() => {
+      window.SIM.ENTITY._dreamFrozen = true;
+    });
+    /* capture the exact frozen wave colors — the off-shot restores the
+     * dormant base, the on-shot restores these (byte-exact pair) */
+    const waveCol = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return Array.from(
+        E.nodes.instanceColor.array.subarray(0, E.nodeCount * 3));
+    });
+    const coreXY = await page.evaluate(() => {
+      const p = window.SIM.project(0, 44, 0);
+      return {
+        x: (p.x + 1) / 2 * window.innerWidth,
+        y: (1 - p.y) / 2 * window.innerHeight,
+        ok: p.x > -1 && p.x < 1 && p.y > -1 && p.y < 1,
+      };
+    });
+    const regionStats = b64 => page.evaluate(async ({ b64, cx, cy }) => {
+      const img = new Image();
+      await new Promise((res2, rej) => {
+        img.onload = res2; img.onerror = rej;
+        img.src = 'data:image/png;base64,' + b64;
+      });
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      /* region: ±12 % of the frame around the projected creature core
+       * (0, 44, 0) — the node grid lives here */
+      const hw = Math.floor(c.width * 0.24) / 2;
+      const hh = Math.floor(c.height * 0.24) / 2;
+      const x0 = Math.max(0, Math.round(cx - hw));
+      const y0 = Math.max(0, Math.round(cy - hh));
+      const x1 = Math.min(c.width, Math.round(cx + hw));
+      const y1 = Math.min(c.height, Math.round(cy + hh));
+      const d = ctx.getImageData(x0, y0, x1 - x0, y1 - y0).data;
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4)
+        sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      return sum / (d.length / 4);
+    }, { b64, cx: coreXY.x, cy: coreXY.y });
+    let offSum = 0, onSum = 0;
+    for (let i = 0; i < 2; i++) {
+      /* off: temporarily restore the dormant base colors */
+      await page.evaluate(() => {
+        const E = window.SIM.ENTITY;
+        E.nodes.instanceColor.array.set(E._nodeBase);
+        E.nodes.instanceColor.needsUpdate = true;
+      });
+      await sleep(150);
+      offSum += await regionStats(
+        (await page.screenshot()).toString('base64'));
+      /* on: restore the frozen wave colors */
+      await page.evaluate(wc => {
+        const E = window.SIM.ENTITY;
+        E.nodes.instanceColor.array.set(wc);
+        E.nodes.instanceColor.needsUpdate = true;
+      }, waveCol);
+      await sleep(150);
+      const shot = await page.screenshot(
+        { path: `${here}/shots/m91-dream-wave.png` });
+      onSum += await regionStats(shot.toString('base64'));
+    }
+    const offReg = offSum / 2, onReg = onSum / 2;
+    check('M9.1: dream wave visible on screen (shots/m91-dream-wave.png) — the sweep adds light across the node grid',
+      fs.existsSync(`${here}/shots/m91-dream-wave.png`) && coreXY.ok &&
+      onReg > offReg + 0.5,
+      `region mean ${offReg.toFixed(2)} → ${onReg.toFixed(2)}`);
+    /* unfreeze and let the wave finish */
+    await page.evaluate(() => {
+      window.SIM.ENTITY._dreamFrozen = false;
+    });
+    await page.waitForFunction(
+      () => !window.SIM.ENTITY._dream.active,
+      { timeout: 15000 });
+    /* reset to the spawn pose for the remaining checks */
+    await page.evaluate(() => {
+      const C = window.SIM.CAMERA;
+      C.pos.set(0, 4, 18);
+      C.vel.set(0, 0, 0);
+      C.yaw = 0;
+      C.pitch = 0;
+    });
+    await sleep(250);
   }
 
   /* ---- 10. No errors anywhere ---- */
