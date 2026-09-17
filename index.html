@@ -470,6 +470,31 @@ const CFG = {
       coreColor: 0x9fe8ff,    // core shaft tint
       fade: 2.5,              // 1/s — opacity ease rate (no pop in/out)
     },
+
+    /* ---- M8.4: distant lightning events ----
+     * A strike at a random far point (beyond the haze wall) plays: brief
+     * hemi intensity bump + screen flash (FX.flash) + a fog-off point
+     * flash billboard + a fog-off EM discharge ring expanding across the
+     * city + lightning motes (PARTS 'light' pool). Auto on a seeded
+     * timer; manual trigger Key L. Idle cost = 0 draw calls (both
+     * meshes hidden). */
+    lightning: {
+      every: [16, 32],         // s between auto events (seeded random)
+      firstDelay: 10,         // s after boot until the first auto event
+      dist: [700, 1400],       // m — far point distance from the plaza
+      altitude: [220, 380],    // m — strike altitude
+      flash: 0.5,              // FX.flash level (screen flash)
+      flashColor: 0xdcebff,   // pale blue-white tint
+      hemiBoost: 2.0,         // added to CFG.lights.hemiIntensity
+      hemiDecay: 3.0,         // 1/s — brief (τ ≈ 0.33 s)
+      ring: { radius: 950, life: 2.6, y: 0.6, color: 0x9fd4ff },
+      /* the annulus is 0.6→1.0 of the radius (0.4 R wide): a wide
+       * shockwave band, not a hairline — readable from above at
+       * distance, and it sweeps the whole city */
+      motes: 16,               // lightning motes per event (PARTS pool)
+      flashSize: 120,          // m — point flash billboard size
+      flashDur: 0.5,           // s — point flash lifetime (flicker)
+    },
   },
 };
 
@@ -627,6 +652,7 @@ const INPUT = {
   arcTrigger: false,          // T edge — dev trigger: FX arcs (sub↔sub, creature→ring)
   flashTrigger: false,        // B edge — dev trigger: FX.flash (screen flash)
   shakeTrigger: false,        // N edge — dev trigger: CAMERA.shake impulse
+  lightningTrigger: false,    // L edge — distant lightning event (M8.4)
 
   pad: {
     connected: false,
@@ -646,6 +672,7 @@ const INPUT = {
       if (e.code === 'KeyT' && !e.repeat) INPUT.arcTrigger = true;
       if (e.code === 'KeyB' && !e.repeat) INPUT.flashTrigger = true;
       if (e.code === 'KeyN' && !e.repeat) INPUT.shakeTrigger = true;
+      if (e.code === 'KeyL' && !e.repeat) INPUT.lightningTrigger = true;
       INPUT.keys.add(e.code);
       if (e.code === 'Space') e.preventDefault();
     });
@@ -3458,16 +3485,39 @@ const PARTS = {
     PARTS._mLive[PARTS.mcount++] = it;
   },
 
+  /* public API — M8.4 distant lightning: n lightning motes around a
+   * far point (x, z) (the strike point). Pool-backed (zero `new`),
+   * capped by the pool (excess silently dropped). */
+  lightning(x, z, n) {
+    for (let k = 0; k < n; k++) {
+      const it = PARTS.lpool.acquire();
+      if (!it) break;
+      PARTS._spawnLightAt(it, x, z);
+    }
+  },
+
   /* spawn one lightning mote at a far sky point (M8.4 distant-
-   * lightning seam): it falls fast and ages out high up */
+   * lightning seam): camera-relative far annulus — falls fast and
+   * ages out high up */
   _spawnLight(it) {
     const li = CFG.parts.light;
     const r = PARTS._rng;
     const p = CAMERA.pos;
     const a = r() * 6.2831853;
     const rad = li.radius[0] + r() * (li.radius[1] - li.radius[0]);
-    it.sx = p.x + Math.cos(a) * rad;
-    it.sz = p.z + Math.sin(a) * rad;
+    PARTS._spawnLightAt(
+      it, p.x + Math.cos(a) * rad, p.z + Math.sin(a) * rad);
+  },
+
+  /* place + arm one lightning mote around (cx, cz) (shared by the
+   * camera-relative rain path and the M8.4 strike-point path) */
+  _spawnLightAt(it, cx, cz) {
+    const li = CFG.parts.light;
+    const r = PARTS._rng;
+    const a = r() * 6.2831853;
+    const rad = 20 + r() * 120;   // scatter around the strike point
+    it.sx = cx + Math.cos(a) * rad;
+    it.sz = cz + Math.sin(a) * rad;
     it.sy = li.altitude[0] + r() * (li.altitude[1] - li.altitude[0]);
     it.px = it.sx; it.py = it.sy; it.pz = it.sz;
     const v = li.speed[0] + r() * (li.speed[1] - li.speed[0]);
@@ -4562,6 +4612,15 @@ const ATMOS = {
   shaftGroup: null,          // M8.3: light shafts (spires + creature core)
   shafts: null,
   coreShaft: null,
+  ltGroup: null,             // M8.4: distant lightning (point flash + EM ring)
+  ltFlash: null,             // M8.4: point flash billboard (fog-off sprite)
+  emRing: null,              // M8.4: EM discharge ring (fog-off annulus)
+  _lt: null,                 // M8.4: live event state
+  _ltTimer: 0,               // M8.4: auto event countdown (s)
+  ltFired: 0,                // M8.4: total events fired (dev/smoke handle)
+  _hemiBoost: 0,             // M8.4: hemi intensity boost (decays)
+  _ltRng: null,              // M8.4: seeded rng (strike points + timer)
+  _ltTint: null,             // M8.4: ring tint scratch
 
   init() {
     const A = CFG.atmos;
@@ -4744,7 +4803,85 @@ const ATMOS = {
     ATMOS._shaftTimer = 0;
     ATMOS.root.add(ATMOS.shaftGroup);
 
+    /* M8.4: distant lightning — point flash billboard + EM discharge
+     * ring. Both fog-off additive (the strike is beyond the haze wall,
+     * they must glow through it); hidden while idle ⇒ 0 draw calls. */
+    const LG = A.lightning;
+    ATMOS.ltGroup = new THREE.Group();
+    ATMOS.ltGroup.name = 'ATMOS-lightning';
+    ATMOS.ltFlash = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: KIT.tex.glow.tex,
+      color: LG.flashColor,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      fog: false,
+      toneMapped: false,
+    }));
+    ATMOS.ltFlash.name = 'lightning-point-flash';
+    ATMOS.ltFlash.visible = false;
+    ATMOS.ltGroup.add(ATMOS.ltFlash);
+    const emGeo = new THREE.RingGeometry(0.6, 1.0, 64);
+    emGeo.rotateX(-Math.PI / 2);
+    ATMOS.emRing = new THREE.Mesh(emGeo, new THREE.MeshBasicMaterial({
+      color: LG.ring.color,
+      transparent: true,
+      opacity: 1,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      fog: false,
+    }));
+    ATMOS.emRing.name = 'lightning-em-ring';
+    ATMOS.emRing.frustumCulled = false;
+    ATMOS.emRing.visible = false;
+    ATMOS.ltGroup.add(ATMOS.emRing);
+    ATMOS._lt = { active: false, age: 0, life: 0, x: 0, z: 0, alt: 0 };
+    ATMOS._ltTimer = LG.firstDelay;
+    ATMOS.ltFired = 0;
+    ATMOS._hemiBoost = 0;
+    ATMOS._ltRng = mulberry32(CFG.city.seed ^ 0x517C);
+    ATMOS._ltTint = new THREE.Color();
+    ATMOS.root.add(ATMOS.ltGroup);
+
     scene.add(ATMOS.root);
+  },
+
+  /* M8.4: fire one distant lightning event — a random far point
+   * (seeded rng ⇒ deterministic per page load): brief hemi bump +
+   * screen flash + fog-off point flash + EM ring + lightning motes.
+   * Optional (x, z, alt): re-fire at a known point (dev/smoke seam). */
+  _fireLightning(x, z, alt) {
+    const LG = CFG.atmos.lightning;
+    const r = ATMOS._ltRng;
+    if (x === undefined) {
+      const d = LG.dist[0] + r() * (LG.dist[1] - LG.dist[0]);
+      const az = r() * 6.2831853;
+      x = Math.cos(az) * d;
+      z = Math.sin(az) * d;
+      alt = LG.altitude[0] + r() * (LG.altitude[1] - LG.altitude[0]);
+    }
+    ATMOS._lt.active = true;
+    ATMOS._lt.age = 0;
+    ATMOS._lt.life = LG.ring.life;
+    ATMOS._lt.x = x;
+    ATMOS._lt.z = z;
+    ATMOS._lt.alt = alt;
+    ATMOS.ltFired++;
+    /* brief hemi intensity bump (decays in update) */
+    ATMOS._hemiBoost = LG.hemiBoost;
+    /* screen flash (M7.4 FX seam) */
+    FX.flash(LG.flash, LG.flashColor);
+    /* point flash billboard at the far strike point */
+    ATMOS.ltFlash.position.set(x, alt, z);
+    ATMOS.ltFlash.scale.set(LG.flashSize, LG.flashSize, 1);
+    ATMOS.ltFlash.visible = true;
+    /* EM discharge ring from the strike point's ground position */
+    ATMOS.emRing.position.set(x, LG.ring.y, z);
+    ATMOS.emRing.scale.set(2, 1, 2);
+    ATMOS.emRing.visible = true;
+    /* lightning motes around the far point (PARTS 'light' pool) */
+    PARTS.lightning(x, z, LG.motes);
   },
 
   /* M8.3: nearest-N spire scan (the M6.4 PARTS pattern) — replays the
@@ -4874,6 +5011,59 @@ const ATMOS = {
         }
       }
     }
+
+    /* M8.4: distant lightning — brief hemi bump + auto timer + manual
+     * key (L). The hemi intensity is re-synced every frame (base +
+     * decaying boost) so it always settles back to the rig value. */
+    {
+      const LG = A.lightning;
+      ATMOS._hemiBoost *= Math.exp(-LG.hemiDecay * dt);
+      if (ATMOS._hemiBoost < 0.001) ATMOS._hemiBoost = 0;
+      KIT.hemi.intensity = CFG.lights.hemiIntensity + ATMOS._hemiBoost;
+
+      let fire = false;
+      ATMOS._ltTimer -= dt;
+      if (ATMOS._ltTimer <= 0) {
+        ATMOS._ltTimer =
+          LG.every[0] + ATMOS._ltRng() * (LG.every[1] - LG.every[0]);
+        fire = true;
+      }
+      if (INPUT.lightningTrigger) {
+        INPUT.lightningTrigger = false;
+        fire = true;
+      }
+      if (fire) ATMOS._fireLightning();
+
+      const lt = ATMOS._lt;
+      if (lt.active) {
+        /* _ltFrozen: dev/smoke seam — hold the event time (screenshots)
+         * without pausing the rest of the sim */
+        if (!ATMOS._ltFrozen) lt.age += dt;
+        const u = lt.age / lt.life;
+        if (u >= 1) {
+          lt.active = false;
+          ATMOS.emRing.visible = false;
+          ATMOS.ltFlash.visible = false;
+        } else {
+          /* EM discharge ring: ease-out expansion, sin-fade tint
+           * (additive ⇒ color IS the light) */
+          const e = 1 - Math.pow(1 - u, 3);
+          const R = 2 + (LG.ring.radius - 2) * e;
+          ATMOS.emRing.scale.set(R, 1, R);
+          ATMOS._ltTint.setHex(LG.ring.color);
+          ATMOS._ltTint.multiplyScalar(Math.sin(u * Math.PI) * 0.9);
+          ATMOS.emRing.material.color.copy(ATMOS._ltTint);
+          /* point flash: brief flicker at the far strike point */
+          const fu = lt.age / LG.flashDur;
+          if (fu < 1) {
+            const flick = 0.75 + 0.25 * Math.sin(lt.age * 55);
+            ATMOS.ltFlash.material.opacity = Math.sin(fu * Math.PI) * flick;
+          } else {
+            ATMOS.ltFlash.visible = false;
+          }
+        }
+      }
+    }
   },
 
   dispose() {
@@ -4909,7 +5099,7 @@ const HUD = {
     HUD.hintEl.textContent =
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
       'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
-      'P particles · R pulse · T arcs · B flash · N shake';
+      'P particles · R pulse · T arcs · B flash · N shake · L lightning';
   },
 
   update(dt) {
@@ -5001,6 +5191,8 @@ try {
   );
 }
 
+const _simProject = new THREE.Vector3();
+
 /* Dev / smoke-test handle (not part of the game). */
 window.SIM = {
   BOOT,
@@ -5021,6 +5213,12 @@ window.SIM = {
   scene,
   camera,
   systems,
+  /* Dev/smoke: world→NDC projection (module-scoped THREE is not a
+   * page global) */
+  project(x, y, z) {
+    _simProject.set(x, y, z).project(camera);
+    return { x: _simProject.x, y: _simProject.y, z: _simProject.z };
+  },
 };
 </script>
 </body>

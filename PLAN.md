@@ -63,7 +63,7 @@ smoke-test evidence.
 | **M8.1** ✅ | Night sky: gradient sky dome (big sphere, canvas/shader texture), stars, faint aurora band | Night mood readable from street level; dome correct from street, orbit, and far fly |
 | **M8.2** ✅ | Fog depth tune + zone-tinted haze (cyan core / warm avenues) via fog color lerp | Depth readable at 500 m; zone tint visible flying across zones |
 | **M8.3** ✅ | Volumetric-ish light shafts: a few additive cone/cylinder meshes from key spires + creature core (only when near / during awakening) | Shafts visible near spire, absent far away (no permanent draw calls) |
-| **M8.4** | Distant lightning: random far point + brief hemi bump + flash + EM discharge ring across the city | Lightning event visible from inside the city; fires on timer + manual key |
+| **M8.4** ✅ | Distant lightning: random far point + brief hemi bump + flash + EM discharge ring across the city | Lightning event visible from inside the city; fires on timer + manual key |
 | **M9.1** | Idle/dormant animation: tensor-ring rotation, antenna sway, breathing core, periodic "dream" LED wave across the node grid (instance-color waves) | Dream wave sweeps the node grid visibly; dormant state stays dim and still-ish |
 | **M9.2** | Wake state machine: DORMANT → STIR (2 s head lift, jaw, rings speed up) → AWAKE (10–20 s) → DECAY → DORMANT, with per-state hooks | State machine smoke test: forced transitions in order, clean return to DORMANT, re-trigger safe |
 | **M9.3** | Awakening beats 1–3: core-eye flare (emissive ramp + light + flash), node voxels ignite in radial waves, rings accelerate + limbs reposition (shake impulse) | Beats 1–3 play in sequence with correct timing on manual trigger |
@@ -538,11 +538,34 @@ nothing while idle.
   environmental in this headless setup and pass on other runs.
 
 #### M8.4 — Distant lightning events
-- [ ] Random far point + brief hemi intensity bump + flash; EM discharge
+- [x] Random far point + brief hemi intensity bump + flash; EM discharge
       rings visible across the city.
 - **Test:** lightning event (timer + manual key) visible from inside the
       city.
 - **Commit when:** event verified from inside the city.
+- **Verified:** smoke M8.4 section green — `ATMOS.ltGroup` holds a fog-off
+  additive point-flash sprite + a fog-off additive EM discharge annulus
+  (`RingGeometry(0.6, 1.0)`, 0.4R-wide band, `CFG.atmos.lightning`), both
+  hidden idle ⇒ 0 draw calls; a fire (seeded auto timer 16–32 s, first
+  delay 10 s, or Key L) strikes a random far point (700–1400 m, 220–380 m
+  up) and plays a brief `KIT.hemi` bump (decays to exactly base),
+  `FX.flash` (M7.4 seam), the sprite flicker (0.5 s), the ring
+  (ease-out 2→950 m over 2.6 s, sin-fade tint), and 16 pooled lightning
+  motes via new public `PARTS.lightning(x, z, n)` (shared
+  `_spawnLightAt`). Gates: Key L fire state (far point in range, all
+  channels alive, motes === 16); sprite and ring each exactly +1 draw
+  call; hemi decays to exactly base and the event resolves clean; auto
+  timer fires one event and re-seeds into [16, 32]; motes age out; visual
+  gate — plaza-side pose 300 m out / 300 m up, re-fire at the last strike
+  point, event frozen (`ATMOS._ltFrozen`), on/off `ltGroup` screenshot
+  pair, 2-pair averaged strip at the projected far annulus edge
+  23.29 → 101.09 (`shots/m84-lightning.png`); heap flat. Note: setting
+  `CAMERA.pos.y` above `groundMaxY` during the GROUND→CINE mode blend
+  sticks the altitude mid-blend (ground clamp is still active) — the
+  smoke pose sets altitude after the 0.8 s blend settle; pre-existing
+  flake fixes folded in: M7.4 flash level read before the screenshot,
+  M7.5 shake bound uses sampling-start energy (frame-stale offset),
+  M8.1 sky gate 2-pair averaged (live traffic in the off-shot sky).
 
 **Phase done-when:** depth and mood readable from street level;
 lightning event visible from inside the city.

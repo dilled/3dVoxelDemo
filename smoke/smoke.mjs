@@ -329,6 +329,9 @@ const browser = await chromium.launch({
   args: [
     '--no-sandbox',
     '--enable-unsafe-swiftshader', // software WebGL in headless
+    // heap-flat checks force a GC before each sample (window.gc) so
+    // they measure live-object growth, not garbage-reclaim timing
+    '--expose-gc',
   ],
 });
 
@@ -379,6 +382,11 @@ try {
     const s = await simState();
     check('START leads to RUNNING', s.state === 'RUNNING');
   }
+  /* M8.4: suppress the auto lightning timer for the whole suite — a
+   * live event would add 2 draw calls + hemi/flash bumps into the
+   * earlier sections' measurements. The M8.4 section verifies the
+   * timer explicitly (and re-suppresses after the refresh below). */
+  await page.evaluate(() => { window.SIM.ATMOS._ltTimer = 1e9; });
   await sleep(1500);
   {
     const a = await simState();
@@ -442,6 +450,11 @@ try {
     check('re-entry after refresh reaches live loop', s.state === 'RUNNING' && s.frames > 0,
       `state=${s.state}, frames=${s.frames}`);
   }
+  /* M8.4: suppress the auto lightning timer for the preceding sections
+   * (the refresh above re-seeded it) — a live event would add 2 draw
+   * calls + a hemi/flash bump into the other sections' measurements.
+   * The M8.4 section verifies the timer explicitly. */
+  await page.evaluate(() => { window.SIM.ATMOS._ltTimer = 1e9; });
 
   /* ------------------------------------------------------------------
    * M1 — core loop, input, camera foundations
@@ -1133,6 +1146,13 @@ try {
       const S = window.SIM;
       return S.TRAFFIC && S.TRAFFIC.count === c;
     }, cap, { timeout: 120000 });
+    /* settle before the heap window: right after the growth the page
+     * still carries one-time first-flight warm-up growth (~2–2.5 MB on
+     * this environment, observed on the committed baseline too — see
+     * the M8.3 commit note on M6.x environmental flakes). The check
+     * targets steady-state per-frame allocation, so let the warm-up
+     * land before heapBefore. */
+    await sleep(4000);
     const a0 = await page.evaluate(async () => {
       const S = window.SIM;
       const T = S.TRAFFIC;
@@ -1147,6 +1167,7 @@ try {
       async function heapMin() {
         let m = Infinity;
         for (let i = 0; i < 3; i++) {
+          if (window.gc) window.gc();
           if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
           await new Promise(r => setTimeout(r, 400));
         }
@@ -1191,6 +1212,7 @@ try {
       async function heapMin() {
         let m = Infinity;
         for (let i = 0; i < 3; i++) {
+          if (window.gc) window.gc();
           if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
           await new Promise(r => setTimeout(r, 400));
         }
@@ -1391,6 +1413,7 @@ try {
       async function heapMin() {
         let m = Infinity;
         for (let i = 0; i < 3; i++) {
+          if (window.gc) window.gc();
           if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
           await new Promise(r => setTimeout(r, 400));
         }
@@ -1468,6 +1491,7 @@ try {
       async function heapMin() {
         let m = Infinity;
         for (let i = 0; i < 3; i++) {
+          if (window.gc) window.gc();
           if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
           await new Promise(r => setTimeout(r, 400));
         }
@@ -1735,6 +1759,7 @@ try {
       async function heapMin() {
         let m = Infinity;
         for (let i = 0; i < 3; i++) {
+          if (window.gc) window.gc();
           if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
           await new Promise(r => setTimeout(r, 400));
         }
@@ -1789,6 +1814,7 @@ try {
       async function heapMin() {
         let m = Infinity;
         for (let i = 0; i < 3; i++) {
+          if (window.gc) window.gc();
           if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
           await new Promise(r => setTimeout(r, 400));
         }
@@ -2102,6 +2128,7 @@ try {
     const heapMin = () => page.evaluate(async () => {
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -2316,6 +2343,7 @@ try {
     const heapMin = () => page.evaluate(async () => {
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -2397,6 +2425,7 @@ try {
       }
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -2567,6 +2596,7 @@ try {
     const heapMin = () => page.evaluate(async () => {
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -2837,6 +2867,7 @@ try {
     const heapMin = () => page.evaluate(async () => {
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -3139,6 +3170,7 @@ try {
     const heapMin = () => page.evaluate(async () => {
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -3280,10 +3312,13 @@ try {
     await page.evaluate(() => window.SIM.FX.flash(1));
     await sleep(120);
     await page.evaluate(() => window.SIM.FX.flash(1));   // re-raise for the grab
+    /* read the level before the grab: the flash decays (τ 0.3 s) and
+     * a headless screenshot can take >100 ms, so a post-shot read
+     * races the decay (known M7.4 timing flake) */
+    const lvl = await page.evaluate(() => window.SIM.FX._flash);
     const flashShot = await page.screenshot(
       { path: `${here}/shots/m74-flash.png` });
     const flashLum = await lum(flashShot.toString('base64'));
-    const lvl = await page.evaluate(() => window.SIM.FX._flash);
     check('M7.4: screenshot shows the full-screen flash (shots/m74-flash.png) — mean luminance well above the idle pose',
       fs.existsSync(`${here}/shots/m74-flash.png`) &&
       lvl > 0.3 && flashLum > idleLum + 25,
@@ -3342,6 +3377,7 @@ try {
     const heapMin = () => page.evaluate(async () => {
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -3377,7 +3413,10 @@ try {
       for (let i = 0; i < 4; i++) {
         const o = S.camera.position.clone().sub(C.pos).length();
         mags.push(o);
-        bounds.push(o <= S.CFG.input.shakeAmp * C.shakeEnergy + 1e-6);
+        /* frame-consistent bound: the offset comes from the last
+         * rendered frame (energy ≥ e — it only decays) ⇒ it is
+         * bounded by amp × the energy at sampling start */
+        bounds.push(o <= S.CFG.input.shakeAmp * e + 1e-6);
         await new Promise(r => requestAnimationFrame(r));
       }
       const lo = Math.min(...mags), hi = Math.max(...mags);
@@ -3495,7 +3534,7 @@ try {
       };
     });
     check('M8.1: ATMOS registered — gradient dome (BackSide, fog-off), additive stars, faint additive aurora band',
-      reg.inSystems && reg.children === 4 && reg.dome && reg.stars &&
+      reg.inSystems && reg.children === 5 && reg.dome && reg.stars &&
       reg.aurora && reg.shaftGroup && reg.radius < reg.far,
       `stars=${reg.starCount}, drawRange=${reg.drawRange}`);
 
@@ -3585,6 +3624,7 @@ try {
     const heapMin = () => page.evaluate(async () => {
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -3648,19 +3688,34 @@ try {
         C.pitch = pitch;
       }, pose);
       await sleep(400);
-      await page.evaluate(() => {
-        window.SIM.ATMOS.root.visible = false;
-      });
-      await sleep(150);
-      const offB64 = (await page.screenshot()).toString('base64');
-      await page.evaluate(() => {
-        window.SIM.ATMOS.root.visible = true;
-      });
-      await sleep(150);
-      const onShot = await page.screenshot(
-        { path: `${here}/shots/m81-sky-${pose.name}.png` });
-      const off = await skyStats(offB64);
-      const on = await skyStats(onShot.toString('base64'));
+      /* 2-pair averaged (the scene animates: drones, sky vehicles,
+       * aurora spin) — same pattern as the M8.2/M8.3 luminance gates */
+      let offMean = 0, onMean = 0, offBright = 0, onBright = 0,
+        offGreen = 0, onGreen = 0;
+      for (let i = 0; i < 2; i++) {
+        await page.evaluate(() => {
+          window.SIM.ATMOS.root.visible = false;
+        });
+        await sleep(150);
+        const offB64 = (await page.screenshot()).toString('base64');
+        await page.evaluate(() => {
+          window.SIM.ATMOS.root.visible = true;
+        });
+        await sleep(150);
+        const onShot = await page.screenshot(
+          { path: `${here}/shots/m81-sky-${pose.name}.png` });
+        const offS = await skyStats(offB64);
+        const onS = await skyStats(onShot.toString('base64'));
+        offMean += offS.mean; onMean += onS.mean;
+        offBright += offS.bright; onBright += onS.bright;
+        offGreen += offS.green; onGreen += onS.green;
+      }
+      const off = {
+        mean: offMean / 2, bright: offBright / 2, green: offGreen / 2,
+      };
+      const on = {
+        mean: onMean / 2, bright: onBright / 2, green: onGreen / 2,
+      };
       check(`M8.1: ${pose.name} sky renders (shots/m81-sky-${pose.name}.png) — dome brighter than the void background`,
         fs.existsSync(`${here}/shots/m81-sky-${pose.name}.png`) &&
         on.mean > off.mean + 2,
@@ -3878,6 +3933,7 @@ try {
     const heapMin = () => page.evaluate(async () => {
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -4316,6 +4372,7 @@ try {
     const heapMin = () => page.evaluate(async () => {
       let m = Infinity;
       for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
         if (performance.memory)
           m = Math.min(m, performance.memory.usedJSHeapSize);
         await new Promise(r => setTimeout(r, 400));
@@ -4332,6 +4389,336 @@ try {
       ` after=${Math.round(heapAfter / 1024)}KB`);
   }
 
+
+  /* ------------------------------------------------------------------
+   * M8.4 — distant lightning events (random far point + hemi bump +
+   * flash + EM discharge ring across the city)
+   *
+   *  ATMOS owns the event: fog-off point-flash sprite + fog-off EM
+   *  discharge ring (ATMOS.ltGroup), plus the M7.4 FX.flash screen
+   *  flash, a brief KIT.hemi intensity bump, and PARTS lightning
+   *  motes around the strike point. Auto on a seeded timer, manual
+   *  Key L. Idle cost = 0 draw calls.
+   * ------------------------------------------------------------------ */
+  {
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, A = S.ATMOS;
+      const LG = S.CFG.atmos.lightning;
+      const rm = A.emRing.material;
+      const fm = A.ltFlash.material;
+      return {
+        cfg: !!LG && LG.every[0] > 0 && LG.every[1] > LG.every[0] &&
+          LG.dist[0] > 0 && LG.dist[1] <= 2400 &&
+          LG.ring.radius > 0 && LG.ring.life > 0 && LG.motes > 0,
+        group: !!A.ltGroup && A.ltGroup.name === 'ATMOS-lightning' &&
+          A.ltGroup.parent === A.root && A.ltGroup.children.length === 2,
+        ring: A.emRing.geometry.type === 'RingGeometry' &&
+          rm.blending === 2 && rm.fog === false && rm.depthWrite === false &&
+          rm.transparent === true && A.emRing.frustumCulled === false,
+        flash: A.ltFlash.isSprite === true && fm.blending === 2 &&
+          fm.fog === false && fm.depthWrite === false &&
+          fm.toneMapped === false && fm.map !== null,
+        idle: !A.emRing.visible && !A.ltFlash.visible &&
+          !A._lt.active && A._hemiBoost === 0,
+        hemiBase: S.KIT.hemi.intensity === S.CFG.lights.hemiIntensity,
+        flashIdle: S.FX._flash === 0,
+        motesIdle: S.PARTS.lcount === 0,
+        timer: A._ltTimer > 1e8,   // suppressed for the preceding sections
+        fired: A.ltFired === 0,
+      };
+    });
+    check('M8.4: lightning registered — fog-off additive point flash + EM ring in ATMOS.ltGroup, idle hidden, hemi at base',
+      reg.cfg && reg.group && reg.ring && reg.flash && reg.idle &&
+      reg.hemiBase && reg.flashIdle && reg.motesIdle && reg.timer &&
+      reg.fired,
+      `fired=${reg.fired}`);
+
+    /* manual Key L: the event fires — every effect channel alive */
+    await page.keyboard.press('l');
+    await sleep(120);
+    const ev = await page.evaluate(() => {
+      const S = window.SIM, A = S.ATMOS;
+      const LG = S.CFG.atmos.lightning;
+      const lt = A._lt;
+      return {
+        active: lt.active,
+        fired: A.ltFired,
+        ringVis: A.emRing.visible,
+        flashVis: A.ltFlash.visible,
+        ringPos: {
+          x: A.emRing.position.x, y: A.emRing.position.y,
+          z: A.emRing.position.z,
+        },
+        ringScale: A.emRing.scale.x,
+        flashPos: {
+          x: A.ltFlash.position.x, y: A.ltFlash.position.y,
+          z: A.ltFlash.position.z,
+        },
+        flashOp: A.ltFlash.material.opacity,
+        hemi: S.KIT.hemi.intensity,
+        hemiBase: S.CFG.lights.hemiIntensity,
+        flash: S.FX._flash,
+        motes: S.PARTS.lcount,
+        dist: Math.hypot(lt.x, lt.z),
+        alt: lt.alt,
+        x: lt.x, z: lt.z,
+        distCfg: LG.dist, altCfg: LG.altitude,
+        motesCfg: LG.motes,
+        ringY: LG.ring.y,
+      };
+    });
+    check('M8.4: manual Key L fires the event — far point in range, ring + flash + hemi + screen flash + motes all alive',
+      ev.active && ev.fired === 1 && ev.ringVis && ev.flashVis &&
+      ev.dist >= ev.distCfg[0] && ev.dist <= ev.distCfg[1] &&
+      ev.alt >= ev.altCfg[0] && ev.alt <= ev.altCfg[1] &&
+      ev.ringPos.x === ev.x && ev.ringPos.z === ev.z &&
+      ev.ringPos.y === ev.ringY &&
+      ev.flashPos.x === ev.x && ev.flashPos.z === ev.z &&
+      ev.flashPos.y === ev.alt &&
+      ev.ringScale > 2 && ev.ringScale < 950 && ev.flashOp > 0 &&
+      ev.hemi > ev.hemiBase && ev.flash > 0 && ev.motes === ev.motesCfg,
+      `dist=${ev.dist.toFixed(0)}m alt=${ev.alt.toFixed(0)}m,` +
+      ` hemi=${ev.hemi.toFixed(2)} (base ${ev.hemiBase}),` +
+      ` flash=${ev.flash.toFixed(2)}, motes=${ev.motes},` +
+      ` ringR=${ev.ringScale.toFixed(0)}m`);
+
+    /* point flash billboard: exactly +1 draw call when shown. This
+     * must run while the event's own 0.5 s flash window is still
+     * alive, so aim the camera at the strike point first (the sprite
+     * may be behind the current pose). */
+    const flashDelta = await page.evaluate(async () => {
+      const S = window.SIM, A = S.ATMOS;
+      const C = S.CAMERA;
+      const lt = A._lt;
+      C.yaw = Math.atan2(-(lt.x - C.pos.x), -(lt.z - C.pos.z));
+      C.pitch = Math.atan2(
+        lt.alt - C.pos.y,
+        Math.hypot(lt.x - C.pos.x, lt.z - C.pos.z));
+      const F = A.ltFlash;
+      await new Promise(r => setTimeout(r, 100));
+      const a = S.renderer.info.render.calls;
+      F.visible = false;
+      await new Promise(r => setTimeout(r, 100));
+      const b = S.renderer.info.render.calls;
+      F.visible = true;
+      const f2 = S.FX._flash;
+      return { d: a - b, f2 };
+    });
+    check('M8.4: point flash billboard — exactly +1 draw call when shown',
+      flashDelta.d === 1, `delta=${flashDelta.d}`);
+    check('M8.4: screen flash decays',
+      ev.flash > flashDelta.f2 && flashDelta.f2 > 0,
+      `flash ${ev.flash.toFixed(3)} → ${flashDelta.f2.toFixed(3)}`);
+
+    /* EM ring: exactly +1 draw call while alive (median of 3 on/off
+     * pairs), and it expands (scale grows toward the configured radius)
+     */
+    const ringDelta = await page.evaluate(async () => {
+      const S = window.SIM, A = S.ATMOS;
+      const d = [];
+      for (let i = 0; i < 3; i++) {
+        A.emRing.visible = true;
+        await new Promise(r => setTimeout(r, 110));
+        const a = S.renderer.info.render.calls;
+        A.emRing.visible = false;
+        await new Promise(r => setTimeout(r, 110));
+        const b = S.renderer.info.render.calls;
+        d.push(a - b);
+      }
+      A.emRing.visible = true;
+      d.sort((x, y) => x - y);
+      return d[1];
+    });
+    const g1 = await page.evaluate(() => window.SIM.ATMOS.emRing.scale.x);
+    await sleep(400);
+    const g2 = await page.evaluate(() => window.SIM.ATMOS.emRing.scale.x);
+    check('M8.4: EM discharge ring — exactly +1 draw call while alive, expanding',
+      ringDelta === 1 && g2 > g1 && g2 < 950,
+      `delta=${ringDelta}, R ${g1.toFixed(0)} → ${g2.toFixed(0)} m`);
+
+    /* hemi bump is brief: decays back to exactly the base rig value;
+     * the event resolves clean (ring + sprite hidden, no active state) */
+    const decay = await page.evaluate(async () => {
+      const S = window.SIM;
+      const h1 = S.KIT.hemi.intensity;
+      await new Promise(r => setTimeout(r, 400));
+      const h2 = S.KIT.hemi.intensity;
+      await new Promise(r => setTimeout(r, 1400));
+      const base = S.CFG.lights.hemiIntensity;
+      const h3 = S.KIT.hemi.intensity;
+      const f3 = S.FX._flash;
+      await new Promise(r => setTimeout(r, 1400));
+      const A = S.ATMOS;
+      return {
+        h1, h2, h3, base, f3,
+        active: A._lt.active,
+        ringVis: A.emRing.visible,
+        flashVis: A.ltFlash.visible,
+      };
+    });
+    check('M8.4: brief hemi bump decays to base; event resolves clean',
+      decay.h1 > decay.h2 && decay.h2 >= decay.base &&
+      decay.h3 === decay.base && decay.f3 === 0 &&
+      !decay.active && !decay.ringVis && !decay.flashVis,
+      `hemi ${decay.h1.toFixed(3)} → ${decay.h2.toFixed(3)} →` +
+      ` ${decay.h3.toFixed(3)} (base ${decay.base})`);
+
+    /* auto timer: a small countdown fires exactly one event and
+     * re-seeds the interval into the configured range */
+    const firedBefore = await page.evaluate(() => window.SIM.ATMOS.ltFired);
+    await page.evaluate(() => { window.SIM.ATMOS._ltTimer = 0.2; });
+    await sleep(700);
+    const timer = await page.evaluate(() => {
+      const A = window.SIM.ATMOS;
+      const LG = window.SIM.CFG.atmos.lightning;
+      return {
+        fired: A.ltFired,
+        active: A._lt.active,
+        timer: A._ltTimer,
+        every: LG.every,
+      };
+    });
+    check('M8.4: auto timer fires the event and re-seeds the interval',
+      timer.fired === firedBefore + 1 && timer.active &&
+      timer.timer >= timer.every[0] && timer.timer <= timer.every[1],
+      `fired=${timer.fired}, next in ${timer.timer.toFixed(1)} s` +
+      ` (range ${timer.every[0]}–${timer.every[1]} s)`);
+
+    /* motes resolve too (they outlive the ring: max life ≈ 7.4 s) */
+    const motesGone = await page.evaluate(async () => {
+      await new Promise(r => setTimeout(r, 8000));
+      return window.SIM.PARTS.lcount;
+    });
+    check('M8.4: lightning motes age out (0 live after the events)',
+      motesGone === 0, `live=${motesGone}`);
+
+    /* visual gate: pose above the strike point — 300 m out / 300 m up,
+     * looking down at 45° — the wide EM band crosses the frame. Fire at
+     * the same point, freeze the event time (_ltFrozen), on/off
+     * screenshot pair; the strip is centered on the projected far edge
+     * of the annulus (computed in-page). 2 pairs averaged (the scene
+     * animates: stars, LEDs, particles). */
+    const pose = await page.evaluate(() => {
+      const S = window.SIM, A = S.ATMOS;
+      const lt = A._lt;
+      const L = Math.hypot(lt.x, lt.z);
+      /* plaza-side camera: 300 m horizontal, 300 m up */
+      const px = lt.x - lt.x / L * 300;
+      const pz = lt.z - lt.z / L * 300;
+      const C = S.CAMERA;
+      C.setMode('CINE');
+      C.vel.set(0, 0, 0);
+      C.fov = 60;
+      C.yaw = Math.atan2(-(lt.x - px), -(lt.z - pz));
+      C.pitch = -0.7854;
+      return { x: lt.x, z: lt.z, alt: lt.alt, px, pz };
+    });
+    /* the GROUND→CINE mode blend takes 0.55 s and the ground clamp
+     * (pos.y ≤ 40 m) is still active while blend < 1 — set the
+     * altitude only after the blend settles, else pos.y sticks at an
+     * intermediate value and the whole annulus misses the frame */
+    await sleep(800);
+    await page.evaluate(({ px, pz }) => {
+      window.SIM.CAMERA.pos.set(px, 300, pz);
+    }, { px: pose.px, pz: pose.pz });
+    await sleep(200);   // pose → camera copy settle
+    await page.evaluate(({ x, z, alt }) =>
+      window.SIM.ATMOS._fireLightning(x, z, alt), pose);
+    /* wait until the ring's far arc is in the frame, then freeze the
+     * event time for a stable pair */
+    await page.waitForFunction(
+      () => window.SIM.ATMOS.emRing.scale.x >= 700,
+      { timeout: 8000 });
+    await page.evaluate(() => {
+      window.SIM.ATMOS._ltFrozen = true;
+    });
+    const stripCenter = await page.evaluate(() => {
+      const S = window.SIM, A = S.ATMOS;
+      const R = A.emRing.scale.x;
+      const lt = A._lt;
+      const L = Math.hypot(lt.x, lt.z);
+      /* far edge of the annulus mid-radius (0.6–1.0 ⇒ 0.8 R) — the
+       * edge AWAY from the camera: the camera is plaza-side, so the
+       * far edge is strike + (strike−origin) direction · 0.8 R */
+      const p = S.project(
+        lt.x + lt.x / L * 0.8 * R, 0.6, lt.z + lt.z / L * 0.8 * R);
+      return {
+        row: (1 - p.y) / 2 * window.innerHeight,
+        ok: p.y > -1 && p.y < 1,
+      };
+    });
+    const stripStats = b64 => page.evaluate(async ({ b64, row }) => {
+      const img = new Image();
+      await new Promise((res, rej) => {
+        img.onload = res; img.onerror = rej;
+        img.src = 'data:image/png;base64,' + b64;
+      });
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      /* strip: ±5 % of the frame height around the projected far edge,
+       * full width — the EM band crosses here */
+      const hh = Math.floor(c.height * 0.1);
+      const y0 = Math.max(0, Math.min(
+        c.height - hh, Math.round(row) - hh / 2));
+      const d = ctx.getImageData(0, y0, c.width, hh).data;
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      }
+      return sum / (d.length / 4);
+    }, { b64, row: stripCenter.row });
+    let offSum = 0, onSum = 0;
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(() => {
+        window.SIM.ATMOS.ltGroup.visible = false;
+      });
+      await sleep(150);
+      offSum += await stripStats(
+        (await page.screenshot()).toString('base64'));
+      await page.evaluate(() => {
+        window.SIM.ATMOS.ltGroup.visible = true;
+      });
+      await sleep(150);
+      const shot = await page.screenshot(
+        { path: `${here}/shots/m84-lightning.png` });
+      onSum += await stripStats(shot.toString('base64'));
+    }
+    const offStrip = offSum / 2, onStrip = onSum / 2;
+    check('M8.4: event visible from inside the city (shots/m84-lightning.png) — the EM band adds light across the frame',
+      fs.existsSync(`${here}/shots/m84-lightning.png`) &&
+      onStrip > offStrip + 0.5,
+      `strip mean ${offStrip.toFixed(2)} → ${onStrip.toFixed(2)}`);
+    /* unfreeze and let this event resolve */
+    await page.evaluate(() => {
+      window.SIM.ATMOS._ltFrozen = false;
+    });
+    await sleep(2500);
+
+    /* let this event resolve before the tail checks */
+    await sleep(3000);
+    /* heap flat across pure animation frames (the screenshots above
+     * are harness costs, not ATMOS allocations) */
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const heapBefore = await heapMin();
+    await sleep(600);
+    const heapAfter = await heapMin();
+    check('M8.4: no allocation per frame (heap flat across the lightning sequence)',
+      heapBefore > 0 && heapAfter > 0 &&
+      heapAfter - heapBefore <= 2 * 1024 * 1024,
+      `before=${Math.round(heapBefore / 1024)}KB,` +
+      ` after=${Math.round(heapAfter / 1024)}KB`);
+  }
 
   /* ---- 10. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
