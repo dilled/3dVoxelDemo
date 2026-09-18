@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [m6, traffic, pool, tier, vehicles]
 created: "2026-09-15T15:52:21"
-updated: "2026-09-15T15:53:24"
+updated: "2026-09-18T07:44:38"
 ---
 
 <!-- compiled_truth -->
@@ -40,3 +40,9 @@ updated: "2026-09-15T15:53:24"
   summary: "M6.3 shipped: sky vehicles with additive light trails in TRAFFIC — ring-road lanes at 3 altitudes, M6.1 pool, tier caps, exactly 2 draw calls"
   source: M6.3 implementation
   affects: [m63-traffic-vehicles]
+
+- time: 2026-09-18T07:44:38
+  kind: decision
+  summary: "M9.4 beat 5: sky vehicles take avoidance offsets off their lanes — lateral ox (signed, away from the plaza) + oalt altitude bump, level av eases in/out over avoidRamp while avoidT > 0. Render pose only (hull + trail offset); the analytic lane state is untouched and the offset eases back to exactly 0. awakenEnd() zeroes avoidT so offsets ease out."
+  source: M9.4 implementation
+  affects: [m63-traffic-vehicles, m94-city-cascade]

@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [m7, fx, arcs, pool, tier]
 created: "2026-09-16T00:05:39"
-updated: "2026-09-16T00:06:44"
+updated: "2026-09-18T07:44:37"
 ---
 
 <!-- compiled_truth -->
@@ -34,3 +34,9 @@ updated: "2026-09-16T00:06:44"
   summary: Rewrote compiled_truth to the new best understanding
   source: M7.3 implementation
   affects: [m73-fx-arcs]
+
+- time: 2026-09-18T07:44:37
+  kind: decision
+  summary: "M9.4: new public API FX.dropArc(it) — swap-remove + pool release of one live arc item even mid-life (no-op for foreign/released items). Used by the M9.4 cascade teardown to drop live substation bolts at DORMANT entry."
+  source: M9.4 implementation
+  affects: [m73-fx-arcs, m94-city-cascade]

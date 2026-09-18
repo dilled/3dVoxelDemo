@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [m7, parts, pool, particles, tier]
 created: "2026-09-15T19:16:13"
-updated: "2026-09-15T19:17:08"
+updated: "2026-09-18T07:44:38"
 ---
 
 <!-- compiled_truth -->
@@ -34,3 +34,9 @@ updated: "2026-09-15T19:17:08"
   summary: "M7.1 shipped: PARTS owns every particle in the demo — 5 M6.1 pools, one shared budget (CFG.parts.tiers = exact sum of per-type tier caps), Key P rains all five types, event types 0 live at idle"
   source: M7.1 implementation
   affects: [m71-parts-particle-system]
+
+- time: 2026-09-18T07:44:38
+  kind: decision
+  summary: "M9.4: new public API PARTS.steamBurst(n) — n steam puffs burst from the ambient cooling-tower vents (pool cap is the gate; excess silently dropped). Also the M13.3 cooling-emergency seam."
+  source: M9.4 implementation
+  affects: [m71-parts-particle-system, m94-city-cascade]

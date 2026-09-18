@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [m4, detail, instancing]
 created: "2026-09-15T06:42:13"
-updated: "2026-09-15T06:42:50"
+updated: "2026-09-18T07:44:38"
 ---
 
 <!-- compiled_truth -->
@@ -66,3 +66,9 @@ fans+pulses animate; 32 draw calls near (flat vs M3). Screenshots:
   summary: "M4 done: near-layer detail pass design + verification"
   source: brain update-truth
   affects: [near-layer-detail-pass]
+
+- time: 2026-09-18T07:44:38
+  kind: decision
+  summary: "M9.4: the sign + ledWin detail meshes now carry a pre-allocated instanceColor (col: true) so the awakening wave can ramp per-instance brightness (1.0 = idle). A (re)filled chunk resets sign/ledWin instance-color slots to exactly 1.0 (stale pooled-slot invariant); pars gain the precomputed distance d from the plaza (sign) and d/nx/nz (ledWin facade) for wave scheduling."
+  source: M9.4 implementation
+  affects: [near-layer-detail-pass, m94-city-cascade]

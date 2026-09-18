@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [m6, traffic, pool, tier]
 created: "2026-09-15T13:31:05"
-updated: "2026-09-15T15:53:51"
+updated: "2026-09-18T07:44:37"
 ---
 
 <!-- compiled_truth -->
@@ -49,3 +49,9 @@ updated: "2026-09-15T15:53:51"
   summary: "M6.3 follow-up fulfilled: sky vehicles joined TRAFFIC with the same pool/cap pattern — see [[m63-traffic-vehicles]]"
   source: M6.3 handoff
   affects: [m62-traffic-drones, m63-traffic-vehicles]
+
+- time: 2026-09-18T07:44:37
+  kind: decision
+  summary: "M9.4 beat 5: TRAFFIC.awaken() assigns reaction roles via seeded roll — state 3 scatter (fly outward from the plaza to pre-allocated rx/ry/rz, then back to the dock) and state 4 escort (re-route to a hover ring at creature height, hold roleT s, then back); other drones hold normal patrol. States 3/4 handled in the existing flight update; TRAFFIC.awakenEnd() sends reaction drones straight home (state 2)."
+  source: M9.4 implementation
+  affects: [m62-traffic-drones, m94-city-cascade]

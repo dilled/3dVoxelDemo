@@ -324,6 +324,44 @@ const CFG = {
         armLift: 0.55,     // rad — arm outward lift at full surge
         shake: 1.2,        // CAMERA.shake impulse at surge start
       },
+      /* M9.4: awakening beats 4–5 (city-level cascade). Beat 4 fires
+       * `pulse.delay` s into AWAKE: the plaza pulse ring + the city
+       * LED/sign wave; beat 5 (`traffic.delay`) fires the traffic
+       * cascade (arcs, steam, drones, vehicles). Everything restores
+       * EXACTLY at DORMANT entry (colors 1.0, roles cleared, the
+       * plaza pulse dropped even mid-life). */
+      cascade: {
+        pulse: {            // beat 4: energy pulse ring from the plaza
+          delay: 2.2,       // s after AWAKE entry
+          radius: 660,      // m — target radius of the expanding ring
+          life: 4.0,        // s — ring life
+          color: 0x66e0ff, // tint (data-cyan)
+        },
+        wave: {             // beat 4: city holo-signs + building LEDs
+          speed: 165,       // m/s wavefront (the pulse ring's travel)
+          width: 26,        // m — front width (attack)
+          hold: 1.2,        // s — lit hold after the front passes
+          release: 1.6,     // s — dim-out after the hold
+          bright: 2.4,     // peak instance-color multiplier (1.0 = idle)
+        },
+        traffic: {          // beat 5: substation arcs + steam + traffic
+          delay: 3.2,       // s after AWAKE entry
+          arcs: 3,          // substation bolts (staggered)
+          arcStagger: 0.45, // s between bolts
+          steam: 12,        // steam puffs burst from cooling towers
+          scatter: 0.55,    // share of drones that scatter outward
+          escort: 0.25,     // share that re-route to the creature
+          scatterDist: [30, 60],  // m outward from the plaza
+          scatterUp: [10, 25],    // m rise
+          escortR: [45, 75],      // m hover ring around the plaza
+          escortAlt: [30, 55],    // m hover altitude
+          escortHold: 5,          // s hover before returning to the dock
+          avoidDur: 4,           // s vehicle avoidance offset duration
+          avoidRamp: 0.5,       // s ease in/out
+          avoidLat: [8, 20],    // m lateral offset away from the plaza
+          avoidAlt: [5, 12],    // m altitude bump
+        },
+      },
     },
   },
 
@@ -1542,6 +1580,23 @@ function _tintHaze(hex, k, haze) {   // lerp toward the city-haze tint
   const b = Math.round((hex & 255) * (1 - k) + (haze & 255) * k);
   return (r << 16) | (g << 8) | b;
 }
+/* M9.4 beat 4: the awakening wave's per-instance brightness envelope.
+ * tau = s since the wavefront passed this instance (<= 0 = not yet).
+ * smoothstep attack over `atk` s, lit hold for `hold` s, smoothstep
+ * release over `rel` s ⇒ back to exactly 0. */
+function _waveEnv(tau, atk, hold, rel) {
+  if (tau <= 0) return 0;
+  let a = tau / atk;
+  if (a > 1) a = 1;
+  let env = a * a * (3 - 2 * a);
+  const h = tau - atk;
+  if (h > hold) {
+    let rl = (h - hold) / rel;
+    if (rl > 1) rl = 1;
+    env *= 1 - (rl * rl * (3 - 2 * rl));
+  }
+  return env;
+}
 
 const WORLD = {
   name: 'WORLD',
@@ -1563,6 +1618,11 @@ const WORLD = {
   _nLed: 0,
   _nSign: 0,
   _nDash: 0,
+  /* M9.4 beat 4: the city holo-signs + building LED facades follow the
+   * awakening wave — per-instance color ramp scheduled by distance from
+   * the plaza. Restores EXACTLY (1.0) at wave end / DORMANT entry. */
+  _waveT0: 0,
+  _waveActive: false,
   _m4: new THREE.Matrix4(),
   _p4: new THREE.Vector3(),
   _q4: new THREE.Quaternion(),
@@ -1636,6 +1696,36 @@ const WORLD = {
     );
     WORLD.ground.rotation.x = -Math.PI / 2;
     WORLD.root.add(WORLD.ground);
+  },
+
+  /* public API — M9.4 beat 4: arm the city holo-sign / LED-facade
+   * wave (t = the wavefront's t0). Idempotent per sequence — ENTITY
+   * fires it once, gated on _ignited. */
+  awakenWave(t) {
+    WORLD._waveT0 = t;
+    WORLD._waveActive = true;
+  },
+
+  /* public API — M9.4: end the wave EXACTLY (every visible chunk's
+   * sign/ledWin instance colors restored to 1.0). Idempotent. Called
+   * at DORMANT entry (and by the wave's own completion). */
+  awakenWaveEnd() {
+    if (!WORLD._waveActive) return;
+    WORLD._waveActive = false;
+    WORLD._waveRestore();
+  },
+
+  /* M9.4: restore every visible chunk's sign/ledWin instance colors to
+   * exactly 1.0 (idle). One pass, only ever called at wave end. */
+  _waveRestore() {
+    for (const ch of WORLD.chunks.values()) {
+      for (const b of [ch.sign, ch.ledWin]) {
+        if (b.count === 0 || !b.mesh.instanceColor) continue;
+        const a = b.mesh.instanceColor.array;
+        for (let i = 0; i < b.count * 3; i++) a[i] = 1;
+        b.mesh.instanceColor.needsUpdate = true;
+      }
+    }
   },
 
   /* per-block seed — deterministic for (bx, bz) forever */
@@ -1768,12 +1858,21 @@ const WORLD = {
         fan:   WORLD._detailMesh(D.fanGeo, MATS.metalDark, D.fanCap),
         dish:  WORLD._detailMesh(D.dishGeo, MATS.metalDark, D.dishCap),
         pulse: WORLD._detailMesh(D.pulseGeo, MATS.pulseGlow, D.pulseCap, true),
-        sign:  WORLD._detailMesh(D.signGeo, MATS.signMat.qwen, D.signCap),
-        ledWin: WORLD._detailMesh(D.ledGeo, D.ledMats.a, D.ledCap),
+        /* M9.4: sign + ledWin carry a pre-allocated instanceColor so the
+         * awakening wave can ramp per-instance brightness (1.0 = idle,
+         * restored EXACTLY at wave end / DORMANT entry) */
+        sign:  WORLD._detailMesh(D.signGeo, MATS.signMat.qwen, D.signCap, true),
+        ledWin: WORLD._detailMesh(D.ledGeo, D.ledMats.a, D.ledCap, true),
       };
     }
     ch.cx = cx; ch.cz = cz;
-    ch.group.add(ch.boxA.mesh, ch.boxG.mesh, ch.cyl.mesh);
+    /* the five detail meshes ride in the chunk group too — without this
+     * they are filled/animated but never rendered (M4 latent bug; the
+     * M9.4 awakening wave ramps sign/ledWin instance colors, which is
+     * only visible once the meshes are in the scene graph) */
+    ch.group.add(ch.boxA.mesh, ch.boxG.mesh, ch.cyl.mesh,
+      ch.fan.mesh, ch.dish.mesh, ch.pulse.mesh, ch.sign.mesh,
+      ch.ledWin.mesh);
     WORLD.root.add(ch.group);
     WORLD.chunks.set(cx + ',' + cz, ch);
     WORLD._fill(ch, ring);
@@ -1833,6 +1932,15 @@ const WORLD = {
     }
     if (ch._ledCands && ch._ledCands.length) {
       WORLD._ledPass(ch);
+    }
+    /* M9.4: a (re)filled chunk's LED/sign instance colors start at
+     * exactly 1.0 (idle) — a pooled chunk may carry stale per-slot
+     * values from a previous fill; an active wave overwrites per-frame
+     * from its own front. */
+    for (const b of [ch.sign, ch.ledWin]) {
+      if (b.count === 0 || !b.mesh.instanceColor) continue;
+      const a = b.mesh.instanceColor.array;
+      for (let i = 0; i < b.count * 3; i++) a[i] = 1;
     }
     for (const b of [ch.boxA, ch.boxG, ch.cyl,
       ch.fan, ch.dish, ch.pulse, ch.sign, ch.ledWin]) {
@@ -2107,7 +2215,9 @@ const WORLD = {
         const sy = h + 5;
         const s = R(6, 10);
         ch.sign.add(x, sy, z, [s, s * 0.375, 1]);
-        ch.sign.pars[slot] = { x, y: sy, z, s: [s, s * 0.375, 1] };
+        /* M9.4: d = distance from the plaza (wave scheduling) */
+        ch.sign.pars[slot] = { x, y: sy, z, s: [s, s * 0.375, 1],
+          d: Math.hypot(x, z) };
         WORLD._nSign++;
       }
       break;
@@ -2149,10 +2259,23 @@ const WORLD = {
     const { x, z, h, w } = c.info;
     const cw = w * 0.8, chh = Math.min(h * 0.6, 12);
     const off = w / 2 + 0.06, y = 1.5 + chh / 2;
+    /* facade outward normal (matches the rotY above) — the smoke
+     * visual gate uses it to anchor the region on a camera-facing
+     * facade */
+    const nx = face === 2 ? 1 : face === 3 ? -1 : 0,
+      nz = face === 0 ? 1 : face === 1 ? -1 : 0;
     if (face === 0) ch.ledWin.add(x, y, z + off, [cw, chh, 1]);
     else if (face === 1) ch.ledWin.add(x, y, z - off, [cw, chh, 1], null, Math.PI);
     else if (face === 2) ch.ledWin.add(x + off, y, z, [1, chh, cw], null, Math.PI / 2);
     else ch.ledWin.add(x - off, y, z, [1, chh, cw], null, -Math.PI / 2);
+    /* M9.4: the awakening wave schedules this facade by its distance
+     * from the plaza (precomputed at fill — zero per-frame cost).
+     * fx/fz = the facade's own world position (the mesh sits `off`
+     * along the face normal from the building center) — the smoke
+     * visual gate anchors its region there */
+    ch.ledWin.pars[ch.ledWin.count - 1] =
+      { x, y, z, d: Math.hypot(x, z), nx, nz,
+        fx: x + nx * off, fz: z + nz * off };
     WORLD._nLed++;
   },
 
@@ -2192,6 +2315,9 @@ const WORLD = {
     const camP = camera.position;
     const M = WORLD._m4, P = WORLD._p4, Q = WORLD._q4, S = WORLD._s4,
       Y = WORLD._y4, C = WORLD._c4, D = WORLD._camDir4;
+    /* M9.4 beat 4: the city wave (null = inactive ⇒ zero cost) */
+    const wv = WORLD._waveActive ? CFG.entity.beats.cascade.wave : null;
+    let waveMaxD = 0;
     for (const ch of WORLD.chunks.values()) {
       if (!ch.group.visible) continue;
       /* fans: shared rotating blades (constant per-fan speed/phase) */
@@ -2259,6 +2385,7 @@ const WORLD = {
       }
       /* holo-sign billboards: face the camera, one shared texture each */
       const sign = ch.sign;
+      const ledWin = ch.ledWin;
       if (sign.count > 0) {
         for (let i = 0; i < sign.count; i++) {
           const p = sign.pars[i];
@@ -2272,7 +2399,42 @@ const WORLD = {
         }
         sign.mesh.instanceMatrix.needsUpdate = true;
       }
-      /* ledWin: static — the shared LED textures animate (KIT redraws) */
+      /* ledWin: static — the shared LED textures animate (KIT redraws);
+       * M9.4 beat 4: while the awakening wave is in flight, the sign +
+       * LED-facade instance colors ramp as the front crosses them —
+       * scheduled by distance from the plaza, so each city ring lights
+       * up as the wave arrives (1.0 = idle, restored EXACTLY). */
+      if (wv) {
+        const r = (t - WORLD._waveT0) * wv.speed;
+        const atk = wv.width / wv.speed;
+        const ic = ledWin.mesh.instanceColor.array;
+        for (let i = 0; i < ledWin.count; i++) {
+          const p = ledWin.pars[i];
+          if (p.d > waveMaxD) waveMaxD = p.d;
+          const b = 1 + (wv.bright - 1) * _waveEnv(
+            (r - p.d) / wv.speed, atk, wv.hold, wv.release);
+          const i3 = i * 3;
+          ic[i3] = b; ic[i3 + 1] = b; ic[i3 + 2] = b;
+        }
+        ledWin.mesh.instanceColor.needsUpdate = true;
+        const sic = sign.mesh.instanceColor.array;
+        for (let i = 0; i < sign.count; i++) {
+          const p = sign.pars[i];
+          if (p.d > waveMaxD) waveMaxD = p.d;
+          const b = 1 + (wv.bright - 1) * _waveEnv(
+            (r - p.d) / wv.speed, atk, wv.hold, wv.release);
+          const i3 = i * 3;
+          sic[i3] = b; sic[i3 + 1] = b; sic[i3 + 2] = b;
+        }
+        sign.mesh.instanceColor.needsUpdate = true;
+      }
+    }
+    /* M9.4: the wave is complete once its front + release have passed
+     * every visible instance ⇒ restore all colors to exactly 1.0 */
+    if (wv && (t - WORLD._waveT0) * wv.speed - waveMaxD >
+        wv.width + wv.speed * (wv.hold + wv.release)) {
+      WORLD._waveActive = false;
+      WORLD._waveRestore();
     }
   },
 
@@ -2446,6 +2608,16 @@ const TRAFFIC = {
   _vqI: new THREE.Quaternion(),
   _vs: new THREE.Vector3(1, 1, 1),
   _vtint: new THREE.Color(),
+  /* M9.4 beat 5: staggered substation-bolt schedule (pre-allocated —
+   * zero allocation in awaken()/update) */
+  _arcQ: 0,               // bolts still to fire
+  _arcTimer: 0,           // s until the next bolt
+  _arcNext: 0,            // next pair index
+  _arcIt: [null, null, null],  // live cascade bolt items (dropped at
+                               // DORMANT entry, even mid-life)
+  _arcPairs: new Float32Array(24),  // 3 pairs × (x,y,z) × 2
+  _arcSel: new Float32Array(64),    // nearest-4 selection flags
+  _arcSubs: [null, null, null, null],
 
   init() {
     /* drone body: merged voxel quad — chassis + 4 rotors + sensor nub
@@ -2489,6 +2661,12 @@ const TRAFFIC = {
       wpT: 0,                  // route timer (returns to waypoint 0)
       dockT: 4,                // remaining dock time (s)
       yaw: 0,                  // heading (radians, toward current target)
+      /* M9.4 beat 5: the traffic cascade — 3 = scatter (fly outward
+       * from the plaza, then back to the dock), 4 = escort (re-route
+       * to hover at the creature, then back). rx/ry/rz = reaction
+       * target; roleT = remaining escort hover (s). */
+      rx: 0, ry: 0, rz: 0,
+      roleT: 0,
       wps: new Float32Array(12),  // up to 4 waypoints, pre-allocated
       tint: new THREE.Color(0x9fe8ff),
     }));
@@ -2528,6 +2706,11 @@ const TRAFFIC = {
       alt: 70,            // lane altitude (m)
       px: 0, py: 0, pz: 0,
       speed: 30, size: 1.6, trailLen: 12, phase: 0,
+      /* M9.4 beat 5: avoidance offset — ox = lateral metres away from
+       * the plaza (signed; axis decides x vs z), oalt = altitude bump,
+       * av = eased level 0..1, avoidT = remaining offset time (s).
+       * Render pose only — the analytic lane state is untouched. */
+      ox: 0, oalt: 0, av: 0, avoidT: 0,
       tint: new THREE.Color(0x6fe3ff),
     }));
 
@@ -2540,8 +2723,138 @@ const TRAFFIC = {
     TRAFFIC._vCap = CFG.traffic.vehicle.tiers[TIER.name];
   },
 
+  /* public API — M9.4 beat 5: the traffic cascade. Drones scatter
+   * outward from the plaza (some re-route to hover at the creature);
+   * sky vehicles take avoidance offsets off their lanes; substation
+   * bolts fire staggered; a steam burst rolls off the cooling towers.
+   * Fired once per sequence by ENTITY, gated on _ignited. */
+  awaken() {
+    const tc = CFG.entity.beats.cascade.traffic;
+    const r = TRAFFIC._rng;
+    /* drones: scatter / escort / hold (normal patrol continues) */
+    for (let i = 0; i < TRAFFIC.count; i++) {
+      const it = TRAFFIC._live[i];
+      const roll = r();
+      if (roll < tc.scatter) {
+        /* scatter: fly outward from the plaza, then back to the dock */
+        const rad = Math.hypot(it.px, it.pz);
+        const a2 = rad > 1
+          ? Math.atan2(it.pz, it.px)
+          : r() * 6.2831853;
+        const dist = tc.scatterDist[0]
+          + r() * (tc.scatterDist[1] - tc.scatterDist[0]);
+        it.rx = Math.cos(a2) * (rad + dist);
+        it.rz = Math.sin(a2) * (rad + dist);
+        it.ry = it.py + tc.scatterUp[0]
+          + r() * (tc.scatterUp[1] - tc.scatterUp[0]);
+        it.state = 3;
+      } else if (roll < tc.scatter + tc.escort) {
+        /* escort: re-route to the creature — hover ring around the
+         * plaza at creature height, hold, then back to the dock */
+        const a2 = r() * 6.2831853;
+        const rad = tc.escortR[0] + r() * (tc.escortR[1] - tc.escortR[0]);
+        it.rx = Math.cos(a2) * rad;
+        it.rz = Math.sin(a2) * rad;
+        it.ry = tc.escortAlt[0]
+          + r() * (tc.escortAlt[1] - tc.escortAlt[0]);
+        it.roleT = tc.escortHold;
+        it.state = 4;
+      }
+    }
+    /* vehicles: avoidance offsets away from the plaza (render pose
+     * only — the analytic lane state is untouched) */
+    for (let i = 0; i < TRAFFIC.vcount; i++) {
+      const it = TRAFFIC._vLive[i];
+      const sgn = it.lane >= 0 ? 1 : -1;
+      it.ox = sgn * (tc.avoidLat[0]
+        + r() * (tc.avoidLat[1] - tc.avoidLat[0]));
+      it.oalt = tc.avoidAlt[0]
+        + r() * (tc.avoidAlt[1] - tc.avoidAlt[0]);
+      it.avoidT = tc.avoidDur;
+    }
+    /* substation bolts: up to 3 staggered pairs among the 4 nearest
+     * substations (to the plaza) — pre-allocated scratch only */
+    TRAFFIC._arcQ = 0;
+    TRAFFIC._arcNext = 0;
+    TRAFFIC._arcIt[0] = TRAFFIC._arcIt[1] = TRAFFIC._arcIt[2] = null;
+    const list = PARTS._subList;
+    if (list.length >= 2) {
+      const m = Math.min(4, list.length);
+      const sel = TRAFFIC._arcSubs;
+      for (let k = 0; k < m; k++) {
+        let bi = -1, bd = Infinity;
+        for (let i = 0; i < list.length; i++) {
+          if (TRAFFIC._arcSel[i]) continue;
+          const s = list[i];
+          const dd = s.x * s.x + s.z * s.z;
+          if (dd < bd) { bd = dd; bi = i; }
+        }
+        if (bi < 0) break;
+        TRAFFIC._arcSel[bi] = 1;
+        sel[k] = list[bi];
+      }
+      for (let i = 0; i < list.length; i++) TRAFFIC._arcSel[i] = 0;
+      const P = TRAFFIC._arcPairs;
+      let q = 0;
+      const put = (a, b) => {
+        P[q * 8 + 0] = a.x; P[q * 8 + 1] = a.hTop + 0.5; P[q * 8 + 2] = a.z;
+        P[q * 8 + 3] = b.x; P[q * 8 + 4] = b.hTop + 0.5; P[q * 8 + 5] = b.z;
+        q++;
+      };
+      if (m === 4) {
+        put(sel[0], sel[1]); put(sel[2], sel[3]); put(sel[0], sel[2]);
+      } else if (m === 3) {
+        put(sel[0], sel[1]); put(sel[1], sel[2]); put(sel[0], sel[2]);
+      } else {
+        put(sel[0], sel[1]);
+      }
+      TRAFFIC._arcQ = q;
+      TRAFFIC._arcTimer = 0;   // first bolt fires on the next frame
+    }
+    /* steam burst from the ambient cooling-tower vents */
+    PARTS.steamBurst(tc.steam);
+  },
+
+  /* public API — M9.4: end the traffic cascade at DORMANT entry.
+   * Reaction drones head straight home (state 2); vehicle offsets
+   * ease out over avoidRamp. Idempotent. */
+  awakenEnd() {
+    for (let i = 0; i < TRAFFIC.count; i++) {
+      const it = TRAFFIC._live[i];
+      if (it.state === 3 || it.state === 4) it.state = 2;
+    }
+    for (let i = 0; i < TRAFFIC.vcount; i++) {
+      TRAFFIC._vLive[i].avoidT = 0;   // level eases out over avoidRamp
+    }
+    /* cancel any not-yet-fired bolts and drop the live ones (even
+     * mid-life) so the cascade leaves no visible residue */
+    TRAFFIC._arcQ = 0;
+    TRAFFIC._arcNext = 0;
+    for (let i = 0; i < 3; i++) {
+      const it = TRAFFIC._arcIt[i];
+      if (it) {
+        FX.dropArc(it);
+        TRAFFIC._arcIt[i] = null;
+      }
+    }
+  },
+
   update(dt, t) {
     const d = CFG.traffic.drone;
+    /* M9.4: staggered substation bolts from the awakening cascade */
+    if (TRAFFIC._arcQ > 0) {
+      TRAFFIC._arcTimer -= dt;
+      if (TRAFFIC._arcTimer <= 0) {
+        const P = TRAFFIC._arcPairs;
+        const o = TRAFFIC._arcNext * 8;
+        const it = FX.arc({ x: P[o], y: P[o + 1], z: P[o + 2] },
+                          { x: P[o + 3], y: P[o + 4], z: P[o + 5] });
+        if (it) TRAFFIC._arcIt[TRAFFIC._arcNext] = it;
+        TRAFFIC._arcNext++;
+        TRAFFIC._arcQ--;
+        TRAFFIC._arcTimer += CFG.entity.beats.cascade.traffic.arcStagger;
+      }
+    }
     /* tier cap: trim the farthest drones down to the tier limit */
     TRAFFIC._cap = d.tiers[TIER.name];
     while (TRAFFIC.count > TRAFFIC._cap) {
@@ -2582,9 +2895,14 @@ const TRAFFIC = {
         if (it.dockT <= 0 && it.wpCount > 0) it.state = 1;
         TRAFFIC._pose(it, t, bob);
       } else {
-        const targetX = it.state === 1 ? it.tx : it.dx;
-        const targetY = it.state === 1 ? it.ty : it.dy;
-        const targetZ = it.state === 1 ? it.tz : it.dz;
+        /* M9.4: states 3/4 (scatter / escort) fly to the reaction
+         * target rx/ry/rz; state 1 → waypoint; state 2 → the dock */
+        const targetX = it.state === 1 ? it.tx
+          : it.state >= 3 ? it.rx : it.dx;
+        const targetY = it.state === 1 ? it.ty
+          : it.state >= 3 ? it.ry : it.dy;
+        const targetZ = it.state === 1 ? it.tz
+          : it.state >= 3 ? it.rz : it.dz;
         const dx = targetX - it.px, dy = targetY - it.py, dz = targetZ - it.pz;
         const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
         const step = it.speed * dt;
@@ -2594,6 +2912,13 @@ const TRAFFIC = {
           if (it.state === 1) {
             if (it.wp >= it.wpCount - 1) it.state = 2;  // last wp → return
             else { it.wp++; TRAFFIC._nextWp(it); }
+          } else if (it.state === 3) {
+            /* M9.4: scatter point reached → back to the dock */
+            it.state = 2;
+          } else if (it.state === 4) {
+            /* M9.4: escort hover at the creature — hold, then return */
+            it.roleT -= dt;
+            if (it.roleT <= 0) it.state = 2;
           } else {
             it.state = 0;
             it.dockT = d.dockTime[0] + it.phase / 6.2831853 * (d.dockTime[1] - d.dockTime[0]);
@@ -2645,8 +2970,21 @@ const TRAFFIC = {
 
     /* per-frame flight update (tight loop, pre-allocated state) */
     const vmesh = TRAFFIC.vmesh, tmesh = TRAFFIC.tmesh;
+    const avRamp = CFG.entity.beats.cascade.traffic.avoidRamp;
     for (let i = TRAFFIC.vcount - 1; i >= 0; i--) {
       const it = TRAFFIC._vLive[i];
+      /* M9.4: avoidance offset — eased lateral shift away from the
+       * plaza (render pose only; the analytic lane state is untouched
+       * and the offset eases back to exactly 0) */
+      if (it.avoidT > 0) {
+        it.avoidT -= dt;
+        it.av = Math.min(1, it.av + dt / avRamp);
+      } else if (it.av > 0) {
+        it.av = Math.max(0, it.av - dt / avRamp);
+      }
+      const ox = it.axis === 0 ? it.ox * it.av : 0;
+      const oz = it.axis === 0 ? 0 : it.ox * it.av;
+      const oy = it.oalt * it.av;
       /* constant-speed run along the avenue line */
       if (it.axis === 0) it.pz += it.dir * it.speed * dt;
       else it.px += it.dir * it.speed * dt;
@@ -2660,7 +2998,7 @@ const TRAFFIC = {
       const yaw = it.axis === 0
         ? (it.dir > 0 ? 0 : Math.PI)
         : (it.dir > 0 ? Math.PI / 2 : -Math.PI / 2);
-      TRAFFIC._vp.set(it.px, it.py, it.pz);
+      TRAFFIC._vp.set(it.px + ox, it.py + oy, it.pz + oz);
       TRAFFIC._vq.setFromAxisAngle(TRAFFIC._y, yaw);
       TRAFFIC._vs.set(it.size, it.size, it.size);
       TRAFFIC._vm.compose(TRAFFIC._vp, TRAFFIC._vq, TRAFFIC._vs);
@@ -2674,7 +3012,7 @@ const TRAFFIC = {
       const L = it.trailLen, W = v.trailW;
       const hx = it.px - (it.axis === 0 ? 0 : it.dir * L * 0.25);
       const hz = it.pz - (it.axis === 0 ? it.dir * L * 0.25 : 0);
-      TRAFFIC._vp.set(hx, it.py, hz);
+      TRAFFIC._vp.set(hx + ox, it.py + oy, hz + oz);
       TRAFFIC._vs.set(
         it.axis === 0 ? W : L / 2, W * 0.6, it.axis === 0 ? L / 2 : W);
       TRAFFIC._vm.compose(TRAFFIC._vp, TRAFFIC._vqI, TRAFFIC._vs);
@@ -2682,7 +3020,7 @@ const TRAFFIC = {
       tmesh.setColorAt(i * 2, it.tint);
       const tx = it.px - (it.axis === 0 ? 0 : it.dir * L * 0.75);
       const tz = it.pz - (it.axis === 0 ? it.dir * L * 0.75 : 0);
-      TRAFFIC._vp.set(tx, it.py, tz);
+      TRAFFIC._vp.set(tx + ox, it.py + oy, tz + oz);
       TRAFFIC._vm.compose(TRAFFIC._vp, TRAFFIC._vqI, TRAFFIC._vs);
       tmesh.setMatrixAt(i * 2 + 1, TRAFFIC._vm);
       TRAFFIC._vtint.setRGB(
@@ -3420,6 +3758,19 @@ const PARTS = {
     }
   },
 
+  /* public API — M9.4 beat 5 + M13.3 cooling emergency: n steam
+   * puffs burst from the ambient cooling-tower vents (the pool is
+   * the gate — excess is silently dropped). */
+  steamBurst(n) {
+    const st = CFG.parts.steam;
+    const r = PARTS._rng;
+    for (let k = 0; k < n; k++) {
+      const src = PARTS._findSource(r, 'cool', st.radius, st.innerRadius);
+      const it = src ? PARTS.spool.acquire() : null;
+      if (it) PARTS._spawnSteam(it, src);
+    }
+  },
+
   /* source search for the ambient emitters (moved from TRAFFIC — the
    * M6.4 seam). A 200 m radius holds only ~10 source blocks, so blind
    * random-block draws would starve the emitters: a small live list of
@@ -3842,15 +4193,16 @@ const FX = {
 
   /* public API — M9.4 plaza pulse, M13.2 data pulse, dev trigger Key R.
    * origin: Vector3-like {x,y,z}; radius: target radius (m, default
-   * CFG.fx.pulse.radius); color: THREE.Color or hex. Returns the pool
-   * item (null = cap hit, nothing allocated, nothing thrown). */
-  pulse(origin, radius, color) {
+   * CFG.fx.pulse.radius); color: THREE.Color or hex; life: optional
+   * override in s (default CFG.fx.pulse.life). Returns the pool item
+   * (null = cap hit, nothing allocated, nothing thrown). */
+  pulse(origin, radius, color, life) {
     const it = FX._pool.acquire();
     if (!it) return null;
     it.ox = origin.x; it.oy = origin.y; it.oz = origin.z;
     it.R = radius > 0 ? radius : CFG.fx.pulse.radius;
     it.age = 0;
-    it.life = CFG.fx.pulse.life;
+    it.life = life > 0 ? life : CFG.fx.pulse.life;
     if (color && color.isColor) {
       it.cR = color.r; it.cG = color.g; it.cB = color.b;
     } else if (typeof color === 'number') {
@@ -3863,6 +4215,33 @@ const FX = {
     FX._live[FX.count++] = it;
     /* audio thump: wired in M11.3 */
     return it;
+  },
+
+  /* public API — M9.4 cascade cleanup: drop one live pulse item
+   * (swap-remove + pool release) even mid-life. No-op for foreign or
+   * already-released items. */
+  dropPulse(it) {
+    if (!it || it.__pool !== FX._pool || it.__free) return;
+    for (let i = FX.count; i-- > 0;) {
+      if (FX._live[i] !== it) continue;
+      const m = --FX.count;
+      if (i !== m) FX._live[i] = FX._live[m];
+      FX._live[m] = undefined;
+      break;
+    }
+    FX._pool.release(it);
+  },
+
+  /* public API — M9.4 cascade cleanup: drop one live arc item
+   * (swap-remove + pool release) even mid-life. No-op for foreign or
+   * already-released items. */
+  dropArc(it) {
+    if (!it || it.__pool !== FX._arcPool || it.__free) return;
+    for (let i = FX.arcCount; i-- > 0;) {
+      if (FX._arcLive[i] !== it) continue;
+      FX._arcReleaseAt(i);
+      break;
+    }
   },
 
   /* public API — M9.4 substation cascade, M13.4 EM discharge, dev
@@ -4228,7 +4607,11 @@ const ENTITY = {
   _ignited: false,              // M9.3: node grid lit (beat 2 in flight)
   _surgeP: 0,                   // M9.3: beat-3 surge level 0..1
   _surgeFired: false,           // M9.3: shake fired this sequence
-  _beatAt: { flare: 0, ignite: 0, surge: 0 },  // M9.3: beat start times
+  _cascadeFired: false,        // M9.4: beat 4 fired this sequence
+  _trafficFired: false,        // M9.4: beat 5 fired this sequence
+  _pulseIt: null,              // M9.4: the plaza pulse pool item (dropped at DORMANT)
+  _beatAt: { flare: 0, ignite: 0, surge: 0, cascade: 0, traffic: 0 },
+  // M9.3/M9.4: beat start times
   _tiltE: null,                 // M9.3: per-ring tilt Euler scratch
   _tiltQ: null,                 // M9.3: per-ring tilt quaternion scratch
   _surgeDir: null,              // M9.3: per-ring tilt directions (x, z)
@@ -4584,9 +4967,12 @@ const ENTITY = {
       ENTITY._wakeCount++;
       for (const sys of systems) if (sys.onAwaken) sys.onAwaken();
       /* M9.3: beat 1 (core-eye flare) starts with the sequence; the
-       * beat-3 shake re-arms for this sequence. */
+       * beat-3 shake re-arms for this sequence. M9.4: the beats 4–5
+       * cascade re-arms for this sequence. */
       ENTITY._beatAt.flare = t;
       ENTITY._surgeFired = false;
+      ENTITY._cascadeFired = false;
+      ENTITY._trafficFired = false;
     }
     for (const h of ENTITY._wakeHooks[s]) h(s, t);
   },
@@ -4737,9 +5123,28 @@ const ENTITY = {
         ENTITY.nodes.instanceColor.needsUpdate = true;
         ENTITY._ignited = false;
       }
+      /* M9.4: tear down the city cascade — the wave colors restore
+       * exactly, the plaza pulse drops even mid-life, and the traffic
+       * roles clear (drones head home, vehicle offsets ease out). The
+       * pulse item is only dropped if it still matches the cascade
+       * signature (a released item may have been re-acquired by a dev
+       * trigger in the meantime). */
+      WORLD.awakenWaveEnd();
+      if (ENTITY._pulseIt) {
+        const pit = ENTITY._pulseIt;
+        if (!pit.__free && pit.ox === 0 && pit.oz === 0 &&
+            pit.R === B.cascade.pulse.radius)
+          FX.dropPulse(pit);
+        ENTITY._pulseIt = null;
+      }
+      TRAFFIC.awakenEnd();
+      ENTITY._cascadeFired = false;
+      ENTITY._trafficFired = false;
       ENTITY._beatAt.flare = 0;
       ENTITY._beatAt.ignite = 0;
       ENTITY._beatAt.surge = 0;
+      ENTITY._beatAt.cascade = 0;
+      ENTITY._beatAt.traffic = 0;
     }
     let wakeP = 0;
     if (ENTITY.state === 'STIR') {
@@ -4785,6 +5190,29 @@ const ENTITY = {
         ic[i3 + 2] = hue[i3 + 2] * b;
       }
       ENTITY.nodes.instanceColor.needsUpdate = true;
+    }
+    /* M9.4 beats 4–5: the city-level cascade. Beat 4 launches the
+     * plaza pulse ring + the city LED/sign wave; beat 5 fires the
+     * traffic cascade (arcs, steam, drones, vehicles). Timers from
+     * AWAKE entry, gated on _ignited (a forced non-sequence AWAKE
+     * never cascades), one fire per sequence; DORMANT entry tears the
+     * cascade down (transition block above). */
+    const Cc = B.cascade;
+    if (ENTITY._ignited && ENTITY.state === 'AWAKE') {
+      const u = t - ENTITY._awakeT0;
+      if (!ENTITY._cascadeFired && u >= Cc.pulse.delay) {
+        ENTITY._cascadeFired = true;
+        ENTITY._beatAt.cascade = t;
+        ENTITY._pulseIt = FX.pulse(
+          FX._fire.set(0, 0.4, 0), Cc.pulse.radius, Cc.pulse.color,
+          Cc.pulse.life);
+        WORLD.awakenWave(t);
+      }
+      if (!ENTITY._trafficFired && u >= Cc.traffic.delay) {
+        ENTITY._trafficFired = true;
+        ENTITY._beatAt.traffic = t;
+        TRAFFIC.awaken();
+      }
     }
     /* M9.3 beat 3: tensor rings tilt + limbs reposition, fired with a
      * camera-shake impulse. The level ramps in `delay` s after AWAKE

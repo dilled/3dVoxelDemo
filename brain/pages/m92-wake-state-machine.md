@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [m9, entity, state-machine, wake]
 created: "2026-09-17T19:28:50"
-updated: "2026-09-17T19:29:56"
+updated: "2026-09-18T07:44:38"
 ---
 
 <!-- compiled_truth -->
@@ -84,3 +84,9 @@ updated: "2026-09-17T19:29:56"
   summary: "M9.2 wake state machine: DORMANT→STIR(2s)→AWAKE(10–20s)→DECAY(3s)→DORMANT on ENTITY — wake() trigger, _enterState, per-state hooks, onAwaken, wakeP pose (head lift/jaw/ring boost), integrated ring angles, seeded AWAKE hold, stateT fast-forward smoke contract"
   source: brain update-truth
   affects: [m92-wake-state-machine]
+
+- time: 2026-09-18T07:44:38
+  kind: decision
+  summary: "M9.4: beats 4–5 (city-level cascade) hang off the machine — fires at AWAKE + cascade.pulse.delay / traffic.delay, gated on _ignited, one fire per sequence (re-armed at STIR entry), torn down at DORMANT entry (wave restored exactly, plaza pulse dropped mid-life, traffic roles cleared). Beat times in _beatAt.cascade/.traffic; see m94-city-cascade."
+  source: M9.4 implementation
+  affects: [m92-wake-state-machine, m94-city-cascade]

@@ -1400,10 +1400,24 @@ try {
       vcap > 0,
       `tier=${await page.evaluate(() => window.SIM.TIER.active())}, cap=${vcap}`);
 
-    /* fleet grows to the tier cap — spawns are gated by the fixed pool */
+    /* fleet grows to the tier cap — spawns are gated by the fixed
+     * pool. Wait for the at-cap state to be STABLE: a vehicle is
+     * released (back to the pool) the moment it flies past the hold
+     * radius around the camera, so a transient at-cap sample can
+     * read one vehicle short. Require no live vehicle within a few
+     * metres of the release boundary. */
     await page.waitForFunction(c => {
-      const S = window.SIM;
-      return S.TRAFFIC && S.TRAFFIC.vcount === c;
+      const S = window.SIM, T = S.TRAFFIC;
+      if (!T || T.vcount !== c) return false;
+      const v = S.CFG.traffic.vehicle;
+      const P = S.CAMERA.pos;
+      const rel = v.radius * v.releaseFactor - 3;
+      for (let i = 0; i < c; i++) {
+        const it = T._vLive[i];
+        const dx = it.px - P.x, dz = it.pz - P.z;
+        if (dx * dx + dz * dz > rel * rel) return false;
+      }
+      return true;
     }, vcap, { timeout: 120000 });
 
     /* all 3 ring-road altitudes occupied at once (random lane picks ⇒
@@ -5898,6 +5912,696 @@ try {
       S.FX.flash = S.__m93f0;
       S.CAMERA.shake = S.__m93s0;
       delete S.__m93;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      const C = S.CAMERA;
+      C.pos.set(0, 4, 18);
+      C.vel.set(0, 0, 0);
+      C.yaw = 0;
+      C.pitch = 0;
+    });
+    await sleep(250);
+  }
+
+  /* ------------------------------------------------------------------
+   * M9.4 — Awakening beats 4–5 (city-level cascade)
+   *
+   *  Beat 4 (u = 2.2 s into AWAKE): the plaza energy-pulse ring
+   *    (FX.pulse, 660 m, 4 s) + the city holo-sign / LED-facade wave —
+   *    per-instance color ramps scheduled by distance from the plaza,
+   *    so the wave travels ring by ring (front 165 m/s, width 26 m,
+   *    1.2 s lit hold, 1.6 s release, peak ×2.4; 1.0 = idle, restored
+   *    EXACTLY). Beat 5 (u = 3.2 s): the traffic cascade — staggered
+   *    substation bolts, steam burst, drones scatter / re-route to
+   *    hover at the creature, sky vehicles take eased avoidance
+   *    offsets off their lanes.
+   *
+   *  Triggered via ENTITY.wake() (M9.6 wires the manual key to it);
+   *  transitions forced by fast-forwarding stateT as in M9.2/M9.3.
+   *  DORMANT entry tears the whole cascade down: wave colors restored
+   *  byte-exact, the plaza pulse dropped even mid-life, live bolts
+   *  dropped, drone roles cleared, vehicle offsets eased out.
+   * ------------------------------------------------------------------ */
+  {
+    const B = await page.evaluate(
+      () => window.SIM.CFG.entity.beats.cascade);
+
+    /* park the dream wave + lightning auto-timer (as in M9.2/M9.3) */
+    await page.waitForFunction(() => {
+      const E = window.SIM.ENTITY;
+      return E && E._dream && !E._dream.active;
+    }, { timeout: 20000 });
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      S.ATMOS._ltTimer = 1e9;
+    });
+    await page.waitForFunction(
+      () => window.SIM.FX._flash === 0, { timeout: 5000 });
+
+    /* 1. registered: config sane, cascade idle at DORMANT */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, T = S.TRAFFIC, W = S.WORLD;
+      const B = S.CFG.entity.beats.cascade;
+      let colors = true;
+      for (const ch of W.chunks.values()) {
+        for (const b of [ch.sign, ch.ledWin]) {
+          if (b.count === 0 || !b.mesh.instanceColor) continue;
+          const a = b.mesh.instanceColor.array;
+          for (let i = 0; i < b.count * 3; i++)
+            if (a[i] !== 1) { colors = false; break; }
+        }
+      }
+      return {
+        cfg: B.pulse.delay > 0 && B.pulse.radius > 100 &&
+          B.pulse.life > 0 &&
+          B.wave.speed > 0 && B.wave.width > 0 && B.wave.hold > 0 &&
+          B.wave.release > 0 && B.wave.bright > 1 &&
+          B.traffic.delay > B.pulse.delay && B.traffic.arcs > 0 &&
+          B.traffic.arcStagger > 0 && B.traffic.steam > 0 &&
+          B.traffic.scatter > 0 && B.traffic.escort > 0 &&
+          B.traffic.avoidDur > 0 && B.traffic.avoidRamp > 0,
+        idle: !E._cascadeFired && !E._trafficFired &&
+          E._pulseIt === null &&
+          E._beatAt.cascade === 0 && E._beatAt.traffic === 0 &&
+          !W._waveActive && colors &&
+          T._arcQ === 0 && T._arcNext === 0 &&
+          S.FX.arcCount === 0 && S.FX.count === 0,
+        calls: S.renderer.info.render.calls,
+      };
+    });
+    check('M9.4: city cascade registered — config sane, cascade idle at DORMANT',
+      reg.cfg && reg.idle, `calls=${reg.calls}`);
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const hb = await heapMin();
+
+    /* street pose (same as M9.1/M9.3) + visible-object baseline — the
+     * teardown check below samples this same pose at DORMANT */
+    await page.evaluate(() => {
+      const C = window.SIM.CAMERA;
+      C.pos.set(72, 1.7, 55);
+      C.vel.set(0, 0, 0);
+      C.yaw = 0.92;
+      C.pitch = 0.30;
+    });
+    await sleep(250);
+    const visBase = await page.evaluate(() => {
+      const S = window.SIM;
+      const vis = [];
+      S.scene.traverse(o => {
+        if (o.isMesh || o.isPoints || o.isLine) {
+          let v = true;
+          for (let p = o; p; p = p.parent) v = v && p.visible;
+          if (v) vis.push(o.name || o.type);
+        }
+      });
+      vis.sort();
+      return { calls: S.renderer.info.render.calls, vis };
+    });
+
+    /* 2. wake() → STIR → force AWAKE; wait for beat 4 (u ≥ 2.2 s):
+     *    the plaza pulse ring is live + the city wave is armed */
+    await page.evaluate(() => window.SIM.ENTITY.wake());
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.stir - 0.05;
+    });
+    await page.waitForFunction(() => {
+      const E = window.SIM.ENTITY;
+      return E.state === 'AWAKE' && E._cascadeFired;
+    }, { timeout: 8000 });
+    const b4 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, F = S.FX;
+      let pit = null;
+      for (let i = 0; i < F.count; i++)
+        if (F._live[i].R === S.CFG.entity.beats.cascade.pulse.radius)
+          pit = F._live[i];
+      return {
+        state: E.state,
+        pulse: !!pit,
+        origin: pit ? pit.ox === 0 && pit.oy === 0.4 && pit.oz === 0
+          : false,
+        owned: pit ? E._pulseIt === pit : false,
+        wave: S.WORLD._waveActive,
+        cascadeAt: E._beatAt.cascade,
+        igniteAt: E._beatAt.ignite,
+      };
+    });
+    check('M9.4: beat 4 — plaza pulse ring live + city wave armed (u ≥ 2.2 s)',
+      b4.state === 'AWAKE' && b4.pulse && b4.origin && b4.owned &&
+      b4.wave && b4.cascadeAt > 0 &&
+      Math.abs(b4.cascadeAt - b4.igniteAt - 2.2) < 0.1,
+      `Δbeat=${(b4.cascadeAt - b4.igniteAt).toFixed(2)} s (want 2.2)`);
+
+    /* 3. the wave travels ring by ring: pick two scheduled rings —
+     *    A = first instance ≥ 60 m from the plaza, B = first instance
+     *    ≥ 100 m beyond A. The two front-pass moments are sampled
+     *    INSIDE their waits (predicate side-effect): A lit while B
+     *    is still ahead-dim (exactly 1.0), then B lit while A still
+     *    holds (front travelled A → B at the speed). */
+    const rings = await page.evaluate(() => {
+      const W = window.SIM.WORLD;
+      let dA = -1, dB = -1;
+      for (const ch of W.chunks.values()) {
+        if (!ch.group.visible) continue;
+        for (const b of [ch.ledWin, ch.sign]) {
+          for (let i = 0; i < b.count; i++) {
+            const d = b.pars[i].d;
+            if (dA < 0 && d >= 60) dA = d;
+            if (dA >= 0 && dB < 0 && d >= dA + 100) dB = d;
+          }
+        }
+        if (dB >= 0) break;
+      }
+      return { dA, dB };
+    });
+    const ringPass = tag => page.waitForFunction(
+      ({ dA, dB, width, tag }) => {
+        const W = window.SIM.WORLD;
+        const wv = window.SIM.CFG.entity.beats.cascade.wave;
+        if (!W._waveActive) return false;
+        const r = (performance.now() / 1000 - W._waveT0) * wv.speed;
+        if (r < (tag === 'g1' ? dA : dB) + width) return false;
+        let a = -1, b = -1, aheadDim = true, aheadN = 0;
+        for (const ch of W.chunks.values()) {
+          if (!ch.group.visible) continue;
+          for (const bb of [ch.ledWin, ch.sign]) {
+            const arr = bb.mesh.instanceColor.array;
+            for (let i = 0; i < bb.count; i++) {
+              const p = bb.pars[i];
+              const v = arr[i * 3];
+              if (a < 0 && Math.abs(p.d - dA) < 0.5) a = v;
+              if (b < 0 && dB > 0 && Math.abs(p.d - dB) < 0.5) b = v;
+              if (v <= 1.01 && p.d > r + width) {
+                if (v !== 1) aheadDim = false;
+                aheadN++;
+              }
+            }
+          }
+        }
+        window['__m94' + tag] = { a, b, r, aheadDim, aheadN };
+        return true;
+      },
+      { dA: rings.dA, dB: rings.dB, width: B.wave.width, tag },
+      { timeout: 15000 });
+    const ringWait1 = ringPass('g1');
+    const ringWait2 = ringPass('g2');
+    const beat5Wait = page.waitForFunction(() => {
+      const S = window.SIM, T = S.TRAFFIC;
+      if (!S.ENTITY._trafficFired) return false;
+      /* snapshot every live vehicle's avoidT at the fire moment —
+       * all of them must have received the full avoidance */
+      if (!window.__m94av0)
+        window.__m94av0 =
+          T._vLive.slice(0, T.vcount).map(it => it.avoidT);
+      return true;
+    }, { timeout: 20000 });
+    await ringWait1;
+    await ringWait2;
+    const g1 = await page.evaluate(() => window.__m94g1);
+    const g2 = await page.evaluate(() => window.__m94g2);
+    check('M9.4: beat 4 — the wave lights the city ring by ring (A lit ⇒ B lit, ahead dim)',
+      rings.dA > 0 && rings.dB > 0 && g1 && g2 &&
+      g1.a > 1.5 && g1.b === 1 && g1.aheadDim && g1.aheadN > 0 &&
+      g2.a > 1.5 && g2.b > 1.5 &&
+      /* each wait fires within one rAF poll of its threshold — the
+       * front moves 165 m/s, so g1's recorded r can overshoot its
+       * threshold by up to a poll interval; 10 m covers two slow
+       * (30 fps) frames while still proving the front travelled A→B */
+      g2.r > g1.r + (rings.dB - rings.dA) - 10,
+      `ringA d=${rings.dA.toFixed(0)} m: ${g1 && g1.a.toFixed(2)} → ${g2 && g2.a.toFixed(2)},`
+      + ` ringB d=${rings.dB.toFixed(0)} m: ${g1 && g1.b.toFixed(2)} → ${g2 && g2.b.toFixed(2)},`
+      + ` front r ${g1 && g1.r.toFixed(0)} → ${g2 && g2.r.toFixed(0)} m`);
+
+    /* 4. beat 5 (u ≥ 3.2 s): the traffic cascade fires —
+     *    __m94av0 (snapshotted at the fire moment) must show every
+     *    live vehicle receiving the full avoidance */
+    const steamBefore = await page.evaluate(
+      () => window.SIM.PARTS.scount);
+    await beat5Wait;
+    const b5 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, T = S.TRAFFIC;
+      let nScatter = 0, nEscort = 0;
+      for (let i = 0; i < T.count; i++) {
+        if (T._live[i].state === 3) nScatter++;
+        if (T._live[i].state === 4) nEscort++;
+      }
+      let avoidN = 0;
+      for (let i = 0; i < T.vcount; i++)
+        if (T._vLive[i].avoidT > 0) avoidN++;
+      let bolts = 0;
+      for (let i = 0; i < 3; i++)
+        if (T._arcIt[i]) bolts++;
+      /* tag the cascaded drones so the later scan can verify
+       * per-drone monotonicity (the mean over a shrinking set is
+       * not monotonic — completers drop out) */
+      for (let i = 0; i < T.count; i++) {
+        const it = T._live[i];
+        if (it.state === 3)
+          it._m94d0 = Math.hypot(it.px, it.pz);
+        if (it.state === 4)
+          it._m94t0 = Math.hypot(it.px - it.rx, it.py - it.ry,
+            it.pz - it.rz);
+      }
+      return {
+        nScatter, nEscort, drones: T.count,
+        avoidN, vehicles: T.vcount,
+        av0: window.__m94av0 ? window.__m94av0.length : -1,
+        av0Full: window.__m94av0
+          ? window.__m94av0.every(t => t > 3.9)
+          : false,
+        arcQ: T._arcQ, bolts,
+        steam: S.PARTS.scount,
+        trafficAt: E._beatAt.traffic,
+        igniteAt: E._beatAt.ignite,
+      };
+    });
+    check('M9.4: beat 5 — traffic cascade fires (scatter + escort roles, vehicle offsets, bolts queued)',
+      b5.nScatter >= 1 && b5.nEscort >= 1 &&
+      b5.av0 > 0 && b5.av0Full &&
+      b5.avoidN >= 1 && b5.avoidN <= b5.vehicles &&
+      b5.bolts >= 1 && b5.steam >= steamBefore - 2 && b5.steam <= 48 &&
+      Math.abs(b5.trafficAt - b5.igniteAt - 3.2) < 0.1,
+      `scatter=${b5.nScatter}, escort=${b5.nEscort} (of ${b5.drones}),`
+      + ` at-fire vehicles=${b5.av0} (all full),`
+      + ` live avoiding=${b5.avoidN}/${b5.vehicles}, bolts=${b5.bolts},`
+      + ` steam ${steamBefore} → ${b5.steam},`
+      + ` Δbeat=${(b5.trafficAt - b5.igniteAt).toFixed(2)} s (want 3.2)`);
+
+    /* 5. substation bolts fire (first within a frame, second at
+     *    +arcStagger) */
+    await sleep(300);
+    const a1 = await page.evaluate(() => window.SIM.FX.arcCount);
+    await sleep(300);
+    const a2 = await page.evaluate(() => window.SIM.FX.arcCount);
+    check('M9.4: beat 5 — substation bolts fire (live arcs observed)',
+      a1 >= 1 && a2 >= 1, `arcCount ${a1} → ${a2}`);
+
+    /* 6. drones: per-drone monotonicity — every scatter drone is at
+     *    least as far out as when tagged (radial outward paths), some
+     *    have moved ≥ 1 m; every escort is no farther from its hover
+     *    target than when tagged (straight approach), some closed
+     *    ≥ 1 m. (The mean over the shrinking in-flight set is not
+     *    monotonic — completers drop out.) */
+    const droneScan = () => page.evaluate(() => {
+      const T = window.SIM.TRAFFIC;
+      let n3 = 0, moved = 0, mono3 = true, n4 = 0, mono4 = true, close = 0;
+      for (let i = 0; i < T.count; i++) {
+        const it = T._live[i];
+        if (it.state === 3 && it._m94d0 !== undefined) {
+          n3++;
+          const d = Math.hypot(it.px, it.pz);
+          if (d < it._m94d0 - 0.01) mono3 = false;
+          if (d > it._m94d0 + 1) moved++;
+        }
+        if (it.state === 4 && it._m94t0 !== undefined) {
+          n4++;
+          const d = Math.hypot(it.px - it.rx, it.py - it.ry, it.pz - it.rz);
+          if (d > it._m94t0 + 0.01) mono4 = false;
+          if (it._m94t0 - d > 1) close++;
+        }
+      }
+      return { n3, moved, mono3, n4, mono4, close };
+    });
+    const s1 = await droneScan();
+    await sleep(600);
+    const s2 = await droneScan();
+    check('M9.4: beat 5 — drones scatter outward, escorts fly to the hover ring',
+      s1.n3 > 0 && s1.n4 > 0 &&
+      s2.mono3 && s2.n3 > 0 && s2.moved >= 1 &&
+      s2.mono4 && s2.n4 > 0 && s2.close >= 1,
+      `scatter tagged=${s1.n3} (mono=${s2.mono3 ? 'ok' : 'BROKEN'}, moved=${s2.moved}),`
+      + ` escort tagged=${s1.n4} (mono=${s2.mono4 ? 'ok' : 'BROKEN'}, closed=${s2.close})`);
+
+    /* 7. vehicle avoidance: per-vehicle invariant — a vehicle still
+     *    avoiding (av > 0) renders its eased offset (lateral ≈ ox·av
+     *    within one lane step, altitude exact); a vehicle at rest
+     *    (av = 0 — incl. ones respawned after the fire) renders
+     *    exactly on its lane. No fire-moment tag needed. */
+    const v1 = await page.evaluate(() => {
+      const T = window.SIM.TRAFFIC;
+      let ok = true, avoiding = 0, maxAv = 0;
+      for (let i = 0; i < T.vcount; i++) {
+        const it = T._vLive[i];
+        T.vmesh.getMatrixAt(i, T._vm);   /* fills T._vm (no return) */
+        const e = T._vm.elements;
+        /* the matrix was composed last frame — one lane step (~0.7 m
+         * at 26–44 m/s) of slack on the lateral axis; altitude is
+         * analytic (py never moves) ⇒ exact */
+        const lat = it.axis === 0 ? e[12] - it.px : e[14] - it.pz;
+        if (it.av > 0) {
+          avoiding++;
+          maxAv = Math.max(maxAv, it.av);
+          if (it.av < 1) ok = false;
+          if (Math.abs(Math.abs(lat) - Math.abs(it.ox)) > 1.0)
+            ok = false;
+          if (Math.abs(e[13] - (it.py + it.oalt * it.av)) > 0.01)
+            ok = false;
+        } else if (Math.abs(lat) > 1.0 || e[13] - it.py !== 0)
+          ok = false;
+      }
+      return { ok, n: T.vcount, avoiding, maxAv };
+    });
+    check('M9.4: beat 5 — vehicles take avoidance offsets (ramped, rendered off-lane)',
+      v1.ok && v1.n > 0 && v1.avoiding >= 1 && v1.maxAv === 1,
+      `vehicles=${v1.n}, avoiding=${v1.avoiding},`
+      + ` av=${v1.maxAv.toFixed(2)}`);
+
+    /* 8. heap flat across the cascade (window ends here — before the
+     *     teardown / re-trigger, as in M9.3; the visual gate's
+     *     screenshot decodes below are harness cost, sampled after)
+     *    */
+    const ha = await heapMin();
+    check('M9.4: no allocation per frame (heap flat across the full cascade)',
+      hb > 0 && ha > 0 && ha - hb <= 2 * 1024 * 1024,
+      `before=${Math.round(hb / 1024)}KB, after=${Math.round(ha / 1024)}KB`);
+
+    /* 9. visual gate: same street pose — off = wave colors restored
+     *    to 1.0, on = the wave in flight. The wavefront is pinned to
+     *    400 m for the pair (near + mid city fully lit, independent
+     *    of the section clock), then _waveT0 is restored. The region
+     *    is anchored on a LIT instance that projects into the frame
+     *    (the LED facade / holo sign the front lit — the wave lights
+     *    the city at street level, not the sky region above the
+     *    creature); 12 nearest-to-camera candidates are scored and
+     *    the best region wins, so occluded candidates (Δ ≈ 0) can
+     *    never hide a visible one.
+     *    shots/m94-city-cascade.png */
+    const t0save = await page.evaluate(() => {
+      const W = window.SIM.WORLD;
+      const save = W._waveT0;
+      W._waveT0 = performance.now() / 1000 - 400 /
+        window.SIM.CFG.entity.beats.cascade.wave.speed;
+      return save;
+    });
+    await page.evaluate(
+      () => { window.SIM.WORLD._waveActive = true; });
+    await sleep(150);
+    const cands = await page.evaluate(() => {
+      const S = window.SIM, W = S.WORLD, C = S.CAMERA.pos;
+      const out = [];
+      for (const ch of W.chunks.values()) {
+        if (!ch.group.visible) continue;
+        for (const b of [ch.sign, ch.ledWin]) {
+          const arr = b.mesh.instanceColor.array;
+          for (let i = 0; i < b.count; i++) {
+            if (arr[i * 3] <= 1.5) continue;
+            const p = b.pars[i];
+            /* the LED facade mesh sits `off` along the face normal
+             * from the building center — anchor on the facade itself
+             * (signs are already at their own position) */
+            const ax = p.fx !== undefined ? p.fx : p.x,
+              az = p.fz !== undefined ? p.fz : p.z;
+            /* project() does not reject behind-camera points (a
+             * perspective divide mirrors them into a valid NDC) —
+             * the camera-space z does */
+            const me = S.camera.matrixWorldInverse.elements;
+            const cz = me[2] * ax + me[6] * p.y + me[10] * az + me[14];
+            if (cz >= 0) continue;
+            const pr = S.project(ax, p.y, az);
+            if (pr.x < -0.6 || pr.x > 0.6 || pr.y < -0.6 || pr.y > 0.6)
+              continue;
+            /* nearest to the camera = largest on screen = the
+             * strongest signal for the region mean */
+            const dx = ax - C.x, dy = p.y - C.y, dz = az - C.z;
+            out.push({
+              d: dx * dx + dy * dy + dz * dz,
+              x: (pr.x + 1) / 2 * window.innerWidth,
+              y: (1 - pr.y) / 2 * window.innerHeight,
+            });
+          }
+        }
+      }
+      out.sort((a, b2) => a.d - b2.d);
+      return out.slice(0, 20);
+    });
+    if (cands.length === 0)
+      throw new Error(
+        'M9.4 visual gate: no lit LED/sign instance projects into the frame');
+    /* freeze the LED/sign canvas textures so the off/on pair compares the
+     * wave against a CONSTANT facade texture (the 15 Hz LED flicker/scanline
+     * and 8 Hz sign flicker otherwise animate between the two shots and
+     * confound the brightness delta). Restored right after the pair. */
+    await page.evaluate(() => {
+      const K = window.SIM.KIT;
+      const fixedT = window.SIM.WORLD._simU ? window.SIM.WORLD._simU() : 0;
+      window.__m94unfreeze = [];
+      for (const key of ['ledA', 'ledB', 'signQwen', 'signUnsloth']) {
+        const T = K.tex[key];
+        if (!T) continue;
+        const orig = T.redraw;
+        orig.call(T, fixedT);
+        T.redraw = u => orig.call(T, fixedT);
+        window.__m94unfreeze.push(() => { T.redraw = orig; });
+      }
+    });
+    /* off pair: wave off (every color restored to exactly 1.0) */
+    const offB64 = [];
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(() => {
+        const W = window.SIM.WORLD;
+        W._waveActive = false;
+        W._waveRestore();
+      });
+      await sleep(150);
+      offB64.push((await page.screenshot()).toString('base64'));
+    }
+    /* on pair: the wave in flight (front pinned to 400 m) */
+    const onB64 = [];
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(
+        () => { window.SIM.WORLD._waveActive = true; });
+      await sleep(150);
+      onB64.push((await page.screenshot(
+        { path: `${here}/shots/m94-city-cascade.png` }))
+        .toString('base64'));
+    }
+    await page.evaluate(t0 => {
+      window.SIM.WORLD._waveT0 = t0;
+    }, t0save);
+    /* restore the animated LED/sign textures now that the pair is captured */
+    await page.evaluate(() => {
+      (window.__m94unfreeze || []).forEach(f => f());
+      window.__m94unfreeze = null;
+    });
+    /* the anchored lit facades light a small region each (±8 % of the half-res
+     * frame); the SUM over all candidates is used (not the best) so that
+     * occluded candidates (Δ ≈ 0) and per-facade LED-cell flicker average out
+     * — the city as a whole must measurably brighten when the wave is on */
+    const vreg = await page.evaluate(async ({ cands, offB64, onB64 }) => {
+      const decode = b64 => new Promise(res2 => {
+        const img = new Image();
+        img.onload = () => {
+          const c = document.createElement('canvas');
+          /* half-res decode — the region mean is resolution-invariant
+           * and keeps the transient canvas buffer small */
+          c.width = Math.floor(img.width / 2);
+          c.height = Math.floor(img.height / 2);
+          const ctx = c.getContext('2d');
+          ctx.drawImage(img, 0, 0, c.width, c.height);
+          res2(ctx);
+        };
+        img.src = 'data:image/png;base64,' + b64;
+      });
+      const mean = (ctx, cx, cy) => {
+        const hw = Math.floor(ctx.canvas.width * 0.08) / 2;
+        const hh = Math.floor(ctx.canvas.height * 0.08) / 2;
+        const x0 = Math.max(0, Math.round(cx - hw));
+        const y0 = Math.max(0, Math.round(cy - hh));
+        const x1 = Math.min(ctx.canvas.width, Math.round(cx + hw));
+        const y1 = Math.min(ctx.canvas.height, Math.round(cy + hh));
+        const d = ctx.getImageData(x0, y0, x1 - x0, y1 - y0).data;
+        let sum = 0;
+        for (let i = 0; i < d.length; i += 4)
+          sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+        return sum / (d.length / 4);
+      };
+      const offCtx = [await decode(offB64[0]), await decode(offB64[1])];
+      const onCtx = [await decode(onB64[0]), await decode(onB64[1])];
+      let sum = 0, best = 0, bestC = -1;
+      for (let k = 0; k < cands.length; k++) {
+        const cx = cands[k].x / 2, cy = cands[k].y / 2;
+        const on = (mean(onCtx[0], cx, cy) + mean(onCtx[1], cx, cy)) / 2;
+        const off = (mean(offCtx[0], cx, cy) + mean(offCtx[1], cx, cy)) / 2;
+        const d = on - off;
+        sum += d;
+        if (d > best) { best = d; bestC = k; }
+      }
+      return { sum, best, bestC, n: cands.length };
+    }, { cands, offB64, onB64 });
+    check('M9.4: cascade visible on screen (shots/m94-city-cascade.png) — wave lights the city region',
+      fs.existsSync(`${here}/shots/m94-city-cascade.png`) && vreg.sum > 0.25,
+      `${vreg.n} candidates: Σ region Δ ${vreg.sum.toFixed(2)} (best cand ${vreg.bestC} Δ ${vreg.best.toFixed(2)})`);
+
+    /* 10. force AWAKE → DECAY → DORMANT: the cascade tears down —
+     *    colors byte-exact, the plaza pulse dropped mid-life, live
+     *    bolts dropped, drone roles cleared, offsets easing out */
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 - E._awakeDur - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DECAY', { timeout: 5000 });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.decay - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    const d1 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, T = S.TRAFFIC, W = S.WORLD;
+      let colors = true;
+      for (const ch of W.chunks.values()) {
+        for (const b of [ch.sign, ch.ledWin]) {
+          if (b.count === 0 || !b.mesh.instanceColor) continue;
+          const a = b.mesh.instanceColor.array;
+          for (let i = 0; i < b.count * 3; i++)
+            if (a[i] !== 1) { colors = false; break; }
+        }
+      }
+      let roles = 0;
+      for (let i = 0; i < T.count; i++)
+        if (T._live[i].state === 3 || T._live[i].state === 4) roles++;
+      let maxAv = 0;
+      for (let i = 0; i < T.vcount; i++)
+        maxAv = Math.max(maxAv, T._vLive[i].av);
+      const vis = [];
+      S.scene.traverse(o => {
+        if (o.isMesh || o.isPoints || o.isLine) {
+          let v = true;
+          for (let p = o; p; p = p.parent) v = v && p.visible;
+          if (v) vis.push(o.name || o.type);
+        }
+      });
+      vis.sort();
+      return {
+        colors, wave: W._waveActive, roles, maxAv,
+        fx: S.FX.count, arcs: S.FX.arcCount, arcQ: T._arcQ,
+        pulseIt: E._pulseIt,
+        hero: E._hero.intensity,
+        calls: S.renderer.info.render.calls,
+        vis,
+      };
+    });
+    const visSame = JSON.stringify(d1.vis) ===
+      JSON.stringify(visBase.vis);
+    check('M9.4: cascade tears down at DORMANT — colors byte-exact, pulse/bolts dropped, roles cleared, visible set back to baseline',
+      d1.colors && !d1.wave && d1.roles === 0 && d1.fx === 0 &&
+      d1.arcs === 0 && d1.arcQ === 0 && d1.pulseIt === null &&
+      d1.hero >= 0.9 - 1e-6 && d1.hero <= 1.2 + 1e-6 && visSame,
+      `hero=${d1.hero.toFixed(2)}, calls=${d1.calls}` +
+      ` (baseline ${visBase.calls}), fx=${d1.fx}, arcs=${d1.arcs},`
+      + ` maxAv=${d1.maxAv.toFixed(2)}` +
+      ` (visible set ${visSame ? 'identical' : 'DIFFERS'})`);
+
+    /* 11. the vehicle offsets ease out to exactly 0 — hulls back on
+     *     their analytic lanes */
+    await page.waitForFunction(() => {
+      const T = window.SIM.TRAFFIC;
+      if (T.vcount === 0) return false;
+      for (let i = 0; i < T.vcount; i++)
+        if (T._vLive[i].av > 0) return false;
+      return true;
+    }, { timeout: 4000 });
+    const v2 = await page.evaluate(() => {
+      const T = window.SIM.TRAFFIC;
+      let ok = true;
+      for (let i = 0; i < T.vcount; i++) {
+        const it = T._vLive[i];
+        T.vmesh.getMatrixAt(i, T._vm);   /* fills T._vm (no return) */
+        const e = T._vm.elements;
+        /* last-frame slack on the lane axis only; altitude exact —
+         * a leftover offset would leave ≥ 5 m of altitude */
+        const lat = it.axis === 0 ? e[12] - it.px : e[14] - it.pz;
+        if (Math.abs(lat) > 1.0) ok = false;
+        if (Math.abs(e[13] - it.py) > 0.01) ok = false;
+      }
+      return ok;
+    });
+    check('M9.4: vehicle avoidance offsets ease out to exactly 0 (hulls back on their lanes)',
+      v2);
+
+    /* 12. re-trigger re-arms the cascade: STIR again, cascade idle,
+     *     and a second full forced cycle re-fires + resolves clean
+     *     (re-trigger safe) */
+    await page.evaluate(() => window.SIM.ENTITY.wake());
+    const r1 = await page.evaluate(() => {
+      const E = window.SIM.ENTITY, W = window.SIM.WORLD;
+      return {
+        state: E.state,
+        cascade: E._cascadeFired,
+        traffic: E._trafficFired,
+        pulseIt: E._pulseIt,
+        wave: W._waveActive,
+        count: E._wakeCount,
+      };
+    });
+    check('M9.4: re-trigger re-arms the cascade (STIR again, cascade idle)',
+      r1.state === 'STIR' && !r1.cascade && !r1.traffic &&
+      r1.pulseIt === null && !r1.wave && r1.count === 6,
+      `count=${r1.count}`);
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.stir - 0.05;
+    });
+    await page.waitForFunction(() => {
+      const E = window.SIM.ENTITY;
+      return E.state === 'AWAKE' &&
+        E._cascadeFired && E._trafficFired;
+    }, { timeout: 8000 });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 - E._awakeDur - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DECAY', { timeout: 5000 });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.decay - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    const r2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, T = S.TRAFFIC, W = S.WORLD;
+      let colors = true;
+      for (const ch of W.chunks.values()) {
+        for (const b of [ch.sign, ch.ledWin]) {
+          if (b.count === 0 || !b.mesh.instanceColor) continue;
+          const a = b.mesh.instanceColor.array;
+          for (let i = 0; i < b.count * 3; i++)
+            if (a[i] !== 1) { colors = false; break; }
+        }
+      }
+      let roles = 0;
+      for (let i = 0; i < T.count; i++)
+        if (T._live[i].state === 3 || T._live[i].state === 4) roles++;
+      return {
+        colors, wave: W._waveActive, roles,
+        fx: S.FX.count, arcs: S.FX.arcCount, arcQ: T._arcQ,
+        count: E._wakeCount,
+      };
+    });
+    check('M9.4: second full cycle — cascade re-fires and resolves clean (re-trigger safe)',
+      r2.count === 6 && r2.colors && !r2.wave && r2.roles === 0 &&
+      r2.fx === 0 && r2.arcs === 0 && r2.arcQ === 0,
+      `count=${r2.count}, fx=${r2.fx}, arcs=${r2.arcs}`);
+
+    /* cleanup: park the dream wave + lightning, reset the spawn pose */
+    await page.evaluate(() => {
+      const S = window.SIM;
       S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
       const C = S.CAMERA;
       C.pos.set(0, 4, 18);

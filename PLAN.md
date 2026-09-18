@@ -67,7 +67,7 @@ smoke-test evidence.
 | **M9.1** ✅ | Idle/dormant animation: tensor-ring rotation, antenna sway, breathing core, periodic "dream" LED wave across the node grid (instance-color waves) | Dream wave sweeps the node grid visibly; dormant state stays dim and still-ish |
 | **M9.2** ✅ | Wake state machine: DORMANT → STIR (2 s head lift, jaw, rings speed up) → AWAKE (10–20 s) → DECAY → DORMANT, with per-state hooks | State machine smoke test: forced transitions in order, clean return to DORMANT, re-trigger safe |
 | **M9.3** ✅ | Awakening beats 1–3: core-eye flare (emissive ramp + light + flash), node voxels ignite in radial waves, rings accelerate + limbs reposition (shake impulse) | Beats 1–3 play in sequence with correct timing on manual trigger |
-| **M9.4** | Awakening beats 4–5: energy pulse ring from plaza + city holo-signs/LEDs following the wave (per-ring scheduled ramps), substation arcs fire, steam bursts, drones scatter/re-route, vehicles avoid | The "thousands of compute nodes illuminate" moment lands; wave visibly travels ring by ring |
+| **M9.4** ✅ | Awakening beats 4–5: energy pulse ring from plaza + city holo-signs/LEDs following the wave (per-ring scheduled ramps), substation arcs fire, steam bursts, drones scatter/re-route, vehicles avoid | The "thousands of compute nodes illuminate" moment lands; wave visibly travels ring by ring |
 | **M9.5** | Awakening beats 6–7 + decay: easter-egg reaction hook (M10), waves dim outward, hum settles, final pulse | Full sequence ends back in DORMANT with one final pulse; re-trigger immediately works |
 | **M9.6** | Triggers: manual key (`F`) + HUD button, auto-play once ~30 s after intro | All three entry paths (key, button, auto) start the same sequence exactly once |
 | **M10.1** | Voxel neon **sloth** monument atop one compute tower on a side avenue + rooftop "UNSLOTH" holo sign with cycling taglines ("local ≠ slow" / "why rush?") | Monument + sign readable from street; sign cycles; outside default intro framing |
@@ -656,10 +656,10 @@ lightning event visible from inside the city.
 - **Commit when:** beats 1–3 verified.
 
 #### M9.4 — Awakening beats 4–5 (city-level cascade)
-- [ ] Beat 4: energy pulse ring launches from the plaza; city holo-signs
+- [x] Beat 4: energy pulse ring launches from the plaza; city holo-signs
       and building LEDs follow the wave (scheduled per-ring color ramps —
       the "thousands of compute nodes illuminate" moment).
-- [ ] Beat 5: substation arcs fire; steam vents burst; drones scatter and
+- [x] Beat 5: substation arcs fire; steam vents burst; drones scatter and
       some re-route to the creature; sky vehicles change to avoidance
       paths.
 - **Test:** wave visibly travels ring by ring; traffic reacts (scatter /
