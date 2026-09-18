@@ -58,6 +58,31 @@
     pointer-events: none;
   }
   #hint.on { opacity: 1; }
+  /* ---- M9.6: awaken button (bottom-right, HUD entry point) ---- */
+  #awakeBtn {
+    position: absolute;
+    right: 10px;
+    bottom: 10px;
+    pointer-events: auto;
+    padding: 8px 16px;
+    font-family: inherit;
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    text-indent: 0.2em;
+    color: #bff2ff;
+    background: rgba(0, 40, 70, 0.35);
+    border: 1px solid rgba(110, 210, 255, 0.45);
+    border-radius: 2px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.4s ease, background 0.2s ease,
+      box-shadow 0.2s ease;
+  }
+  #awakeBtn.on { opacity: 1; }
+  #awakeBtn:hover {
+    background: rgba(0, 70, 110, 0.45);
+    box-shadow: 0 0 18px rgba(0, 190, 255, 0.4);
+  }
   /* ---- Boot overlay: title + START button (audio unlock gate) ---- */
   #overlay {
     position: absolute;
@@ -157,6 +182,7 @@
 <div class="ui">
   <div id="hud" aria-live="off"></div>
   <div id="hint"></div>
+  <button id="awakeBtn" type="button">&#9889; AWAKEN&nbsp;[F]</button>
   <div id="overlay">
     <div class="title">QWEN FLASH // AWAKENING</div>
     <div class="subtitle">VOXEL DATACENTER CITY &middot; SIMULATION BUILD</div>
@@ -298,6 +324,11 @@ const CFG = {
       headRise: 0.8,       // m — head position lift at full wake
       jawOpen: 0.22,       // rad — jaw drop at full wake
       ringBoost: 8,        // ring speed multiplier at full wake
+    },
+    /* M9.6: triggers — manual (F key / HUD button) + one-shot auto for
+     * the audience that presses nothing. */
+    trigger: {
+      auto: 30,              // s after intro end (BOOT.t0) until auto-awaken
     },
     /* M9.3: awakening beats 1–3 (creature-level power). Beat 1 ramps
      * with wakeP over STIR and fires its flash at the STIR→AWAKE peak;
@@ -649,16 +680,19 @@ const BOOT = {
   state: 'LOADER',          // LOADER | RUNNING | ERROR
   started: false,
   frames: 0,
+  t0: 0,                    // s: RUNNING entry time — intro-end anchor (M9.6)
 
   enter(next) {
     if (BOOT.started && next === 'RUNNING') return;   // no double-init
     BOOT.state = next;
     if (next === 'RUNNING') {
       BOOT.started = true;
+      BOOT.t0 = performance.now() / 1000; // M9.6: intro-end anchor
       AUDIO.unlock();                       // audio gate (user gesture)
       document.getElementById('overlay').classList.add('hide');
       document.getElementById('hud').classList.add('on');
       document.getElementById('hint').classList.add('on');
+      document.getElementById('awakeBtn').classList.add('on');
       lastNow = performance.now();
       requestAnimationFrame(frame);        // one and only one loop
     }
@@ -773,6 +807,7 @@ const INPUT = {
   flashTrigger: false,        // B edge — dev trigger: FX.flash (screen flash)
   shakeTrigger: false,        // N edge — dev trigger: CAMERA.shake impulse
   lightningTrigger: false,    // L edge — distant lightning event (M8.4)
+  wakeTrigger: false,         // F edge — manual awaken trigger (M9.6)
 
   pad: {
     connected: false,
@@ -793,6 +828,7 @@ const INPUT = {
       if (e.code === 'KeyB' && !e.repeat) INPUT.flashTrigger = true;
       if (e.code === 'KeyN' && !e.repeat) INPUT.shakeTrigger = true;
       if (e.code === 'KeyL' && !e.repeat) INPUT.lightningTrigger = true;
+      if (e.code === 'KeyF' && !e.repeat) INPUT.wakeTrigger = true;
       INPUT.keys.add(e.code);
       if (e.code === 'Space') e.preventDefault();
     });
@@ -4921,6 +4957,15 @@ const ENTITY = {
       (CFG.entity.wake.decay * CFG.entity.beats.decayDim.at);
     ENTITY._eggReact = [];
 
+    /* M9.6: trigger state — the one-shot auto fires `trigger.auto` s
+     * after intro end (BOOT.t0) for the audience that presses nothing:
+     * it is skipped when the user already triggered (F key / HUD
+     * button) and never re-fires after burning. `_autoAt` is lazily
+     * computed at RUNNING; smoke parks it directly. */
+    ENTITY._userTriggered = false;
+    ENTITY._autoFired = false;
+    ENTITY._autoAt = null;
+
     /* M9.3: awakening beats 1–3 — pre-allocated scratch (zero per-frame
      * allocation). Beat 3 tilts each ring group by baseQ × tiltQ(level)
      * along a fixed per-ring direction; the level is 0 in DORMANT ⇒
@@ -5138,6 +5183,26 @@ const ENTITY = {
   },
 
   update(dt, t) {
+    /* M9.6: triggers — manual: F key edge (INPUT) + HUD button (wired
+     * in HUD.init); both route through ENTITY.wake(), which is a
+     * no-op unless DORMANT (re-press mid-sequence never re-triggers).
+     * Auto: fires exactly once, `trigger.auto` s after intro end
+     * (BOOT.t0 — M12's intro replaces that anchor), and skips when the
+     * user already triggered (the auto is for the audience that
+     * presses nothing). */
+    if (INPUT.wakeTrigger) {
+      INPUT.wakeTrigger = false;
+      ENTITY._userTriggered = true;
+      ENTITY.wake();
+    }
+    if (!ENTITY._autoFired) {
+      if (ENTITY._autoAt === null && BOOT.t0 > 0)
+        ENTITY._autoAt = BOOT.t0 + CFG.entity.trigger.auto;
+      if (t >= ENTITY._autoAt) {
+        ENTITY._autoFired = true;
+        if (!ENTITY._userTriggered) ENTITY.wake();
+      }
+    }
     /* wake state machine (M9.2): DORMANT → STIR (2 s) → AWAKE (10–20 s)
      * → DECAY (3 s) → DORMANT. wakeP is the 0..1 pose level: smoothstep
      * up in STIR, 1 in AWAKE, smoothstep down in DECAY, 0 in DORMANT
@@ -5963,7 +6028,18 @@ const HUD = {
     HUD.hintEl.textContent =
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
       'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
-      'P particles · R pulse · T arcs · B flash · N shake · L lightning';
+      'P particles · R pulse · T arcs · B flash · N shake · L lightning\n' +
+      'F awaken';
+    /* M9.6: HUD awaken button — same entry as the F key: the manual
+     * trigger path routes through ENTITY.wake() (no-op unless DORMANT)
+     * and marks the session user-triggered so the one-shot auto skips. */
+    const btn = document.getElementById('awakeBtn');
+    HUD.btnEl = btn;
+    btn.addEventListener('click', () => {
+      if (BOOT.state !== 'RUNNING') return;
+      ENTITY._userTriggered = true;
+      ENTITY.wake();
+    });
   },
 
   update(dt) {

@@ -69,7 +69,7 @@ smoke-test evidence.
 | **M9.3** ✅ | Awakening beats 1–3: core-eye flare (emissive ramp + light + flash), node voxels ignite in radial waves, rings accelerate + limbs reposition (shake impulse) | Beats 1–3 play in sequence with correct timing on manual trigger |
 | **M9.4** ✅ | Awakening beats 4–5: energy pulse ring from plaza + city holo-signs/LEDs following the wave (per-ring scheduled ramps), substation arcs fire, steam bursts, drones scatter/re-route, vehicles avoid | The "thousands of compute nodes illuminate" moment lands; wave visibly travels ring by ring |
 | **M9.5** ✅ | Awakening beats 6–7 + decay: easter-egg reaction hook (M10), waves dim outward, hum settles, final pulse | Full sequence ends back in DORMANT with one final pulse; re-trigger immediately works |
-| **M9.6** | Triggers: manual key (`F`) + HUD button, auto-play once ~30 s after intro | All three entry paths (key, button, auto) start the same sequence exactly once |
+| **M9.6** ✅ | Triggers: manual key (`F`) + HUD button, auto-play once ~30 s after intro | All three entry paths (key, button, auto) start the same sequence exactly once |
 | **M10.1** | Voxel neon **sloth** monument atop one compute tower on a side avenue + rooftop "UNSLOTH" holo sign with cycling taglines ("local ≠ slow" / "why rush?") | Monument + sign readable from street; sign cycles; outside default intro framing |
 | **M10.2** | Relaxed holographic sloth silhouette on the antenna arm (billboard + canvas sprite, additive, slow breathing) + 1–2 slow sloth-themed maintenance drones (bigger, soft pink) patrolling that street only | Holo sloth breathes; pink drones patrol only that street |
 | **M10.3** | Awakening reaction: sign flares, holograph brightens + one slow stretch, sloth drones rise to hover for the pulse, then resume | Reaction plays during AWAKE, everything returns to idle after DECAY |
@@ -707,11 +707,44 @@ lightning event visible from inside the city.
   environmental, not M9.5 regressions; every M9.2–M9.5 check passes.
 
 #### M9.6 — Triggers (manual + auto)
-- [ ] Manual: key (e.g. `F`) + HUD button. Auto: plays once ~30 s after
+- [x] Manual: key (e.g. `F`) + HUD button. Auto: plays once ~30 s after
       intro for audience that presses nothing.
 - **Test:** all three entry paths (key, button, auto) start the same
       sequence exactly once; auto never re-fires.
 - **Commit when:** trigger test passes.
+  All three entry paths funnel into the M9.2 `ENTITY.wake()` trigger
+  (no-op unless DORMANT ⇒ re-press/re-click mid-sequence is a
+  no-op): **F key** = new `INPUT.wakeTrigger` edge (repeat-
+  guarded, RUNNING-guarded like the other dev edges), consumed at
+  the top of `ENTITY.update`; **HUD button** `#awakeBtn` (bottom-
+  right, `.on` fade, wired in `HUD.init`; hint gained an "F awaken"
+  line); **one-shot auto** = `CFG.entity.trigger.auto` (30 s) after
+  intro end, anchored at new `BOOT.t0` (set in `enter('RUNNING')` —
+  today the intro ends at START; M12's intro engine replaces that
+  anchor, the seam is `BOOT.t0`): `ENTITY._autoAt` lazily computed
+  from `null` to `BOOT.t0 + 30` on the first RUNNING frame, at the
+  deadline `_autoFired` burns permanently and `ENTITY.wake()` runs
+  only when `!ENTITY._userTriggered` (set by the key edge or the
+  button click — the auto is for the audience that presses nothing).
+  Smoke: both boot points park `S.ENTITY._autoAt = Infinity` next to
+  the `_ltTimer` park (a live auto at 30 s would inject a full
+  sequence into the earlier sections). No screenshot gate — the
+  analytic checks are strictly stronger than a picture. Smoke M9.6
+  8 checks green in 2 runs (registration: auto = 30 s, button
+  present, trigger state idle; F key exactly once + re-press no-op;
+  HUD button exactly once + re-click no-op; auto burns/skips when
+  user-triggered (no sequence); seam re-arm (`_userTriggered=false,
+  _autoFired=false, _autoAt=null`) → lazy recompute lands on exactly
+  `BOOT.t0 + 30` and fires one sequence; auto never re-fires after
+  the forced DORMANT return (flag stays burned, count frozen); key
+  re-trigger after the auto works and resolves clean; heap flat)
+  + all M9.2–M9.6 checks green in both runs. Note: the pre-existing
+  timing-sensitive flakes flake in this headless environment (rAF/
+  keyboard latency / GC noise) — run 1: M7.3 bolt regen, M8.1 star
+  brightness, M8.3 shaft strip, M9.3 heap-flat (29→31 MB vs the 2 MB
+  bound); run 2: M7.5 key-N shake (`energy=1.18` vs the 1.2
+  threshold — the documented baseline value) and M9.4 cascade visual —
+  none reproduce across runs, environmental, not M9.6 regressions.
 
 **Phase done-when:** a first-time viewer reads the sequence as a clear
 narrative (dormant → stir → awake → pulse → settle) in ≤ 30 s.

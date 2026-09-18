@@ -385,8 +385,14 @@ try {
   /* M8.4: suppress the auto lightning timer for the whole suite — a
    * live event would add 2 draw calls + hemi/flash bumps into the
    * earlier sections' measurements. The M8.4 section verifies the
-   * timer explicitly (and re-suppresses after the refresh below). */
-  await page.evaluate(() => { window.SIM.ATMOS._ltTimer = 1e9; });
+   * timer explicitly (and re-suppresses after the refresh below).
+   * M9.6: park the one-shot auto-awaken the same way — a live auto
+   * at 30 s would inject a full sequence into the earlier sections.
+   * The M9.6 section verifies it explicitly. */
+  await page.evaluate(() => {
+    window.SIM.ATMOS._ltTimer = 1e9;
+    window.SIM.ENTITY._autoAt = Infinity;
+  });
   await sleep(1500);
   {
     const a = await simState();
@@ -453,8 +459,12 @@ try {
   /* M8.4: suppress the auto lightning timer for the preceding sections
    * (the refresh above re-seeded it) — a live event would add 2 draw
    * calls + a hemi/flash bump into the other sections' measurements.
-   * The M8.4 section verifies the timer explicitly. */
-  await page.evaluate(() => { window.SIM.ATMOS._ltTimer = 1e9; });
+   * The M8.4 section verifies the timer explicitly. M9.6: park the
+   * one-shot auto-awaken again (the refresh above re-armed it). */
+  await page.evaluate(() => {
+    window.SIM.ATMOS._ltTimer = 1e9;
+    window.SIM.ENTITY._autoAt = Infinity;
+  });
 
   /* ------------------------------------------------------------------
    * M1 — core loop, input, camera foundations
@@ -7001,6 +7011,222 @@ try {
       C.pitch = 0;
     });
     await sleep(250);
+  }
+
+  /* ------------------------------------------------------------------
+   * M9.6 — Triggers: manual key (F) + HUD button + one-shot auto
+   *
+   *  All three entry paths route through ENTITY.wake() and therefore
+   *    start the same state machine exactly once (wake() is a no-op
+   *    unless DORMANT — a re-press / re-click mid-sequence never
+   *    re-triggers). The auto fires once, trigger.auto (30 s) after
+   *    intro end (BOOT.t0), for the session that presses nothing
+   *    (`_userTriggered` gate) and never re-fires after burning.
+   *    Smoke parked `_autoAt` from boot (a live auto at 30 s would
+   *    inject a full sequence into the earlier sections) and steers
+   *    it directly here; transitions are forced by fast-forwarding
+   *    stateT as in M9.2/M9.5.
+   *  No screenshot gate: the analytic checks are strictly stronger
+   *    than a picture.
+   * ------------------------------------------------------------------ */
+  {
+    /* wait out M9.5's final pulses (5 s life) + park the dream wave
+     * and the lightning auto-timer (as in M9.2/M9.3/M9.4/M9.5) */
+    await page.waitForFunction(
+      () => window.SIM.FX.count === 0, { timeout: 12000 });
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      S.ATMOS._ltTimer = 1e9;
+    });
+
+    /* 1. registered: config sane, trigger state idle at DORMANT */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, I = S.INPUT;
+      return {
+        cfg: S.CFG.entity.trigger.auto === 30 &&
+          E._userTriggered === false && E._autoFired === false &&
+          E._autoAt === Infinity && I.wakeTrigger === false,
+        btn: !!document.getElementById('awakeBtn'),
+        state: E.state,
+        count: E._wakeCount,
+      };
+    });
+    check('M9.6: triggers registered — auto = 30 s, HUD button present, trigger state idle at DORMANT',
+      reg.cfg && reg.btn && reg.state === 'DORMANT',
+      `count=${reg.count}`);
+    const count0 = reg.count;
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const hb = await heapMin();
+
+    /* fast-forward the live sequence back to DORMANT (M9.5 pattern)
+     * and wait out the final pulse */
+    const settleDormant = async () => {
+      await page.evaluate(() => {
+        const E = window.SIM.ENTITY;
+        E.stateT = performance.now() / 1000 -
+          window.SIM.CFG.entity.wake.stir - 0.05;
+      });
+      await page.waitForFunction(
+        () => window.SIM.ENTITY.state === 'AWAKE', { timeout: 5000 });
+      await page.evaluate(() => {
+        const E = window.SIM.ENTITY;
+        E.stateT = performance.now() / 1000 - E._awakeDur - 0.05;
+      });
+      await page.waitForFunction(
+        () => window.SIM.ENTITY.state === 'DECAY', { timeout: 5000 });
+      await page.evaluate(() => {
+        const E = window.SIM.ENTITY;
+        E.stateT = performance.now() / 1000 -
+          window.SIM.CFG.entity.wake.decay - 0.05;
+      });
+      await page.waitForFunction(
+        () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+      await page.waitForFunction(
+        () => window.SIM.FX.count === 0, { timeout: 12000 });
+    };
+
+    /* 2. manual key path: F starts the sequence exactly once (the
+     *    edge is consumed, the user-triggered flag is set, and a
+     *    re-press mid-sequence is a no-op — wake() needs DORMANT) */
+    await page.keyboard.press('f');
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'STIR', { timeout: 5000 });
+    const k1 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      return {
+        state: E.state, count: E._wakeCount,
+        user: E._userTriggered, trig: S.INPUT.wakeTrigger,
+      };
+    });
+    await page.keyboard.press('f');   // re-press mid-sequence: no-op
+    await sleep(200);
+    const k1b = await page.evaluate(
+      () => window.SIM.ENTITY._wakeCount);
+    check('M9.6: F key starts the sequence exactly once (re-press mid-sequence is a no-op)',
+      k1.state === 'STIR' && k1.count === count0 + 1 &&
+      k1.user === true && k1.trig === false &&
+      k1b === count0 + 1,
+      `count=${k1.count} (want ${count0 + 1}), re-press=${k1b}`);
+    await settleDormant();
+
+    /* 3. HUD button path: the same sequence exactly once (second
+     *    click mid-sequence is a no-op) */
+    await page.locator('#awakeBtn').click();
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'STIR', { timeout: 5000 });
+    const b1 = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return { state: E.state, count: E._wakeCount };
+    });
+    await page.locator('#awakeBtn').click();  // re-click: no-op
+    await sleep(200);
+    const b1b = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return { state: E.state, count: E._wakeCount };
+    });
+    check('M9.6: HUD button starts the same sequence exactly once (re-click mid-sequence is a no-op)',
+      b1.state === 'STIR' && b1.count === count0 + 2 &&
+      b1b.state === 'STIR' && b1b.count === count0 + 2,
+      `count=${b1.count} (want ${count0 + 2}), re-click=${b1b.count}`);
+    await settleDormant();
+
+    /* 4. the one-shot auto burns (skips) when the user already
+     *    triggered — `_userTriggered` is true from the key test, so
+     *    the deadline passing starts NOTHING, but the shot is gone */
+    await page.evaluate(() => {
+      window.SIM.ENTITY._autoAt = performance.now() / 1000 - 0.05;
+    });
+    await sleep(250);
+    const skip = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return {
+        fired: E._autoFired, state: E.state, count: E._wakeCount,
+      };
+    });
+    check('M9.6: auto skips (and burns) when the user already triggered — no sequence started',
+      skip.fired === true && skip.state === 'DORMANT' &&
+      skip.count === count0 + 2,
+      `count=${skip.count}, state=${skip.state}`);
+
+    /* 5. the auto plays for the audience that presses nothing:
+     *    re-arm the one-shot via the smoke seam (`_userTriggered` =
+     *    false, `_autoFired` = false, `_autoAt` = null) — the lazy
+     *    recompute must land on BOOT.t0 + 30 s and fire exactly one
+     *    sequence (this boot is long past 30 s ⇒ fires next frame) */
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E._userTriggered = false;
+      E._autoFired = false;
+      E._autoAt = null;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'STIR', { timeout: 5000 });
+    const a1 = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY;
+      return {
+        state: E.state, count: E._wakeCount,
+        fired: E._autoFired,
+        autoAt: E._autoAt, t0: S.BOOT.t0,
+      };
+    });
+    check('M9.6: auto starts the same sequence exactly once at BOOT.t0 + 30 s (audience that presses nothing)',
+      a1.state === 'STIR' && a1.count === count0 + 3 &&
+      a1.fired === true &&
+      Math.abs(a1.autoAt - (a1.t0 + 30)) < 0.05,
+      `count=${a1.count} (want ${count0 + 3}),` +
+      ` Δdeadline=${(a1.autoAt - a1.t0).toFixed(2)} s (want 30)`);
+
+    /* 6. the auto never re-fires: force back to DORMANT and let
+     *    frames pass — the one-shot flag stays burned, no sequence */
+    await settleDormant();
+    await sleep(500);
+    const nr = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return { state: E.state, fired: E._autoFired, count: E._wakeCount };
+    });
+    check('M9.6: auto never re-fires (one-shot) even after the DORMANT return',
+      nr.state === 'DORMANT' && nr.fired === true &&
+      nr.count === count0 + 3,
+      `count=${nr.count} (want ${count0 + 3}), fired=${nr.fired}`);
+
+    /* 7. key re-trigger after the auto still works (re-trigger safe),
+     *    and resolves clean again */
+    await page.keyboard.press('f');
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'STIR', { timeout: 5000 });
+    const r1 = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return { state: E.state, count: E._wakeCount };
+    });
+    await settleDormant();
+    check('M9.6: key re-trigger after the auto works and resolves clean (re-trigger safe)',
+      r1.state === 'STIR' && r1.count === count0 + 4,
+      `count=${r1.count} (want ${count0 + 4})`);
+
+    /* 8. heap flat across the whole section */
+    const ha = await heapMin();
+    check('M9.6: no allocation per frame (heap flat across the section)',
+      hb > 0 && ha > 0 && ha - hb <= 2 * 1024 * 1024,
+      `before=${Math.round(hb / 1024)}KB, after=${Math.round(ha / 1024)}KB`);
+
+    /* cleanup: park the dream wave + lightning again (the section's
+     * forced cycles re-armed none of them; keep the suite state) */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      S.ATMOS._ltTimer = 1e9;
+    });
   }
 
   /* ---- 10. No errors anywhere ---- */
