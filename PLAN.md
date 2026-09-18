@@ -73,7 +73,7 @@ smoke-test evidence.
 | **M10.1** ✅ | Voxel neon **sloth** monument atop one compute tower on a side avenue + rooftop "UNSLOTH" holo sign with cycling taglines ("local ≠ slow" / "why rush?") | Monument + sign readable from street; sign cycles; outside default intro framing |
 | **M10.2** ✅ | Relaxed holographic sloth silhouette on the antenna arm (billboard + canvas sprite, additive, slow breathing) + 1–2 slow sloth-themed maintenance drones (bigger, soft pink) patrolling that street only | Holo sloth breathes; pink drones patrol only that street |
 | **M10.3** ✅ | Awakening reaction: sign flares, holograph brightens + one slow stretch, sloth drones rise to hover for the pulse, then resume | Reaction plays during AWAKE, everything returns to idle after DECAY |
-| **M11.1** | Audio master graph: compressor → user-mute gain → destination; gesture-gated start (START button), resume-safe | Audio starts only after gesture; mute key mutes all; refresh/re-entry safe |
+| **M11.1** ✅ | Audio master graph: compressor → user-mute gain → destination; gesture-gated start (START button), resume-safe | Audio starts only after gesture; mute key mutes all; refresh/re-entry safe |
 | **M11.2** | Looping beds: reactor hum (detuned sines + sub + LFO), fans (filtered noise, band-pass sweep), distant machinery (noise + random low thumps) | Beds run indefinitely without audible repeats/bugs; identifiable as "machine city" within 3 s |
 | **M11.3** | Event sounds: pulse thump, arc crackle, steam hiss, drone whir — wired to M6–M9 emitters | Each event in-game produces its sound; all silent when muted; zero cost when idle |
 | **M11.4** | Spatial-ish mixing: one panner + distance gain for 2–3 nearest emitters, rest folded into ambient bed | Walking past an emitter pans/attenuates; cost bounded |
@@ -852,11 +852,45 @@ feels like it belongs to the world, not pasted on.
 ### M11 — Procedural audio (Web Audio only)
 
 #### M11.1 — Master graph + gesture gate
-- [ ] Compressor → user-mute gain → destination; starts only on user
+- [x] Compressor → user-mute gain → destination; starts only on user
       gesture (START button), resume-safe.
 - **Test:** no audio before gesture; mute key mutes everything; refresh /
       re-entry safe, no errors.
 - **Commit when:** gate + mute verified.
+  `AUDIO` (exposed on `window.SIM`) is the Web Audio master graph, built
+  inside the START-click gesture and never before: **master** (GainNode,
+  0.8) → **comp** (DynamicsCompressor) → **muteGain** (GainNode, 1.0) →
+  `ctx.destination`. Everything the game makes (M11.2 beds, M11.3 event
+  sounds, M11.4 spatial sources) connects to `AUDIO.master`; the
+  compressor and the mute gain are the only two choke points. `unlock()`
+  is only ever called from `BOOT.enter('RUNNING')` (the START click — the
+  single user gesture, M0 contract), so **no `AudioContext` exists before
+  the gesture**; it is idempotent and resume-safe: a context the browser
+  suspended (tab hidden/backgrounded) is resumed via `ctx.resume()`
+  (`.catch`-guarded) on the next `pointerdown`/`keydown`/
+  `visibilitychange` — listeners wired once at unlock (`_gestureWired`
+  guard ⇒ zero cost before the first gesture). **Mute:** `M` key (INPUT
+  keydown, repeat-guarded) → `AUDIO.toggleMute()` →
+  `muteGain.gain.setTargetAtTime(0|1, t, 0.02)`; `AUDIO.muted` flag;
+  HUD shows `MUTED`/`mute: M`, hint line reads `F awaken · M mute`.
+  Refresh / re-entry rebuilds the module fresh and hits the same path.
+  **Wiring verification (headless gotcha):** the headless smoke Chrome
+  build exposes no `inputs`/`outputs`/`connections` on `AudioNode` and no
+  `DynamicsCompressor` global, so the harness cannot introspect the
+  graph — the app instead captures `AUDIO.wired` at build time from
+  `connect()` return values (spec: returns the destination node).
+  Smoke M11.1 section (9 checks, after M10.3) reloads the page for the
+  pre-gesture check: `AUDIO.ctx === null` before START, then
+  graph/types/wired + `state === 'running'` after the gesture, M-key
+  mute→0 / unmute→1 by gain value, refresh → fresh module (ctx null
+  again) → re-entry unlocks a fresh running context, no page/console
+  errors; it re-parks `ATMOS._ltTimer` + `ENTITY._autoAt` after the
+  reload like the other sections. 9/9 PASS in 3 consecutive full-suite
+  runs; the only failures are the documented pre-existing headless flakes
+  (M7.5 camera-shake `energy=1.18` baseline) plus single-run
+  screenshot/timing flakes (M6.2 dock window, M8.1 star brightness) —
+  unrelated to M11.1 (audio adds no draw calls, no objects, no per-frame
+  work).
 
 #### M11.2 — Looping beds
 - [ ] Reactor hum (2 detuned sines/triangles + sub sine, slow LFO); fans

@@ -749,16 +749,36 @@ const BOOT = {
 };
 
 /* ------------------------------------------------------------------ *
- * AUDIO — gesture-gated unlock stub.
- * M11 builds the master graph + beds on top of this context.
+ * AUDIO — Web Audio master graph (M11.1).
+ *
+ * Graph:  master (bus gain) → compressor → muteGain → destination
+ *   - master:   one bus — M11.2 beds and M11.3 event sounds connect
+ *               here, so everything the game makes flows through the
+ *               same two choke points below.
+ *   - comp:     a DynamicsCompressor glues the whole mix; one for the
+ *               whole graph, never per-source.
+ *   - muteGain: user mute (M key) — the LAST stage before destination,
+ *               so muting silences everything at zero cost.
+ *
+ * Gesture gate: unlock() is only ever called from BOOT.enter('RUNNING')
+ * on the START click — no AudioContext exists before that gesture
+ * (no audio before gesture). Resume-safe: a context the browser
+ * suspended (tab hidden/backgrounded) is resumed on the next gesture
+ * or visibility; refresh / re-entry just rebuilds this module fresh
+ * and hits the same path again.
  * ------------------------------------------------------------------ */
 const AUDIO = {
   ctx: null,
   master: null,
+  comp: null,
+  muteGain: null,
+  muted: false,
+  wired: false,
+  _gestureWired: false,
 
   unlock() {
     if (AUDIO.ctx) {
-      if (AUDIO.ctx.state === 'suspended') AUDIO.ctx.resume();
+      AUDIO._resume();
       return;
     }
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -767,10 +787,54 @@ const AUDIO = {
       AUDIO.ctx = new AC();
       AUDIO.master = AUDIO.ctx.createGain();
       AUDIO.master.gain.value = 0.8;
-      AUDIO.master.connect(AUDIO.ctx.destination);
+      AUDIO.comp = AUDIO.ctx.createDynamicsCompressor();
+      AUDIO.muteGain = AUDIO.ctx.createGain();
+      AUDIO.muteGain.gain.value = 1;
+      /* connect() returns the destination node (spec) — capture the
+       * wiring flag; the headless smoke build exposes no
+       * inputs/outputs introspection on AudioNode. */
+      const c1 = AUDIO.master.connect(AUDIO.comp);
+      const c2 = AUDIO.comp.connect(AUDIO.muteGain);
+      const c3 = AUDIO.muteGain.connect(AUDIO.ctx.destination);
+      AUDIO.wired = c1 === AUDIO.comp && c2 === AUDIO.muteGain &&
+        c3 === AUDIO.ctx.destination;
     } catch (_) {
       AUDIO.ctx = null;
     }
+    AUDIO._wireResume();
+  },
+
+  setMuted(on) {
+    AUDIO.muted = !!on;
+    if (AUDIO.ctx && AUDIO.muteGain) {
+      const t = AUDIO.ctx.currentTime;
+      AUDIO.muteGain.gain.setTargetAtTime(AUDIO.muted ? 0 : 1, t, 0.02);
+    }
+  },
+
+  toggleMute() { AUDIO.setMuted(!AUDIO.muted); },
+
+  /* Resume a context the browser suspended (tab hidden/backgrounded).
+   * It was created inside a user gesture (START click), so Chrome keeps
+   * activation for resume(); if a gesture is still required the call
+   * simply waits — never an error. */
+  _resume() {
+    if (AUDIO.ctx && AUDIO.ctx.state === 'suspended') {
+      const p = AUDIO.ctx.resume();
+      if (p && p.catch) p.catch(() => {});
+    }
+  },
+
+  /* Cheap gesture hooks, wired once at unlock — zero cost before the
+   * first gesture (nothing exists yet). */
+  _wireResume() {
+    if (AUDIO._gestureWired) return;
+    AUDIO._gestureWired = true;
+    window.addEventListener('pointerdown', () => AUDIO._resume());
+    window.addEventListener('keydown', () => AUDIO._resume());
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) AUDIO._resume();
+    });
   },
 };
 
@@ -868,6 +932,7 @@ const INPUT = {
       if (e.code === 'KeyN' && !e.repeat) INPUT.shakeTrigger = true;
       if (e.code === 'KeyL' && !e.repeat) INPUT.lightningTrigger = true;
       if (e.code === 'KeyF' && !e.repeat) INPUT.wakeTrigger = true;
+      if (e.code === 'KeyM' && !e.repeat) AUDIO.toggleMute();   // M11.1
       INPUT.keys.add(e.code);
       if (e.code === 'Space') e.preventDefault();
     });
@@ -6372,7 +6437,7 @@ const HUD = {
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
       'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
       'P particles · R pulse · T arcs · B flash · N shake · L lightning\n' +
-      'F awaken';
+      'F awaken · M mute';
     /* M9.6: HUD awaken button — same entry as the F key: the manual
      * trigger path routes through ENTITY.wake() (no-op unless DORMANT)
      * and marks the session user-triggered so the one-shot auto skips. */
@@ -6396,11 +6461,13 @@ const HUD = {
         const mode = CAMERA.orbit ? 'ORBIT' : CAMERA.mode;
         const mouse = INPUT.pointerLocked ? 'locked' : 'click to capture';
         const pad = INPUT.pad.connected ? 'PAD' : '-';
+        const mute = AUDIO.muted ? 'MUTED' : 'mute: M';
         HUD.el.textContent =
           `FPS ${String(Math.round(HUD.fps)).padStart(2, ' ')}\n` +
           `STATE ${BOOT.state}\n` +
           `AI ${ENTITY.state}\n` +
-          `CAM ${mode} · FOV ${Math.round(camera.fov)} · ${mouse} · ${pad}`;
+          `CAM ${mode} · FOV ${Math.round(camera.fov)} · ${mouse} · ${pad}\n` +
+          `${mute}`;
         HUD.el.style.whiteSpace = 'pre';
       }
     }
@@ -6493,6 +6560,7 @@ window.SIM = {
   FX,
   ATMOS,
   TIER,
+  AUDIO,
   HUD,
   CFG,
   renderer,

@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-16T03:19:20"
+updated: "2026-09-19T02:38:36"
 ---
 
 <!-- compiled_truth -->
@@ -59,3 +59,9 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   summary: "M8.1 extends the harness: fixed-order check is now …FX→ATMOS→HUD; M2 gate hides/shows ATMOS.root around its draw-call read; new M8.1 section — ATMOS registration (dome BackSide fog-off, stars additive fog-off, aurora additive fog-off), camera-follow (dome/stars track exactly, aurora at configured altitude), +3 draw calls (min-over-6-frames per state, retry ≤3 — other systems add transient calls), star drawRange tier cap, aurora spin animation, heap flat on pure animation frames, and the first multi-pose on/off visual gate: 3 camera distances (street GROUND / orbit CINE / far CINE), each an ATMOS-hidden vs visible screenshot pair decoded in-page, sky region = top 55 % at x ≥ 25 % (HUD corner excluded), asserting mean luminance (dome), bright pixels (stars), greenish pixels (aurora) all rise; on-shots saved as shots/m81-sky-{street,orbit,far}.png"
   source: M8.1 implementation
   affects: [smoke-harness-dev-tooling, m81-night-sky]
+
+- time: 2026-09-19T02:38:36
+  kind: decision
+  summary: "M11.1 extends the harness: new M11.1 section (9 checks, after M10.3) reloads the page for the pre-gesture check (AUDIO.ctx null before START), verifies the master graph via the app-side AUDIO.wired flag (captured from connect() return values) + node constructor names — the headless WebAudio build exposes no inputs/outputs/connections and no DynamicsCompressor global — then M-key mute/unmute by gain value and refresh/re-entry; window.SIM now also exposes AUDIO"
+  source: M11.1 implementation
+  affects: [smoke-harness-dev-tooling]

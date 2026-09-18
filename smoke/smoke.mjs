@@ -7984,6 +7984,127 @@ try {
     await sleep(250);
   }
 
+  /* ------------------------------------------------------------------ *
+   * M11.1 — Audio master graph + gesture gate
+   *
+   *  master (bus gain 0.8) → DynamicsCompressor → muteGain (M key) →
+   *  destination. unlock() runs only on the START click (the user
+   *  gesture); the M key mutes the whole mix; a suspended context is
+   *  resumed on gesture/visibility; refresh / re-entry rebuilds the
+   *  module fresh and hits the same path again.
+   *
+   *  This section reloads the page: the pre-gesture check ("no audio
+   *  before gesture") needs a fresh LOADER page, and the refresh /
+   *  re-entry check doubles as a second full re-entry.
+   * ------------------------------------------------------------------ */
+  {
+    /* The headless Web Audio build exposes no inputs/outputs/
+     * connections introspection on AudioNode, so wiring is verified
+     * from the app-side flag captured at build time (connect() returns
+     * the destination node) + node types. */
+    const audioState = () => page.evaluate(() => {
+      const A = window.SIM.AUDIO;
+      if (!A || !A.ctx) return { ctx: false };
+      const ctor = n => (n && n.constructor) ? n.constructor.name : '';
+      return {
+        ctx: true,
+        state: A.ctx.state,
+        types: ctor(A.master) === 'GainNode' &&
+          ctor(A.comp) === 'DynamicsCompressorNode' &&
+          ctor(A.muteGain) === 'GainNode' &&
+          ctor(A.ctx.destination) === 'AudioDestinationNode',
+        wired: A.wired === true,
+        masterGain: A.master ? A.master.gain.value : -1,
+        muteGain: A.muteGain ? A.muteGain.gain.value : -1,
+        muted: A.muted,
+      };
+    });
+    const ensureRunning = () => page.evaluate(async () => {
+      const A = window.SIM.AUDIO;
+      if (!A.ctx) return 'none';
+      if (A.ctx.state === 'suspended') {
+        await A.ctx.resume().catch(() => {});
+      }
+      return A.ctx.state;
+    });
+
+    /* 1. fresh page: no audio before the user gesture */
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT && window.SIM.BOOT.state === 'LOADER',
+      { timeout: 20000 },
+    );
+    {
+      const a = await audioState();
+      check('M11.1: no AudioContext before the user gesture', !a.ctx);
+    }
+
+    /* 2. START click (the gesture) unlocks the master graph */
+    await page.locator('#startBtn').click();
+    await page.waitForFunction(() => window.SIM && window.SIM.BOOT.state === 'RUNNING', { timeout: 5000 });
+    await sleep(150);
+    {
+      const a = await audioState();
+      check('M11.1: START gesture creates the AudioContext', a.ctx, `state=${a.state}`);
+      check('M11.1: master graph wired master→compressor→muteGain→destination',
+        a.types && a.wired,
+        `types=${a.types}, wired=${a.wired}`);
+      check('M11.1: master bus gain 0.8, mute gain 1, not muted',
+        Math.abs(a.masterGain - 0.8) < 1e-6 && Math.abs(a.muteGain - 1) < 1e-6 && !a.muted,
+        `master=${a.masterGain}, mute=${a.muteGain}, muted=${a.muted}`);
+      const st = await ensureRunning();
+      check('M11.1: context running after the gesture (resume-safe)', st === 'running', `state=${st}`);
+    }
+
+    /* 3. M key mutes everything (mute gain is the last stage) */
+    await page.keyboard.press('KeyM');
+    await sleep(300);   // setTargetAtTime(time constant 0.02 s) settles
+    {
+      const a = await audioState();
+      check('M11.1: M key mutes everything (mute gain → 0)',
+        a.muted && a.muteGain < 0.01,
+        `muted=${a.muted}, muteGain=${a.muteGain}`);
+    }
+
+    /* 4. M again unmutes */
+    await page.keyboard.press('KeyM');
+    await sleep(300);
+    {
+      const a = await audioState();
+      check('M11.1: M again unmutes (mute gain → 1)',
+        !a.muted && a.muteGain > 0.99,
+        `muted=${a.muted}, muteGain=${a.muteGain}`);
+    }
+
+    /* 5. refresh / re-entry: fresh module, no context before the
+     *    gesture again, START unlocks a fresh context, no errors */
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT && window.SIM.BOOT.state === 'LOADER',
+      { timeout: 20000 },
+    );
+    {
+      const a = await audioState();
+      check('M11.1: refresh returns to a fresh module (no context before gesture)', !a.ctx);
+    }
+    await page.locator('#startBtn').click();
+    await page.waitForFunction(() => window.SIM && window.SIM.BOOT.state === 'RUNNING', { timeout: 5000 });
+    await sleep(150);
+    {
+      const a = await audioState();
+      const st = await ensureRunning();
+      check('M11.1: re-entry after refresh unlocks a fresh running context, no errors',
+        a.ctx && a.types && a.wired && st === 'running' && pageErrors.length === 0,
+        `ctx=${a.ctx}, types=${a.types}, wired=${a.wired}, state=${st}, pageErrors=${pageErrors.length}`);
+    }
+    /* suite hygiene: suppress the re-armed auto timers (same as the
+     * earlier sections — nothing else runs after this point) */
+    await page.evaluate(() => {
+      window.SIM.ATMOS._ltTimer = 1e9;
+      window.SIM.ENTITY._autoAt = Infinity;
+    });
+  }
+
   /* ---- 10. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));
