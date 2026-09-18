@@ -2,19 +2,19 @@
 slug: architecture
 title: System architecture
 role: system architecture
-updated: "2026-09-15T01:42:40"
+updated: "2026-09-19T02:45:37"
 ---
 
 # System architecture
 
-Single self-contained `index.html` (Three.js via CDN importmap is the only external, pinned to r0.160.0 — see [[three-cdn-pin-boot-watchdog]]). Everything lives inside the one file: a `systems` registry that boots in a fixed order, a central `frame()` rAF loop calling `update(dt, t)`, and the `BOOT` deterministic state machine (`LOADER → RUNNING`, error path via watchdog). M0–M1 skeleton in place: `CFG` (tunables), `BOOT`, `AUDIO` (gesture-gated unlock stub — M11 builds beds on it), `HUD` (FPS/state DOM), `window.SIM` dev handle. M2 adds the `KIT` material kit: shared `MATS` library, canvas-texture factory (LED grid, holo signs, glow), `InstancedBox`/`InstancedCylinder` builders, merged-geometry batcher, lighting rig (hemi + moon key + 2 reserved hero point lights), and a temporary gate test wall/tower at (0,0,-80) rendered at 8 draw calls [[m2-material-kit]].
+Single self-contained `index.html` (Three.js via CDN importmap is the only external, pinned to r0.160.0 — see [[three-cdn-pin-boot-watchdog]]). Everything lives inside the one file: a `systems` registry that boots in a fixed order, a central `frame()` rAF loop calling `update(dt, t)`, and the `BOOT` deterministic state machine (`LOADER → RUNNING`, error path via watchdog). M0–M1 skeleton in place: `CFG` (tunables), `BOOT`, `AUDIO` (gesture-gated Web Audio master graph — M11.1, see [[m111-audio-master-graph]]; M11.2+ beds/events connect to `AUDIO.master`), `HUD` (FPS/state DOM), `window.SIM` dev handle. M2 adds the `KIT` material kit: shared `MATS` library, canvas-texture factory (LED grid, holo signs, glow), `InstancedBox`/`InstancedCylinder` builders, merged-geometry batcher, lighting rig (hemi + moon key + 2 reserved hero point lights), and a temporary gate test wall/tower at (0,0,-80) rendered at 8 draw calls [[m2-material-kit]].
 
 ## Module graph
 
 ```mermaid
 graph TD
   CFG[CFG tunables] --> R
-  BOOT[BOOT state machine LOADER / RUNNING] -->|user gesture| AUDIO[AUDIO unlock stub]
+  BOOT[BOOT state machine LOADER / RUNNING] -->|START gesture| AUDIO[AUDIO master graph master/comp/muteGain]
   BOOT -->|arms once| LOOP[central frame loop rAF]
   LOOP -->|update dt, t| REG[systems registry fixed order: INPUT, CAMERA, KIT, HUD]
   REG --> HUD[HUD FPS + state DOM]
