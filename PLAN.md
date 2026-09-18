@@ -72,7 +72,7 @@ smoke-test evidence.
 | **M9.6** ✅ | Triggers: manual key (`F`) + HUD button, auto-play once ~30 s after intro | All three entry paths (key, button, auto) start the same sequence exactly once |
 | **M10.1** ✅ | Voxel neon **sloth** monument atop one compute tower on a side avenue + rooftop "UNSLOTH" holo sign with cycling taglines ("local ≠ slow" / "why rush?") | Monument + sign readable from street; sign cycles; outside default intro framing |
 | **M10.2** ✅ | Relaxed holographic sloth silhouette on the antenna arm (billboard + canvas sprite, additive, slow breathing) + 1–2 slow sloth-themed maintenance drones (bigger, soft pink) patrolling that street only | Holo sloth breathes; pink drones patrol only that street |
-| **M10.3** | Awakening reaction: sign flares, holograph brightens + one slow stretch, sloth drones rise to hover for the pulse, then resume | Reaction plays during AWAKE, everything returns to idle after DECAY |
+| **M10.3** ✅ | Awakening reaction: sign flares, holograph brightens + one slow stretch, sloth drones rise to hover for the pulse, then resume | Reaction plays during AWAKE, everything returns to idle after DECAY |
 | **M11.1** | Audio master graph: compressor → user-mute gain → destination; gesture-gated start (START button), resume-safe | Audio starts only after gesture; mute key mutes all; refresh/re-entry safe |
 | **M11.2** | Looping beds: reactor hum (detuned sines + sub + LFO), fans (filtered noise, band-pass sweep), distant machinery (noise + random low thumps) | Beds run indefinitely without audible repeats/bugs; identifiable as "machine city" within 3 s |
 | **M11.3** | Event sounds: pulse thump, arc crackle, steam hiss, drone whir — wired to M6–M9 emitters | Each event in-game produces its sound; all silent when muted; zero cost when idle |
@@ -837,10 +837,10 @@ narrative (dormant → stir → awake → pulse → settle) in ≤ 30 s.
   (camera-shake `energy=1.18` baseline — untouched by M10.2).
 
 #### M10.3 — Awakening reaction
-- [ ] Sign flares, holograph brightens + one slow stretch animation,
+- [x] Sign flares, holograph brightens + one slow stretch animation,
       sloth drones rise to hover nearby for the pulse, then resume
       patrolling.
-- [ ] Constraint: never competes with the creature in the default
+- [x] Constraint: never competes with the creature in the default
       framing of the intro reveal; max ~5 % of attention budget.
 - **Test:** reaction plays during AWAKE; everything returns to idle after
       DECAY.

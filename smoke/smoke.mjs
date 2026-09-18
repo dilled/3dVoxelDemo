@@ -6751,7 +6751,8 @@ try {
     await page.evaluate(() => {
       const E = window.SIM.ENTITY;
       window.__m95 = { egg: [] };
-      E.eggReact((ph) => { window.__m95.egg.push(ph); });
+      window.__m95.fake = (ph) => { window.__m95.egg.push(ph); };
+      E.eggReact(window.__m95.fake);
       E.wake();
     });
     const st1 = await page.evaluate(() => {
@@ -6996,11 +6997,13 @@ try {
       r2.same && !r2.ignited && !r2.eggFired,
       `count=${r2.count}, fx=${r2.fx} (final ${r2.fin})`);
 
-    /* cleanup: drop the fake reaction, park the dream wave +
-     * lightning again, reset the spawn pose */
+    /* cleanup: drop the fake reaction (splice ONLY it — the real
+     * M10.3 reaction is registered at boot and must survive), park the
+     * dream wave + lightning again, reset the spawn pose */
     await page.evaluate(() => {
       const S = window.SIM;
-      S.ENTITY._eggReact.length = 0;
+      const i = S.ENTITY._eggReact.indexOf(window.__m95.fake);
+      if (i >= 0) S.ENTITY._eggReact.splice(i, 1);
       delete S.__m95;
       S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
       S.ATMOS._ltTimer = 1e9;
@@ -7660,6 +7663,313 @@ try {
     /* 8. heap flat across the section */
     const ha = await heapMin();
     check('M10.2: no allocation per frame (heap flat across the section)',
+      hb > 0 && ha > 0 && ha - hb <= 2 * 1024 * 1024,
+      `before=${Math.round(hb / 1024)}KB, after=${Math.round(ha / 1024)}KB`);
+
+    /* reset to the spawn pose for the remaining checks */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(0, 4, 18);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = 0;
+    });
+    await sleep(250);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * M10.3 — Unsloth easter egg: the awakening reaction
+   *
+   *  Hooked through ENTITY.eggReact (beat 6 fires at AWAKE + egg.delay,
+   *  'end' at DORMANT entry): the UNSLOTH sign flares, the holo sloth
+   *  brightens + plays one slow stretch, and the sloth drones rise to
+   *  hover nearby for the pulse — then everything returns to idle
+   *  (street patrol resumes) after DECAY. Subtle by design: it plays
+   *  at the monument (outside the default intro-reveal framing) and
+   *  adds no draw calls / no visible objects. Full awakening run,
+   *  then a re-trigger.
+   * ------------------------------------------------------------------ */
+  {
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      S.ATMOS._ltTimer = 1e9;
+    });
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const hb = await heapMin();
+
+    /* 1. registered: the reaction is wired (WORLD owns the visuals,
+     *    ENTITY.eggReact owns the timing), idle at DORMANT (holo at
+     *    base brightness, sign at base, drones on the street) */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, E = S.ENTITY, M = S.WORLD.monument;
+      const e = M.droneMesh.instanceMatrix.array;
+      return {
+        ok: !!M.egg && Array.isArray(E._eggReact) &&
+          E._eggReact.length >= 1,
+        reactLen: E._eggReact ? E._eggReact.length : -1,
+        eggOn: M.egg ? M.egg.on : 'noegg',
+        state: E.state,
+        eggFired: E._eggFired,
+        holoC: M.holoMat.color.r,
+        signC: M.sign.material.color.r,
+        alt: e[13],
+      };
+    });
+    check('M10.3: awakening reaction wired (ENTITY.eggReact) and idle at DORMANT',
+      reg.ok && reg.state === 'DORMANT' && !reg.eggFired &&
+        reg.holoC === 1 && reg.signC === 1 && Math.abs(reg.alt - 30) < 0.6,
+      `state=${reg.state} eggFired=${reg.eggFired}` +
+      ` holo=${reg.holoC} sign=${reg.signC}` +
+      ` alt=${reg.alt.toFixed(1)}m ok=${reg.ok}` +
+      ` reactLen=${reg.reactLen} eggOn=${reg.eggOn}`);
+
+    /* street pose (same as M10.2) so the reaction is in frame for the
+     * screenshot + the visible-set / draw-call baselines */
+    await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument, B = S.WORLD.BLOCK;
+      const m5 = n => ((n % 5) + 5) % 5;
+      let ax = null, az = null;
+      if (m5(M.bz) === 1) az = (M.bz - 1 + 0.5) * B;
+      else if (m5(M.bz) === 4) az = (M.bz + 1 + 0.5) * B;
+      else if (m5(M.bx) === 1) ax = (M.bx - 1 + 0.5) * B;
+      else ax = (M.bx + 1 + 0.5) * B;
+      const px = ax === null ? M.x : ax;
+      const pz = az === null ? M.z : az;
+      const dx = M.x - px, dz = M.z - pz;
+      const dy = M.hTop + 10 - 1.7;
+      S.CAMERA.pos.set(px, 1.7, pz);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = Math.atan2(-dx, -dz);
+      S.CAMERA.pitch = Math.atan2(dy, Math.hypot(dx, dz));
+    });
+    await sleep(450);
+    const visBase = await page.evaluate(() => {
+      const S = window.SIM;
+      const vis = [];
+      S.scene.traverse(o => {
+        if (o.isMesh || o.isPoints || o.isLine) {
+          let v = true, shaft = false;
+          for (let p = o; p; p = p.parent) {
+            v = v && p.visible;
+            if (p === S.ATMOS.shaftGroup) shaft = true;
+          }
+          /* ATMOS-shafts fade in/out on a 2 s camera scan — excluded:
+           * the pose change above can catch them mid-fade (environment,
+           * not the reaction) */
+          if (v && !shaft) vis.push(o.name || o.type);
+        }
+      });
+      vis.sort();
+      return { vis, calls: S.renderer.info.render.calls };
+    });
+
+    /* 2. full awakening run: wake() → force STIR→AWAKE → beat 6 fires
+     *    (u ≥ 4.2 s) → the reaction ramps in (1.2 s): sign flares,
+     *    holo brightens + the one slow stretch, drones rise to hover
+     *    nearby (above the tower, off the street line) */
+    await page.evaluate(() => window.SIM.ENTITY.wake());
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.stir - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY._eggFired, { timeout: 8000 });
+    await sleep(1200);   // ramp (1.2 s) done, stretch near its peak
+    const on = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument,
+        EG = S.CFG.kit.slothEgg, H = S.CFG.kit.slothHolo;
+      const e = M.droneMesh.instanceMatrix.array;
+      const drones = M.drones.map((d, i) => {
+        const o = i * 16;
+        return {
+          x: e[o + 12], y: e[o + 13], z: e[o + 14],
+          nearTower: Math.hypot(e[o + 12] - M.x, e[o + 14] - M.z) < 8,
+          offStreet: Math.abs(
+            (d.axis === 'z' ? e[o + 12] : e[o + 14]) - d.c) > 10,
+        };
+      });
+      const inndc = p => p.z < 1 && Math.abs(p.x) < 0.9 && Math.abs(p.y) < 0.9;
+      const inHolo = inndc(S.project(M.x, M.hTop + 13, M.z));
+      const tNow = performance.now() / 1000;
+      return {
+        egg: M.egg ? {
+          on: M.egg.on, age: +(tNow - M.egg.t0).toFixed(1),
+          endA: M.egg.endT ? +(tNow - M.egg.endT).toFixed(1) : null,
+          st: M.egg.stretchT0 ? +(tNow - M.egg.stretchT0).toFixed(1) : null,
+        } : 'noegg',
+        holoC: M.holoMat.color.r,
+        signC: M.sign.material.color.r,
+        state: S.ENTITY.state,
+        holoBright: M.holoMat.color.r > 1 + EG.holoBoost * 0.99,
+        signFlare: M.neonMat.color.r > M.neonBase.r * 1.2 &&
+          M.sign.material.color.r > 1,
+        stretch: M.holo.scale.y >
+          H.scale * (176 / 140) * (1 + H.breathAmp) + 0.2,
+        allUp: drones.every(
+          d => d.y > 35 && d.nearTower && d.offStreet),
+        alt: drones.map(d => d.y),
+        inHolo,
+        calls: S.renderer.info.render.calls,
+      };
+    });
+    await page.screenshot({ path: `${here}/shots/m103-sloth-awaken.png` });
+    check('M10.3: reaction plays during AWAKE — sign flares, holo brightens + slow stretch, drones rise to hover nearby (shots/m103-sloth-awaken.png)',
+      on.state === 'AWAKE' && on.holoBright && on.signFlare &&
+        on.stretch && on.allUp && on.inHolo &&
+        on.calls <= visBase.calls + 2,
+      `egg=${JSON.stringify(on.egg)} holoC=${on.holoC.toFixed(2)}` +
+      ` signC=${on.signC.toFixed(2)}` +
+      ` alts=${on.alt.map(a => a.toFixed(1)).join('/')}m` +
+      ` (baseline ${visBase.calls} + ≤2 live FX, got ${on.calls})`);
+
+    /* 3. force AWAKE→DECAY: the reaction HOLDS (drones still up for the
+     *    pulse — 'end' only fires at DORMANT entry) */
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 - E._awakeDur - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DECAY', { timeout: 5000 });
+    const dc = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument;
+      const e = M.droneMesh.instanceMatrix.array;
+      return {
+        state: S.ENTITY.state,
+        holoBright: M.holoMat.color.r > 1 + S.CFG.kit.slothEgg.holoBoost * 0.99,
+        up: M.drones.every((d, i) => e[i * 16 + 13] > 35),
+      };
+    });
+    check('M10.3: reaction holds through DECAY (drones still hovering for the pulse)',
+      dc.state === 'DECAY' && dc.holoBright && dc.up);
+
+    /* 4. force DECAY→DORMANT: 'end' fires — everything eases back to
+     *    idle (settle 2 s): holo/sign back to base, drones back on the
+     *    street, the patrol resumes, no new visible objects */
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.decay - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    await page.waitForFunction(() => {
+      const M = window.SIM.WORLD.monument;
+      return M.holoMat.color.r === 1;
+    }, { timeout: 8000 });
+    const back = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument;
+      const e = M.droneMesh.instanceMatrix.array;
+      const d = M.drones[0];
+      const H = S.CFG.kit.slothHolo;
+      const nb = M.neonBase;
+      const vis = [];
+      S.scene.traverse(o => {
+        if (o.isMesh || o.isPoints || o.isLine) {
+          let v = true, shaft = false;
+          for (let p = o; p; p = p.parent) {
+            v = v && p.visible;
+            if (p === S.ATMOS.shaftGroup) shaft = true;
+          }
+          if (v && !shaft) vis.push(o.name || o.type);
+        }
+      });
+      vis.sort();
+      return {
+        holoC: M.holoMat.color.r,
+        signC: M.sign.material.color.r,
+        neonInBase: M.neonMat.color.r >= nb.r * 0.6 - 1e-3 &&
+          M.neonMat.color.r <= nb.r + 1e-3,
+        alt: e[13],
+        onStreet: Math.abs((d.axis === 'z' ? e[12] : e[14]) - d.c) < 0.5,
+        stretchEnded: M.holo.scale.y <=
+          H.scale * (176 / 140) * (1 + H.breathAmp) + 1e-3,
+        along: d.along,
+        vis,
+      };
+    });
+    await sleep(300);
+    const back2 = await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument;
+      return { along: M.drones[0].along };
+    });
+    const visSame = JSON.stringify(back.vis) ===
+      JSON.stringify(visBase.vis);
+    const visAdd = back.vis.filter(x => !visBase.vis.includes(x));
+    const visRem = visBase.vis.filter(x => !back.vis.includes(x));
+    check('M10.3: everything returns to idle after DECAY (street patrol resumes, holo/sign back to base, no new objects)',
+      back.holoC === 1 && back.signC === 1 && back.neonInBase &&
+        Math.abs(back.alt - 30) < 0.6 && back.onStreet &&
+        back.stretchEnded &&
+        Math.abs(back2.along - back.along) > 0.05 && visSame,
+      `alt=${back.alt.toFixed(1)}m, along ${back.along.toFixed(1)} ->` +
+      ` ${back2.along.toFixed(1)},` +
+      ` visible set ${visSame ? 'identical' : 'DIFFERS'}` +
+      (visSame ? '' :
+        ` add=${JSON.stringify(visAdd)} rem=${JSON.stringify(visRem)}`));
+
+    /* 5. re-trigger: the reaction plays again and returns to idle
+     *    again (re-trigger safe) */
+    await page.evaluate(() => window.SIM.ENTITY.wake());
+    const rt1 = await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      return { state: E.state, eggFired: E._eggFired };
+    });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.stir - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY._eggFired, { timeout: 8000 });
+    await sleep(1200);
+    const rt2 = await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument;
+      return {
+        state: window.SIM.ENTITY.state,
+        holoC: M.holoMat.color.r,
+        egg: M.egg ? M.egg.on : 'noegg',
+        holoBright: M.holoMat.color.r > 1 +
+          window.SIM.CFG.kit.slothEgg.holoBoost * 0.99,
+      };
+    });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 - E._awakeDur - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DECAY', { timeout: 5000 });
+    await page.evaluate(() => {
+      const E = window.SIM.ENTITY;
+      E.stateT = performance.now() / 1000 -
+        window.SIM.CFG.entity.wake.decay - 0.05;
+    });
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'DORMANT', { timeout: 5000 });
+    await page.waitForFunction(() => {
+      const M = window.SIM.WORLD.monument;
+      return M.holoMat.color.r === 1;
+    }, { timeout: 8000 });
+    check('M10.3: re-trigger works (the reaction plays again and returns to idle)',
+      rt1.state === 'STIR' && !rt1.eggFired &&
+        rt2.state === 'AWAKE' && rt2.holoBright,
+      `first=${rt1.state}, re-fired=${rt2.holoBright}` +
+      ` holoC=${rt2.holoC.toFixed(2)} eggOn=${rt2.egg}`);
+
+    /* 6. heap flat across the section */
+    const ha = await heapMin();
+    check('M10.3: no allocation per frame (heap flat across the section)',
       hb > 0 && ha > 0 && ha - hb <= 2 * 1024 * 1024,
       `before=${Math.round(hb / 1024)}KB, after=${Math.round(ha / 1024)}KB`);
 
