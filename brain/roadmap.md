@@ -2,12 +2,12 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-09-15T09:31:03"
+updated: "2026-09-18T19:50:40"
 ---
 
 # Roadmap
 
-Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status below: M0–M5 + M6.1 done and smoke-verified headless (M5: dormant Qwen machine-creature, see [[entity-system-m5]]; M6.1: generic object-pool foundation, see [[m61-object-pool]]).
+Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status: **M0–M10.1 done and smoke-verified headless** — M10.1 unsloth monument + UNSLOTH sign ([[m101-sloth-monument]]); M9 awakening sequence ([[m92-wake-state-machine]], [[m94-city-cascade]], [[m95-awakening-decay]], [[m96-wake-triggers]]); M8 atmosphere ([[m81-night-sky]], [[m82-fog-zone-tint]], [[m83-light-shafts]], [[m84-distant-lightning]]); M7 particles + FX ([[m71-parts-particle-system]], [[m72-fx-pulse]], [[m73-fx-arcs]], [[m74-fx-flash]], [[m75-camera-shake]]); M6 traffic/ambient ([[m61-object-pool]], [[m62-traffic-drones]], [[m63-traffic-vehicles]], [[m64-steam-sparks]]); M5 dormant creature ([[entity-system-m5]]).
 
 ```mermaid
 gantt
@@ -24,12 +24,13 @@ gantt
   section Creature & life
   M5 Qwen creature dormant :done, m5, after m4, 3d
   M6.1 object pool foundation :done, m61, after m5, 1d
-  M6.2-6.5 traffic + ambient life :m6, after m61, 2d
-  M7 particles + FX :m7, after m6, 2d
+  M6.2-6.5 traffic + ambient life :done, m6, after m61, 2d
+  M7 particles + FX :done, m7, after m6, 2d
   section Climax
-  M8 atmosphere :m8, after m7, 2d
-  M9 awakening sequence :m9, after m8, 3d
-  M10 unsloth easter egg :m10, after m9, 1d
+  M8 atmosphere :done, m8, after m7, 2d
+  M9 awakening sequence :done, m9, after m8, 3d
+  M10.1 unsloth monument + sign :done, m101, after m9, 1d
+  M10.2-10.3 holo sloth + drones + reaction :m10, after m101, 1d
   section Finish
   M11 procedural audio :m11, after m10, 2d
   M12 intro cinematic :m12, after m11, 2d
