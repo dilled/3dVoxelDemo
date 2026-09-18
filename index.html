@@ -362,6 +362,29 @@ const CFG = {
           avoidAlt: [5, 12],    // m altitude bump
         },
       },
+      /* M9.5: awakening beats 6–7 (egg reaction + decay). Beat 6 fires
+       * `egg.delay` s into AWAKE: the Unsloth easter-egg reaction hook
+       * (M10.3 registers its reaction via ENTITY.eggReact — nothing is
+       * visible until M10 lands). Beat 7: during DECAY the ignited node
+       * grid dims outward (front from head level; it passes the farthest
+       * node + ignite width at `decayDim.at` fraction of DECAY ⇒ the
+       * DORMANT-entry restore is pop-free), and one final pulse fires at
+       * DORMANT entry. (The "hum settles" audio is M11.3 — no audio
+       * system exists yet; the DECAY/DORMANT state entry hooks are the
+       * seam.) */
+      egg: {
+        delay: 4.2,             // s after AWAKE entry (beat 6)
+      },
+      decayDim: {
+        at: 0.85,               // fraction of DECAY where the dim front
+                                // has passed the farthest node + width
+      },
+      finalPulse: {            // beat 7: one final pulse at DORMANT entry
+        radius: 820,            // m (≠ cascade.pulse.radius ⇒ distinct
+                                // signature for the teardown drop check)
+        life: 5.0,              // s
+        color: 0x9fdcff,        // tint (soft white-cyan — the settle)
+      },
     },
   },
 
@@ -4609,13 +4632,17 @@ const ENTITY = {
   _surgeFired: false,           // M9.3: shake fired this sequence
   _cascadeFired: false,        // M9.4: beat 4 fired this sequence
   _trafficFired: false,        // M9.4: beat 5 fired this sequence
+  _eggFired: false,           // M9.5: beat 6 fired this sequence
   _pulseIt: null,              // M9.4: the plaza pulse pool item (dropped at DORMANT)
-  _beatAt: { flare: 0, ignite: 0, surge: 0, cascade: 0, traffic: 0 },
-  // M9.3/M9.4: beat start times
+  _finalPulseIt: null,        // M9.5: beat 7 final pulse pool item
+  _beatAt: { flare: 0, ignite: 0, surge: 0, cascade: 0, traffic: 0, egg: 0 },
+  // M9.3/M9.4/M9.5: beat start times
   _tiltE: null,                 // M9.3: per-ring tilt Euler scratch
   _tiltQ: null,                 // M9.3: per-ring tilt quaternion scratch
   _surgeDir: null,              // M9.3: per-ring tilt directions (x, z)
   _flareCol: null,              // M9.3: beat-1 flare color (pre-allocated)
+  _eggReact: null,             // M9.5: beat-6 easter-egg reaction hooks (M10.3)
+  _dimSpeed: 0,               // M9.5: beat-7 decay dim-front speed (m/s)
   root: null,
   parts: {},
   core: null,                       // breathing group (torso/head/jaw/coreEye)
@@ -4886,6 +4913,13 @@ const ENTITY = {
       nextAt: performance.now() / 1000 + D.first,
       maxR,
     };
+    /* M9.5 beat 7: decay dim-front speed — passes the farthest node +
+     * ignite width at `decayDim.at` fraction of DECAY (the DORMANT-
+     * entry restore is then pop-free: every node is back at exactly
+     * its base brightness). */
+    ENTITY._dimSpeed = (maxR + CFG.entity.beats.ignite.width) /
+      (CFG.entity.wake.decay * CFG.entity.beats.decayDim.at);
+    ENTITY._eggReact = [];
 
     /* M9.3: awakening beats 1–3 — pre-allocated scratch (zero per-frame
      * allocation). Beat 3 tilts each ring group by baseQ × tiltQ(level)
@@ -4951,6 +4985,14 @@ const ENTITY = {
     if (ENTITY._wakeHooks[state]) ENTITY._wakeHooks[state].push(fn);
   },
 
+  /* M9.5 beat 6: easter-egg reaction hook — M10.3 registers its
+   * reaction here: fn('start', t) at the beat-6 fire during AWAKE,
+   * fn('end', t) at DORMANT entry (the reaction plays during
+   * AWAKE/DECAY and returns to idle). */
+  eggReact(fn) {
+    ENTITY._eggReact.push(fn);
+  },
+
   /* M9.2: trigger the awakening sequence (M9.6 wires key/button/auto).
    * Safe: a no-op unless the creature is DORMANT. */
   wake() {
@@ -4973,6 +5015,9 @@ const ENTITY = {
       ENTITY._surgeFired = false;
       ENTITY._cascadeFired = false;
       ENTITY._trafficFired = false;
+      /* M9.5: beat 6 re-arms for this sequence. */
+      ENTITY._eggFired = false;
+      ENTITY._finalPulseIt = null;
     }
     for (const h of ENTITY._wakeHooks[s]) h(s, t);
   },
@@ -5115,6 +5160,7 @@ const ENTITY = {
       t - ENTITY.stateT >= ENTITY._awakeDur)
       ENTITY._enterState('DECAY', t);
     else if (ENTITY.state === 'DECAY' && t - ENTITY.stateT >= W.decay) {
+      const wasIgnited = ENTITY._ignited;
       ENTITY._enterState('DORMANT', t);
       /* M9.3 beat 2 exit: restore the dormant node colors byte-exact;
        * the beat state machine is fully idle again. */
@@ -5138,13 +5184,28 @@ const ENTITY = {
         ENTITY._pulseIt = null;
       }
       TRAFFIC.awakenEnd();
+      /* M9.5 beat 7: one final pulse as the sequence settles — fired
+       * only for a real sequence (a forced non-sequence state never
+       * ignited the grid). The "hum settles" audio lands in M11.3 (no
+       * audio system yet — the DECAY/DORMANT state entry hooks are the
+       * seam). */
+      if (wasIgnited)
+        ENTITY._finalPulseIt = FX.pulse(
+          FX._fire.set(0, 0.4, 0), B.finalPulse.radius,
+          B.finalPulse.color, B.finalPulse.life);
+      /* M9.5 beat 6: the easter-egg reaction ends (M10.3 returns to
+       * idle). */
+      if (ENTITY._eggFired)
+        for (const h of ENTITY._eggReact) h('end', t);
       ENTITY._cascadeFired = false;
       ENTITY._trafficFired = false;
+      ENTITY._eggFired = false;
       ENTITY._beatAt.flare = 0;
       ENTITY._beatAt.ignite = 0;
       ENTITY._beatAt.surge = 0;
       ENTITY._beatAt.cascade = 0;
       ENTITY._beatAt.traffic = 0;
+      ENTITY._beatAt.egg = 0;
     }
     let wakeP = 0;
     if (ENTITY.state === 'STIR') {
@@ -5164,14 +5225,20 @@ const ENTITY = {
     /* M9.3 beat 2: node voxels ignite in radial waves from head level.
      * The front radius grows from the AWAKE entry; each node's lit
      * level smoothsteps in as the front passes, the hot front adds a
-     * Gaussian brightness bump, and the lit level HOLDS through
-     * AWAKE/DECAY (M9.5 dims it outward). DORMANT entry restores the
-     * base colors byte-exact (transition block above). */
+     * Gaussian brightness bump, and the lit level HOLDS through AWAKE,
+     * then (M9.5 beat 7) dims outward during DECAY: a dim front travels
+     * outward from head level and each node's lit excess scales by
+     * (1 − dm) as it passes — it has passed the farthest node + width
+     * by `decayDim.at` fraction of DECAY ⇒ DORMANT entry restores the
+     * base colors byte-exact pop-free (transition block above). */
     if (ENTITY._ignited &&
         (ENTITY.state === 'AWAKE' || ENTITY.state === 'DECAY')) {
       const r = Math.min((t - ENTITY._awakeT0) * B.ignite.speed,
         ENTITY._dream.maxR + B.ignite.width * 3);
       const sig2 = 2 * B.ignite.width * B.ignite.width;
+      let dimR = -1;
+      if (ENTITY.state === 'DECAY')
+        dimR = (t - ENTITY.stateT) * ENTITY._dimSpeed;
       const ic = ENTITY.nodes.instanceColor.array;
       const hue = ENTITY._nodeHue;
       const nb = ENTITY._nodeBright;
@@ -5182,8 +5249,13 @@ const ENTITY = {
         u = u < 0 ? 0 : u > 1 ? 1 : u;
         const ig = u * u * (3 - 2 * u);
         const dd = dist[i] - r;
-        const b = nb[i] + (B.ignite.bright - nb[i]) * ig +
+        let b = nb[i] + (B.ignite.bright - nb[i]) * ig +
           B.ignite.front * Math.exp(-(dd * dd) / sig2);
+        if (dimR >= 0) {
+          let dm = (dimR - dist[i]) / B.ignite.width;
+          dm = dm < 0 ? 0 : dm > 1 ? 1 : dm;
+          b = nb[i] + (b - nb[i]) * (1 - dm * dm * (3 - 2 * dm));
+        }
         const i3 = i * 3;
         ic[i3] = hue[i3] * b;
         ic[i3 + 1] = hue[i3 + 1] * b;
@@ -5212,6 +5284,14 @@ const ENTITY = {
         ENTITY._trafficFired = true;
         ENTITY._beatAt.traffic = t;
         TRAFFIC.awaken();
+      }
+      /* M9.5 beat 6: the Unsloth easter-egg reaction hook (M10.3
+       * registers its reaction via ENTITY.eggReact — nothing visible
+       * until M10 lands). */
+      if (!ENTITY._eggFired && u >= B.egg.delay) {
+        ENTITY._eggFired = true;
+        ENTITY._beatAt.egg = t;
+        for (const h of ENTITY._eggReact) h('start', t);
       }
     }
     /* M9.3 beat 3: tensor rings tilt + limbs reposition, fired with a

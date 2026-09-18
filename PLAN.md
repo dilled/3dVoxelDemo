@@ -68,7 +68,7 @@ smoke-test evidence.
 | **M9.2** ✅ | Wake state machine: DORMANT → STIR (2 s head lift, jaw, rings speed up) → AWAKE (10–20 s) → DECAY → DORMANT, with per-state hooks | State machine smoke test: forced transitions in order, clean return to DORMANT, re-trigger safe |
 | **M9.3** ✅ | Awakening beats 1–3: core-eye flare (emissive ramp + light + flash), node voxels ignite in radial waves, rings accelerate + limbs reposition (shake impulse) | Beats 1–3 play in sequence with correct timing on manual trigger |
 | **M9.4** ✅ | Awakening beats 4–5: energy pulse ring from plaza + city holo-signs/LEDs following the wave (per-ring scheduled ramps), substation arcs fire, steam bursts, drones scatter/re-route, vehicles avoid | The "thousands of compute nodes illuminate" moment lands; wave visibly travels ring by ring |
-| **M9.5** | Awakening beats 6–7 + decay: easter-egg reaction hook (M10), waves dim outward, hum settles, final pulse | Full sequence ends back in DORMANT with one final pulse; re-trigger immediately works |
+| **M9.5** ✅ | Awakening beats 6–7 + decay: easter-egg reaction hook (M10), waves dim outward, hum settles, final pulse | Full sequence ends back in DORMANT with one final pulse; re-trigger immediately works |
 | **M9.6** | Triggers: manual key (`F`) + HUD button, auto-play once ~30 s after intro | All three entry paths (key, button, auto) start the same sequence exactly once |
 | **M10.1** | Voxel neon **sloth** monument atop one compute tower on a side avenue + rooftop "UNSLOTH" holo sign with cycling taglines ("local ≠ slow" / "why rush?") | Monument + sign readable from street; sign cycles; outside default intro framing |
 | **M10.2** | Relaxed holographic sloth silhouette on the antenna arm (billboard + canvas sprite, additive, slow breathing) + 1–2 slow sloth-themed maintenance drones (bigger, soft pink) patrolling that street only | Holo sloth breathes; pink drones patrol only that street |
@@ -667,12 +667,44 @@ lightning event visible from inside the city.
 - **Commit when:** cascade verified end-to-end.
 
 #### M9.5 — Awakening beats 6–7 + decay
-- [ ] Beat 6: Unsloth easter egg reacts (M10.3 hook).
-- [ ] Beat 7: decay — waves dim outward, hum settles, one final pulse,
+- [x] Beat 6: Unsloth easter egg reacts (M10.3 hook).
+- [x] Beat 7: decay — waves dim outward, hum settles, one final pulse,
       back to DORMANT.
 - **Test:** full sequence ends in DORMANT with one final pulse;
       re-trigger immediately works.
 - **Commit when:** full-sequence test passes.
+  Implemented as a hook seam + the decay half of the sequence, all
+  tunables in `CFG.entity.beats` (`egg.delay` 4.2, `decayDim.at` 0.85,
+  `finalPulse` 820 m / 5 s / 0x9fdcff — radius deliberately ≠ the M9.4
+  cascade pulse 660 m so the teardown drop check keeps a distinct
+  signature): **beat 6** fires at AWAKE + 4.2 s (gated on `_ignited`,
+  one fire per sequence via `_eggFired`, re-armed at STIR entry):
+  `ENTITY.eggReact(fn)` gets `fn('start', t)` then `fn('end', t)` at
+  DORMANT entry — M10.3 is the only consumer, nothing is visible until
+  M10 lands (the smoke registers a fake reaction). **Beat 7** = the
+  ignited node grid dims outward during DECAY (front from head level at
+  `ENTITY._dimSpeed = (maxR + width)/(decay · 0.85)`; each node's lit
+  excess × `(1 − dm)`; the front passes the farthest node + width at 85%
+  of DECAY ⇒ the DORMANT-entry byte-exact restore is pop-free) + one
+  final pulse fired at the DECAY→DORMANT transition (gated on
+  `wasIgnited` captured before the transition clears it — a forced
+  non-sequence state never gets one); `ENTITY._finalPulseIt` holds the
+  pool item until the next STIR entry. The "hum settles" audio is
+  M11.3 (no audio system yet — the DECAY/DORMANT state-entry hooks are
+  the seam). Smoke impact by design: a live final pulse at DORMANT
+  entry adds the shared ring's +1 draw call (the ring's `visible` flag
+  is always true ⇒ visible-set checks unaffected; only call counts and
+  `FX.count` move) — M9.2 checks 7/8 now expect `reg.calls + 1`, M9.4
+  check 10 expects `fx === 1` (the 820 m pulse at 0/0.4/0), check 12
+  `fx >= 1`, and M9.3/M9.4/M9.5 section starts wait out the previous
+  section's final pulse (`FX.count === 0`) before baselines. No
+  screenshot gate: the analytic checks are strictly stronger than a
+  picture. Note: the pre-existing timing-sensitive flakes (M6.2
+  heap-flat, M7.3 bolt regen, M7.5 key-N shake, M8.1 star brightness,
+  M9.4 vehicle ease-out) flake in this headless environment (rAF /
+  keyboard latency / GC noise) — re-verified to fail identically at the
+  pre-M9.5 HEAD baseline (M7.5 `energy=1.18` vs the 1.2 threshold),
+  environmental, not M9.5 regressions; every M9.2–M9.5 check passes.
 
 #### M9.6 — Triggers (manual + auto)
 - [ ] Manual: key (e.g. `F`) + HUD button. Auto: plays once ~30 s after
