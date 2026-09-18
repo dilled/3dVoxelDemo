@@ -7453,6 +7453,227 @@ try {
     await sleep(250);
   }
 
+  /* ------------------------------------------------------------------ *
+   * M10.2 — Holographic sloth + sloth drones
+   *
+   *  A relaxed holographic sloth silhouette (billboard canvas sprite,
+   *  additive) hangs on the monument tower's antenna arm, slow
+   *  breathing (per-frame sprite scale). 1–2 sloth-themed maintenance
+   *  drones (bigger, soft pink, extra slow) patrol the monument's
+   *  street only (one avenue line). Both are standalone children of
+   *  WORLD.root (outside the chunk pools ⇒ chunk regen never touches
+   *  them). No forced state — the checks are registration + breathing
+   *  + street-only patrol (bounded + moving + bounce) + bounded draw
+   *  calls + regen-safety + heap flat.
+   * ------------------------------------------------------------------ */
+  {
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      S.ATMOS._ltTimer = 1e9;
+    });
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const hb = await heapMin();
+
+    /* 1. registered: holo sloth (additive billboard, bound to the sloth
+     *    texture) + sloth drones (soft pink, bigger, extra slow) on the
+     *    monument's street */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument;
+      if (!M || !M.holo || !M.droneMesh || !Array.isArray(M.drones))
+        return { ok: false };
+      const D = S.CFG.kit.slothDrone;
+      /* soft pink: red dominant, green below red, blue present (linear) */
+      const pink = c => c.r > 0.9 && c.g < c.r && c.b > 0.5;
+      return {
+        ok: true,
+        holoIsSprite: M.holo.isSprite === true,
+        holoAdditive: M.holo.material.blending === 2,   // AdditiveBlending
+        holoBound: M.holo.material.map === S.KIT.tex.slothHolo.tex,
+        droneCount: M.drones.length,
+        dronePink: M.drones.every(d => pink(d.tint)),
+        droneBigger: D.size > S.CFG.traffic.drone.size,
+        droneSlow: D.speed < S.CFG.traffic.drone.speed[0],
+        axis: M.drones[0].axis,
+        c: M.drones[0].c,
+        span: (M.drones[0].aMax - M.drones[0].aMin) / 2,
+        meshCount: M.droneMesh.count,
+      };
+    });
+    check('M10.2: holo sloth + sloth drones registered (additive billboard, soft-pink/bigger/slow drones on the street)',
+      reg.ok && reg.holoIsSprite && reg.holoAdditive && reg.holoBound &&
+        reg.droneCount >= 1 && reg.droneCount <= 2 && reg.dronePink &&
+        reg.droneBigger && reg.droneSlow,
+      reg.ok
+        ? `${reg.droneCount} drones, axis=${reg.axis} avenue=${Math.round(reg.c)} span=±${Math.round(reg.span)}m, mesh.count=${reg.meshCount}`
+        : 'missing');
+    if (!reg.ok) throw new Error('M10.2: holo sloth / drones missing');
+
+    /* 2. holo sloth breathes (sprite scale oscillates over time) */
+    const br0 = await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument;
+      return { sx: M.holo.scale.x, sy: M.holo.scale.y };
+    });
+    let br1 = br0;
+    for (let i = 0; i < 40; i++) {            // ≤ 4 s — a breathing swing
+      await sleep(100);
+      br1 = await page.evaluate(() => {
+        const M = window.SIM.WORLD.monument;
+        return { sx: M.holo.scale.x, sy: M.holo.scale.y };
+      });
+      if (Math.abs(br1.sx - br0.sx) > 0.02) break;
+    }
+    check('M10.2: holo sloth breathes (sprite scale oscillates)',
+      Math.abs(br1.sx - br0.sx) > 0.02 && br1.sy > 0,
+      `scale.x ${br0.sx.toFixed(3)} -> ${br1.sx.toFixed(3)}`);
+
+    /* 3. sloth drones patrol ONLY the monument's street: fixed cross-
+     *    street coordinate (the avenue), bounded + moving along the
+     *    street, and the instance-matrix cross-street coord stays on
+     *    the avenue line */
+    const p0 = await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument, d = M.drones[0];
+      return { along: d.along, aMin: d.aMin, aMax: d.aMax, c: d.c, axis: d.axis };
+    });
+    await sleep(1500);
+    const p1 = await page.evaluate((along0) => {
+      const M = window.SIM.WORLD.monument, d = M.drones[0];
+      const e = M.droneMesh.instanceMatrix.array;
+      const ix = e[12], iy = e[13], iz = e[14];
+      const cross = d.axis === 'z' ? ix : iz;   // cross-street from the matrix
+      return {
+        along: d.along,
+        inBounds: d.along >= d.aMin - 1e-3 && d.along <= d.aMax + 1e-3,
+        moved: Math.abs(d.along - along0) > 0.05,
+        crossOnStreet: Math.abs(cross - d.c) < 0.5,
+        alt: iy,
+      };
+    }, p0.along);
+    check('M10.2: sloth drones patrol ONLY the monument\'s street (fixed avenue, bounded + moving)',
+      p1.inBounds && p1.moved && p1.crossOnStreet && p0.axis === reg.axis,
+      `axis=${reg.axis} along ${p0.along.toFixed(1)} -> ${p1.along.toFixed(1)} (span ±${Math.round((p0.aMax - p0.aMin) / 2)}m), cross-street on avenue, alt=${p1.alt.toFixed(1)}m`);
+
+    /* 4. the patrol bounces at the span ends (back-and-forth, not a
+     *    one-way pass) — park a drone at the far end, it must turn back */
+    await page.evaluate(() => {
+      const d = window.SIM.WORLD.monument.drones[0];
+      d.along = d.aMax; d.dir = 1;
+    });
+    await sleep(150);
+    const bc = await page.evaluate(() => {
+      const d = window.SIM.WORLD.monument.drones[0];
+      return { along: d.along, dir: d.dir, atEnd: d.along <= d.aMax + 1e-3 };
+    });
+    check('M10.2: sloth drone patrol bounces at the span end (resumes toward the plaza)',
+      bc.dir === -1 && bc.atEnd,
+      `dir=${bc.dir} along=${bc.along.toFixed(1)} (aMax)`);
+
+    /* 5. street view: holo sloth + drones readable from the monument's
+     *    street (screenshot for the record) */
+    const st = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument, B = S.WORLD.BLOCK;
+      const m5 = n => ((n % 5) + 5) % 5;
+      let ax = null, az = null;
+      if (m5(M.bz) === 1) az = (M.bz - 1 + 0.5) * B;
+      else if (m5(M.bz) === 4) az = (M.bz + 1 + 0.5) * B;
+      else if (m5(M.bx) === 1) ax = (M.bx - 1 + 0.5) * B;
+      else ax = (M.bx + 1 + 0.5) * B;
+      const px = ax === null ? M.x : ax;
+      const pz = az === null ? M.z : az;
+      const dx = M.x - px, dz = M.z - pz;
+      const dy = M.hTop + 10 - 1.7;
+      S.CAMERA.pos.set(px, 1.7, pz);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = Math.atan2(-dx, -dz);
+      S.CAMERA.pitch = Math.atan2(dy, Math.hypot(dx, dz));
+      return { px, pz };
+    });
+    await sleep(450);
+    const inHolo = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument;
+      const p = S.project(M.x, M.hTop + 13, M.z);
+      return p.z < 1 && Math.abs(p.x) < 0.9 && Math.abs(p.y) < 0.9;
+    });
+    await page.screenshot({ path: `${here}/shots/m102-sloth-holo-street.png` });
+    check('M10.2: holo sloth readable from the monument street (shots/m102-sloth-holo-street.png)',
+      inHolo, `street=(${Math.round(st.px)},${Math.round(st.pz)})`);
+
+    /* 6. bounded draw-call cost (+2: holo sprite + drone instanced mesh) */
+    const cOn = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument;
+      M.holo.visible = false;
+      M.droneMesh.visible = false;
+    });
+    await sleep(150);
+    const cOff = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument;
+      M.holo.visible = true;
+      M.droneMesh.visible = true;
+    });
+    check('M10.2: holo sloth + sloth drones cost a bounded +2 draw calls',
+      cOn - cOff >= 2 && cOn - cOff <= 3, `delta=${cOn - cOff}`);
+
+    /* 7. chunk regen leaves the holo sloth + drones untouched (standalone,
+     *    outside the chunk pools) */
+    const pre = await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument;
+      return {
+        holoPos: M.holo.position.toArray(),
+        count: M.drones.length,
+        c: M.drones[0].c,
+        axis: M.drones[0].axis,
+      };
+    });
+    await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument;
+      const key = Math.floor(M.bx / 16) + ',' + Math.floor(M.bz / 16);
+      S.WORLD.regen(key);
+    });
+    await sleep(200);
+    const post = await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument;
+      return {
+        holoPos: M.holo.position.toArray(),
+        count: M.drones.length,
+        c: M.drones[0].c,
+        axis: M.drones[0].axis,
+        holoInScene: M.holo.parent === window.SIM.WORLD.root,
+      };
+    });
+    check('M10.2: chunk regen leaves the holo sloth + drones untouched (standalone, outside the chunk pools)',
+      post.holoPos.every((v, i) => v === pre.holoPos[i]) &&
+        post.count === pre.count && post.c === pre.c &&
+        post.axis === pre.axis && post.holoInScene);
+
+    /* 8. heap flat across the section */
+    const ha = await heapMin();
+    check('M10.2: no allocation per frame (heap flat across the section)',
+      hb > 0 && ha > 0 && ha - hb <= 2 * 1024 * 1024,
+      `before=${Math.round(hb / 1024)}KB, after=${Math.round(ha / 1024)}KB`);
+
+    /* reset to the spawn pose for the remaining checks */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(0, 4, 18);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = 0;
+    });
+    await sleep(250);
+  }
+
   /* ---- 10. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));

@@ -266,6 +266,26 @@ const CFG = {
     /* M10.1: the unsloth monument — voxel neon sloth atop one side-avenue
      * compute tower + rooftop UNSLOTH holo sign (shared unsloth texture) */
     slothMonument: { neon: 0xff6fb2, minH: 30 },
+    /* M10.2: the relaxed holo-sloth hologram — a billboard canvas sprite
+     * (additive) hanging on the tower's antenna arm, slow breathing. */
+    slothHolo: {
+      color: 0xffb3d9,      // soft pink holo glow
+      scale: 3.4,           // sprite width (m); height = scale * 176/140
+      breath: 1.0,          // rad/s — slow breathing
+      breathAmp: 0.05,     // breathing scale amplitude
+    },
+    /* M10.2: sloth-themed maintenance drones — bigger, soft pink, extra
+     * slow — patrolling the monument's street only (one avenue line). */
+    slothDrone: {
+      count: 2,             // 1–2 sloth drones
+      color: 0xff9ecb,      // soft pink tint
+      size: 3.0,            // bigger than city drones (2.0)
+      speed: 2.2,           // extra slow (city: 7–13 m/s)
+      altitude: 30,         // street-patrol altitude (m)
+      span: 70,             // patrol half-span along the street (m)
+      bobAmp: 0.5,          // hover bob (m)
+      bob: 0.9,             // rad/s — slow hover bob
+    },
   },
   city: {
     block: 24,                  // metres per block
@@ -1291,6 +1311,45 @@ function makeGlowTexture(size = 128, rgb = '150,235,255') {
   });
 }
 
+/* M10.2: a relaxed sloth silhouette hanging on an antenna arm — a soft
+ * additive holo projection (rendered as a billboard sprite). The canvas
+ * is a STATIC silhouette; the slow breathing is a per-frame sprite scale
+ * in WORLD._updateMonument, not a canvas redraw. */
+function makeSlothHolo(color = '#ffb3d9') {
+  const W = 140, H = 176;
+  return makeCanvasTexture(W, H, (ctx, w, h) => {
+    ctx.clearRect(0, 0, w, h);
+    const cx = w / 2;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 14;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    /* the antenna arm — vertical mast + a short horizontal crossbar */
+    ctx.globalAlpha = 0.7;
+    ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(cx, 8); ctx.lineTo(cx, h - 8); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx - 40, 44); ctx.lineTo(cx + 40, 44); ctx.stroke();
+    /* front limbs wrapped over the crossbar */
+    ctx.lineWidth = 11;
+    ctx.beginPath(); ctx.moveTo(cx - 22, 44); ctx.lineTo(cx - 18, 76); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx + 22, 44); ctx.lineTo(cx + 18, 76); ctx.stroke();
+    /* body — relaxed, drooping */
+    ctx.globalAlpha = 0.9;
+    ctx.beginPath(); ctx.ellipse(cx, 108, 27, 42, 0, 0, 6.2832); ctx.fill();
+    /* head — resting on the front, below the limbs */
+    ctx.beginPath(); ctx.arc(cx, 66, 20, 0, 6.2832); ctx.fill();
+    /* hind legs hanging down */
+    ctx.lineWidth = 10;
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath(); ctx.moveTo(cx - 15, 138); ctx.lineTo(cx - 20, 164); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx + 15, 138); ctx.lineTo(cx + 20, 164); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur = 0;
+  });
+}
+
 /* ---- shared material library (cheap: mostly Lambert/Basic) ---- */
 
 const MATS = {
@@ -1450,6 +1509,8 @@ const KIT = {
       signQwen: makeHoloSign('QWEN', 'FLASH // AWAKENING', '#7fe6ff', 256, 96),
       signUnsloth: makeHoloSign('UNSLOTH', () => KIT._tagline(), '#ffb3d9', 256, 96),
       glow: makeGlowTexture(128, '150,235,255'),
+      /* M10.2: the relaxed holo-sloth silhouette (billboard, additive) */
+      slothHolo: makeSlothHolo('#ffb3d9'),
       /* M4: shared city-sign faces for the WORLD holo-sign billboards */
       signCity: makeHoloSign('UNSLOTH', () => KIT._tagline(), '#ff9ecb', 256, 96),
       signCore: makeHoloSign('QWEN', 'CORE COMPUTE', '#7fe6ff', 256, 96),
@@ -1694,6 +1755,12 @@ const WORLD = {
   _c4: new THREE.Color(),
   _camDir4: new THREE.Vector3(),
   _monD: new THREE.Vector3(),  // M10.1: monument sign billboard scratch
+  /* M10.2: sloth-drone instance scratch (zero per-frame allocation) */
+  _slothM: new THREE.Matrix4(),
+  _slothP: new THREE.Vector3(),
+  _slothQ: new THREE.Quaternion(),
+  _slothS: new THREE.Vector3(1, 1, 1),
+  _slothY: new THREE.Vector3(0, 1, 0),
   monument: null,              // M10.1: { g, body, neon, sign, neonMat, neonBase, bx, bz, x, z, hTop, w }
   stats: { chunks: 0, instances: 0, ring: [0, 0, 0], meters: 0 },
 
@@ -1862,7 +1929,7 @@ const WORLD = {
       WORLD._sync();
       WORLD._updateDetail(t);
     }
-    WORLD._updateMonument(t);
+    WORLD._updateMonument(dt, t);
   },
 
   /* M10.1 — pick the monument tower: one side-avenue compute tower.
@@ -1933,17 +2000,86 @@ const WORLD = {
     sign.position.set(0, 7.2, 0);
     g.add(body, neon, sign);
     WORLD.root.add(g);
+
+    /* M10.2: relaxed holo-sloth hologram — a billboard canvas sprite
+     * (additive) hanging on the tower's antenna arm, above the sign.
+     * Standalone child of WORLD.root (world space) so the monument group
+     * keeps its 3 meshes; breathing is a per-frame sprite scale. */
+    const H = CFG.kit.slothHolo;
+    const holoMat = new THREE.SpriteMaterial({
+      map: KIT.tex.slothHolo.tex, transparent: true,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const holo = new THREE.Sprite(holoMat);
+    holo.scale.set(H.scale, H.scale * (176 / 140), 1);
+    holo.position.set(P.wx, P.info.hTop + 13, P.wz);
+    holo.name = 'sloth-holo';
+    WORLD.root.add(holo);
+
+    /* M10.2: sloth-themed maintenance drones — bigger, soft pink, extra
+     * slow — patrolling the monument's street only (one avenue line).
+     * Standalone InstancedMesh in world space (patrols in world coords). */
+    const D = CFG.kit.slothDrone;
+    const droneGeo = KIT.mergeGeometries([
+      { geo: new THREE.BoxGeometry(1.0, 0.24, 1.0) },
+      { geo: new THREE.BoxGeometry(0.44, 0.06, 0.44),
+        matrix: new THREE.Matrix4().makeTranslation(0.55, 0.14, 0.55) },
+      { geo: new THREE.BoxGeometry(0.44, 0.06, 0.44),
+        matrix: new THREE.Matrix4().makeTranslation(-0.55, 0.14, 0.55) },
+      { geo: new THREE.BoxGeometry(0.44, 0.06, 0.44),
+        matrix: new THREE.Matrix4().makeTranslation(0.55, 0.14, -0.55) },
+      { geo: new THREE.BoxGeometry(0.44, 0.06, 0.44),
+        matrix: new THREE.Matrix4().makeTranslation(-0.55, 0.14, -0.55) },
+      { geo: new THREE.BoxGeometry(0.3, 0.16, 0.3),
+        matrix: new THREE.Matrix4().makeTranslation(0, -0.18, 0.3) },
+    ]);
+    const droneMesh = new THREE.InstancedMesh(
+      droneGeo, new THREE.MeshBasicMaterial({ color: 0xffffff }), D.count);
+    droneMesh.frustumCulled = false;
+    droneMesh.count = 0;
+    droneMesh.name = 'sloth-drones';
+    WORLD.root.add(droneMesh);
+    /* patrol line = the monument's avenue (same priority as the M10.1
+     * street pose): m5(bz)∈{1,4} → runs along x at z; else runs along z
+     * at x. Staggered start positions along the street. */
+    const B = WORLD.BLOCK;
+    const m5 = n => ((n % 5) + 5) % 5;
+    let streetAxis, streetC;
+    if (m5(P.bz) === 1) { streetC = (P.bz - 1 + 0.5) * B; streetAxis = 'x'; }
+    else if (m5(P.bz) === 4) { streetC = (P.bz + 1 + 0.5) * B; streetAxis = 'x'; }
+    else if (m5(P.bx) === 1) { streetC = (P.bx - 1 + 0.5) * B; streetAxis = 'z'; }
+    else { streetC = (P.bx + 1 + 0.5) * B; streetAxis = 'z'; }
+    const streetAlong = streetAxis === 'z' ? P.wz : P.wx;
+    const drones = [];
+    for (let i = 0; i < D.count; i++) {
+      const sgn = i % 2 ? 1 : -1;
+      drones.push({
+        axis: streetAxis,
+        c: streetC,
+        along: streetAlong + sgn * D.span * 0.4 * (i + 1),
+        dir: sgn,
+        speed: D.speed * (0.85 + 0.3 * ((i * 37) % 10) / 10),
+        phase: i * 2.4,
+        aMin: streetAlong - D.span,
+        aMax: streetAlong + D.span,
+        tint: new THREE.Color(D.color),
+      });
+    }
+
     WORLD.monument = {
       g, body, neon, sign, neonMat,
       neonBase: new THREE.Color(CFG.kit.slothMonument.neon),
       bx: P.bx, bz: P.bz, x: P.wx, z: P.wz,
       hTop: P.info.hTop, w: P.info.w,
+      /* M10.2: holo sloth + sloth drones (M10.3 hooks through these) */
+      holo, holoMat,
+      droneMesh, drones, streetAxis, streetC,
     };
   },
 
   /* M10.1 — per-frame: billboard the UNSLOTH sign to the camera
    * (horizontal, like the M4 signs) + a slow neon pulse. */
-  _updateMonument(t) {
+  _updateMonument(dt, t) {
     const m = WORLD.monument;
     if (!m) return;
     const D = WORLD._monD;
@@ -1954,6 +2090,40 @@ const WORLD = {
     }
     const k = 0.8 + 0.2 * Math.sin(t * 1.3);
     m.neonMat.color.copy(m.neonBase).multiplyScalar(k);
+
+    /* M10.2: holo sloth — slow breathing (per-frame sprite scale) */
+    const H = CFG.kit.slothHolo;
+    const br = 1 + H.breathAmp * Math.sin(t * H.breath);
+    m.holo.scale.set(H.scale * br, H.scale * (176 / 140) * br, 1);
+
+    /* M10.2: sloth drones — patrol the monument's street only (one
+     * avenue line); bounce at the span ends. Standalone (world space). */
+    const SD = CFG.kit.slothDrone;
+    const dm = m.droneMesh;
+    for (let i = 0; i < m.drones.length; i++) {
+      const d = m.drones[i];
+      d.along += d.dir * d.speed * dt;
+      if (d.along > d.aMax) { d.along = d.aMax; d.dir = -1; }
+      else if (d.along < d.aMin) { d.along = d.aMin; d.dir = 1; }
+      const bob = SD.bobAmp * Math.sin(t * SD.bob + d.phase);
+      const px = d.axis === 'z' ? d.c : d.along;
+      const pz = d.axis === 'z' ? d.along : d.c;
+      const py = SD.altitude + bob;
+      const yaw = d.axis === 'z'
+        ? (d.dir > 0 ? 0 : Math.PI)
+        : (d.dir > 0 ? Math.PI / 2 : -Math.PI / 2);
+      WORLD._slothP.set(px, py, pz);
+      WORLD._slothQ.setFromAxisAngle(WORLD._slothY, yaw);
+      WORLD._slothS.set(SD.size, SD.size, SD.size);
+      WORLD._slothM.compose(WORLD._slothP, WORLD._slothQ, WORLD._slothS);
+      dm.setMatrixAt(i, WORLD._slothM);
+      dm.setColorAt(i, d.tint);
+    }
+    dm.count = m.drones.length;
+    if (dm.count > 0) {
+      dm.instanceMatrix.needsUpdate = true;
+      if (dm.instanceColor) dm.instanceColor.needsUpdate = true;
+    }
   },
 
   /* (re)build the keep-set around the player, retire the rest */

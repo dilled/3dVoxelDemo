@@ -1,9 +1,10 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-09-18T16:40:29.344Z._
+_Auto-generated. Last updated 2026-09-18T17:55:37.410Z._
 
 - [entity-system-m5](pages/entity-system-m5.md) — category: decision | tags: [entity, m5, creature, instancing] | ENTITY is the 6th system in the fixed boot order (INPUT → CAMERA → KIT → WORLD → **ENTITY** → HUD), registered between WORLD and HUD in `ind
 - [m101-sloth-monument](pages/m101-sloth-monument.md) — category: decision | tags: [m10, unsloth, easter-egg, world] | M10.1 adds the unsloth monument as a **standalone** child of `WORLD.root`
+- [m102-holo-sloth-drones](pages/m102-holo-sloth-drones.md) — category: decision | tags: [m10, unsloth, easter-egg, world, traffic] | M10.2 adds the two remaining "unsloth" pieces to the M10.1 monument, both as
 - [m2-material-kit](pages/m2-material-kit.md) — category: decision | tags: [kit, materials, draw-calls, three] | M2's `KIT` system is the shared foundation every later visual milestone builds on:
 - [m61-object-pool](pages/m61-object-pool.md) — category: decision | tags: [pool, traffic, m6, performance] | `POOL` (top-level module in `index.html`, exposed as `window.SIM.POOL`) is the single object-pool foundation all M6/M7 emitters (drones, veh
 - [m62-traffic-drones](pages/m62-traffic-drones.md) — category: decision | tags: [m6, traffic, pool, tier] | ## Decided

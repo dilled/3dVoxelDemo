@@ -71,7 +71,7 @@ smoke-test evidence.
 | **M9.5** ✅ | Awakening beats 6–7 + decay: easter-egg reaction hook (M10), waves dim outward, hum settles, final pulse | Full sequence ends back in DORMANT with one final pulse; re-trigger immediately works |
 | **M9.6** ✅ | Triggers: manual key (`F`) + HUD button, auto-play once ~30 s after intro | All three entry paths (key, button, auto) start the same sequence exactly once |
 | **M10.1** ✅ | Voxel neon **sloth** monument atop one compute tower on a side avenue + rooftop "UNSLOTH" holo sign with cycling taglines ("local ≠ slow" / "why rush?") | Monument + sign readable from street; sign cycles; outside default intro framing |
-| **M10.2** | Relaxed holographic sloth silhouette on the antenna arm (billboard + canvas sprite, additive, slow breathing) + 1–2 slow sloth-themed maintenance drones (bigger, soft pink) patrolling that street only | Holo sloth breathes; pink drones patrol only that street |
+| **M10.2** ✅ | Relaxed holographic sloth silhouette on the antenna arm (billboard + canvas sprite, additive, slow breathing) + 1–2 slow sloth-themed maintenance drones (bigger, soft pink) patrolling that street only | Holo sloth breathes; pink drones patrol only that street |
 | **M10.3** | Awakening reaction: sign flares, holograph brightens + one slow stretch, sloth drones rise to hover for the pulse, then resume | Reaction plays during AWAKE, everything returns to idle after DECAY |
 | **M11.1** | Audio master graph: compressor → user-mute gain → destination; gesture-gated start (START button), resume-safe | Audio starts only after gesture; mute key mutes all; refresh/re-entry safe |
 | **M11.2** | Looping beds: reactor hum (detuned sines + sub + LFO), fans (filtered noise, band-pass sweep), distant machinery (noise + random low thumps) | Beds run indefinitely without audible repeats/bugs; identifiable as "machine city" within 3 s |
@@ -792,12 +792,49 @@ narrative (dormant → stir → awake → pulse → settle) in ≤ 30 s.
   environmental, not M10.1 regressions.
 
 #### M10.2 — Holographic sloth + sloth drones
-- [ ] Relaxed holographic sloth silhouette on the tower's antenna arm,
+- [x] Relaxed holographic sloth silhouette on the tower's antenna arm,
       slow breathing (billboard + canvas sprite, additive).
-- [ ] 1–2 sloth-themed maintenance drones (extra slow, slightly larger,
+- [x] 1–2 sloth-themed maintenance drones (extra slow, slightly larger,
       soft pink light) patrolling that street only.
 - **Test:** holo sloth breathes; pink drones patrol only that street.
 - **Commit when:** both verified.
+  Both are **standalone children of `WORLD.root`** (world space, outside the
+  chunk pools ⇒ chunk regen / LOD / wave-restore never touch them — and not
+  children of the monument group `g`, so `g.children` stays 3 and the M10.1
+  smoke is untouched). **Holo sloth** = a `THREE.Sprite` on `KIT.tex.slothHolo`
+  (`makeSlothHolo`, a static soft-pink silhouette of a sloth hanging on an
+  antenna arm: mast + crossbar + limbs + drooping body + resting head +
+  hanging legs), additive, `depthWrite:false`, at `(wx, hTop+13, wz)` above
+  the M10.1 sign — the **slow breathing is a per-frame sprite scale**
+  (`1 + breathAmp·sin(t·breath)`) in `WORLD._updateMonument`, not a canvas
+  redraw. **Sloth drones** = one `InstancedMesh` reusing the M6.2 voxel-quad
+  drone geometry, `count` = `CFG.kit.slothDrone.count` = 2, bigger
+  (`size 3.0` vs city 2.0), soft pink tint (`0xff9ecb`), extra slow
+  (`speed 2.2` vs city 7–13 m/s), patrolling **the monument's street only**
+  (one avenue line, not the general roof-dock fleet): per-drone state
+  `WORLD.monument.drones[] = { axis, c, along, dir, speed, phase, aMin,
+  aMax, tint }` — `c` is the fixed cross-street coordinate (the avenue),
+  `along` varies within `[streetAlong ± span]` (span 70 m) and **bounces**
+  at the ends (back-and-forth patrol, not a one-way pass); `altitude 30 m`,
+  slow hover bob. Street line (same priority as the M10.1 street pose):
+  `m5(bz)∈{1,4}` → runs along x at `z=streetC`; else `m5(bx)∈{1,4}` → runs
+  along z at `x=streetC` — current seed ⇒ `axis='z'`, `streetC=x=−108`,
+  `streetAlong=84` ⇒ drones patrol z∈[14,154] at x=−108. +2 draw calls (holo
+  sprite + drone instanced mesh), zero per-frame allocation (pre-allocated
+  scratch on `WORLD`); `WORLD._updateMonument` now takes `(dt, t)`. **M10.3
+  seam** (exposed only, not implemented): `WORLD.monument.{ holo, holoMat,
+  droneMesh, drones, streetAxis, streetC }` — M10.3 brightens/stretches the
+  holo and rises the drones to hover, then resumes (hooks through the
+  existing `ENTITY.eggReact` seam). Smoke M10.2 8 checks green (registration:
+  holo is an additive Sprite bound to the shared sloth texture, 2 drones
+  soft-pink/bigger/slow on the street; holo breathes — sprite scale
+  oscillates; patrol ONLY the street — fixed avenue `c`, bounded + moving
+  `along`, instance-matrix cross-street coord on the avenue line; patrol
+  bounces at the span end — dir flips, stays ≤ aMax; street screenshot
+  `smoke/shots/m102-sloth-holo-street.png`; draw-call delta exactly 2; chunk
+  regen leaves holo position + drone count/c/axis untouched; heap flat). The
+  only failure is the documented pre-existing M7.5 headless flake
+  (camera-shake `energy=1.18` baseline — untouched by M10.2).
 
 #### M10.3 — Awakening reaction
 - [ ] Sign flares, holograph brightens + one slow stretch animation,
