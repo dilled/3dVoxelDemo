@@ -7229,6 +7229,230 @@ try {
     });
   }
 
+  /* ------------------------------------------------------------------
+   * M10.1 — Unsloth easter egg: voxel neon sloth monument + UNSLOTH sign
+   *
+   *  One side-avenue compute tower (seeded, mid-distance, plaza south
+   *  side ⇒ outside the default intro-reveal framing) carries a voxel
+   *  neon sloth on its crown + a rooftop UNSLOTH holo sign on the
+   *  shared unsloth texture (tagline cycles via KIT._tagline). The
+   *  monument is standalone (outside the chunk pools) ⇒ chunk regen
+   *  never moves it. No forced state in this section — the checks are
+   *  placement + framing + tagline cycle + street readability (on/off
+   *  brightness) + bounded draw calls + regen-safety + heap flat.
+   * ------------------------------------------------------------------ */
+  {
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.ENTITY._dream.nextAt = performance.now() / 1000 + 60;
+      S.ATMOS._ltTimer = 1e9;
+    });
+
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory)
+          m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const hb = await heapMin();
+
+    /* 1. registered: one side-avenue compute tower, mid-distance,
+     *    plaza south side, sign bound to the shared unsloth texture */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument;
+      if (!M || !M.g || M.g.children.length !== 3) return { ok: false };
+      const m5 = n => ((n % 5) + 5) % 5;
+      const d = Math.hypot(M.x, M.z);
+      const info = S.WORLD.buildingAt(M.bx, M.bz, 0,
+        ['server'], S.CFG.kit.slothMonument.minH);
+      return {
+        ok: true,
+        onAvenue: m5(M.bx) !== 0 && m5(M.bz) !== 0 &&
+          (m5(M.bx) === 1 || m5(M.bx) === 4 ||
+           m5(M.bz) === 1 || m5(M.bz) === 4),
+        south: M.bz > 0,
+        mid: d >= 100 && d <= 300,
+        server: !!info && info.arch === 'server' &&
+          info.h >= S.CFG.kit.slothMonument.minH,
+        onRoof: !!info && Math.abs(M.hTop - info.hTop) < 1e-6,
+        signBound: M.sign.material.map === S.KIT.tex.signUnsloth.tex,
+        d, bx: M.bx, bz: M.bz, hTop: M.hTop,
+      };
+    });
+    check('M10.1: monument registered — voxel sloth + UNSLOTH sign on a side-avenue compute tower (mid-distance, plaza south side)',
+      reg.ok && reg.onAvenue && reg.south && reg.mid && reg.server &&
+        reg.onRoof && reg.signBound,
+      reg.ok
+        ? `block=(${reg.bx},${reg.bz}) d=${Math.round(reg.d)}m hTop=${Math.round(reg.hTop)}m`
+        : 'monument missing');
+    if (!reg.ok) throw new Error('M10.1: monument missing');
+
+    /* 2. outside the default intro-reveal framing (spawn pose) */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(0, 4, 18);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = 0;
+    });
+    await sleep(300);
+    const fr = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument;
+      const out = p => p.z > 1 || Math.abs(p.x) > 1 || Math.abs(p.y) > 1;
+      return {
+        m: out(S.project(M.x, M.hTop + 2, M.z)),
+        s: out(S.project(M.x, M.hTop + 7.2, M.z)),
+      };
+    });
+    check('M10.1: monument + sign outside the default intro-reveal framing (spawn pose)',
+      fr.m && fr.s);
+
+    /* 3. tagline cycles (8 s) on the shared unsloth texture (8 Hz redraw) */
+    const tg0 = await page.evaluate(() => ({
+      tag: window.SIM.KIT._tagline(),
+      frame: window.SIM.KIT.tex.signUnsloth.frame,
+    }));
+    await sleep(1100);
+    const tg1 = await page.evaluate(() => ({
+      frame: window.SIM.KIT.tex.signUnsloth.frame,
+    }));
+    let tg2 = tg0.tag;
+    for (let i = 0; i < 40; i++) {           // ≤ 20 s — one 8 s flip inside
+      tg2 = await page.evaluate(() => window.SIM.KIT._tagline());
+      if (tg2 !== tg0.tag) break;
+      await sleep(500);
+    }
+    const tags = ['LOCAL ≠ SLOW', 'WHY RUSH?'];
+    check('M10.1: UNSLOTH tagline cycles ("local ≠ slow" / "why rush?") and the sign texture animates',
+      tags.includes(tg0.tag) && tags.includes(tg2) && tg2 !== tg0.tag &&
+        tg1.frame > tg0.frame,
+      `${tg0.tag} -> ${tg2}, tex.frame ${tg0.frame} -> ${tg1.frame}`);
+
+    /* 4. street view: monument + sign inside the frame from the nearest
+     *    avenue, and the monument adds visible bright content (on/off)
+     *    — the "readable from street" gate. Screenshot for the record. */
+    const st = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument, B = S.WORLD.BLOCK;
+      const m5 = n => ((n % 5) + 5) % 5;
+      let ax = null, az = null;
+      if (m5(M.bz) === 1) az = (M.bz - 1 + 0.5) * B;
+      else if (m5(M.bz) === 4) az = (M.bz + 1 + 0.5) * B;
+      else if (m5(M.bx) === 1) ax = (M.bx - 1 + 0.5) * B;
+      else ax = (M.bx + 1 + 0.5) * B;
+      const px = ax === null ? M.x : ax;
+      const pz = az === null ? M.z : az;
+      const dx = M.x - px, dz = M.z - pz;
+      const dy = M.hTop + 3 - 1.7;
+      S.CAMERA.pos.set(px, 1.7, pz);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = Math.atan2(-dx, -dz);
+      S.CAMERA.pitch = Math.atan2(dy, Math.hypot(dx, dz));
+      return { px, pz };
+    });
+    await sleep(450);
+    const ins = await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument;
+      const inndc = p => p.z < 1 && Math.abs(p.x) < 0.75 && Math.abs(p.y) < 0.75;
+      const pm = S.project(M.x, M.hTop + 2, M.z);
+      const ps = S.project(M.x, M.hTop + 7.2, M.z);
+      return {
+        m: inndc(pm), s: inndc(ps),
+        /* sign centre in frame coords for the on/off crop */
+        sx: (ps.x + 1) / 2, sy: (1 - ps.y) / 2,
+      };
+    });
+    const cVis = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    await page.screenshot({ path: `${here}/shots/m101-sloth-street.png` });
+    await page.evaluate(() => {
+      window.SIM.WORLD.monument.g.visible = false;
+    });
+    await sleep(150);
+    const cOff = await page.evaluate(() => window.SIM.renderer.info.render.calls);
+    await page.screenshot({ path: `${here}/shots/m101-sloth-off.png` });
+    await page.evaluate(() => {
+      window.SIM.WORLD.monument.g.visible = true;
+    });
+    /* sign-region mean luminance, on vs off (screenshots decoded in-page
+     * — the live WebGL canvas has no preserveDrawingBuffer). Crop a box
+     * around the sign's projected centre: the monument is small in the
+     * frame, so the full-frame mean barely moves. */
+    const decSign = b64 => page.evaluate(async ([b64, cx, cy]) => {
+      const img = new Image();
+      await new Promise((res, rej) => {
+        img.onload = res; img.onerror = rej;
+        img.src = 'data:image/png;base64,' + b64;
+      });
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const bw = Math.floor(c.width * 0.2), bh = Math.floor(c.height * 0.25);
+      const x0 = Math.max(0, Math.min(c.width - 1 - bw, Math.floor(c.width * cx) - Math.floor(bw / 2)));
+      const y0 = Math.max(0, Math.min(c.height - 1 - bh, Math.floor(c.height * cy) - Math.floor(bh / 2)));
+      const d = ctx.getImageData(x0, y0, bw, bh).data;
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4)
+        sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      return sum / (d.length / 4);
+    }, [b64, ins.sx, ins.sy]);
+    const onB64 = fs.readFileSync(
+      `${here}/shots/m101-sloth-street.png`).toString('base64');
+    const offB64 = fs.readFileSync(
+      `${here}/shots/m101-sloth-off.png`).toString('base64');
+    const [cmpOn, cmpOff] = await Promise.all([
+      decSign(onB64), decSign(offB64),
+    ]);
+    check('M10.1: monument + sign readable from the street (shots/m101-sloth-street.png, on/off brightness)',
+      ins.m && ins.s && cmpOn > cmpOff + 1,
+      `street=(${Math.round(st.px)},${Math.round(st.pz)}) sign-region mean ${cmpOff.toFixed(1)} -> ${cmpOn.toFixed(1)}`);
+
+    /* 5. bounded draw-call cost (+3 meshes: body, neon, sign) */
+    check('M10.1: monument costs a bounded +3 draw calls',
+      cVis - cOff >= 2 && cVis - cOff <= 4, `delta=${cVis - cOff}`);
+
+    /* 6. chunk regen leaves the monument untouched (standalone, outside
+     *    the chunk pools) */
+    const pre = await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument;
+      return { sign: M.sign.matrixWorld.elements.slice() };
+    });
+    await page.evaluate(() => {
+      const S = window.SIM, M = S.WORLD.monument;
+      const key = Math.floor(M.bx / 16) + ',' + Math.floor(M.bz / 16);
+      S.WORLD.regen(key);
+    });
+    await sleep(200);
+    const post = await page.evaluate(() => {
+      const M = window.SIM.WORLD.monument;
+      return {
+        sign: M.sign.matrixWorld.elements.slice(),
+        children: M.g.children.length,
+      };
+    });
+    check('M10.1: chunk regen leaves the monument untouched (standalone, outside the chunk pools)',
+      post.children === 3 && pre.sign.every((v, i) => v === post.sign[i]));
+
+    /* 7. heap flat across the section */
+    const ha = await heapMin();
+    check('M10.1: no allocation per frame (heap flat across the section)',
+      hb > 0 && ha > 0 && ha - hb <= 2 * 1024 * 1024,
+      `before=${Math.round(hb / 1024)}KB, after=${Math.round(ha / 1024)}KB`);
+
+    /* reset to the spawn pose for the remaining checks */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(0, 4, 18);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = 0;
+    });
+    await sleep(250);
+  }
+
   /* ---- 10. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));

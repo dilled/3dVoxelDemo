@@ -70,7 +70,7 @@ smoke-test evidence.
 | **M9.4** ✅ | Awakening beats 4–5: energy pulse ring from plaza + city holo-signs/LEDs following the wave (per-ring scheduled ramps), substation arcs fire, steam bursts, drones scatter/re-route, vehicles avoid | The "thousands of compute nodes illuminate" moment lands; wave visibly travels ring by ring |
 | **M9.5** ✅ | Awakening beats 6–7 + decay: easter-egg reaction hook (M10), waves dim outward, hum settles, final pulse | Full sequence ends back in DORMANT with one final pulse; re-trigger immediately works |
 | **M9.6** ✅ | Triggers: manual key (`F`) + HUD button, auto-play once ~30 s after intro | All three entry paths (key, button, auto) start the same sequence exactly once |
-| **M10.1** | Voxel neon **sloth** monument atop one compute tower on a side avenue + rooftop "UNSLOTH" holo sign with cycling taglines ("local ≠ slow" / "why rush?") | Monument + sign readable from street; sign cycles; outside default intro framing |
+| **M10.1** ✅ | Voxel neon **sloth** monument atop one compute tower on a side avenue + rooftop "UNSLOTH" holo sign with cycling taglines ("local ≠ slow" / "why rush?") | Monument + sign readable from street; sign cycles; outside default intro framing |
 | **M10.2** | Relaxed holographic sloth silhouette on the antenna arm (billboard + canvas sprite, additive, slow breathing) + 1–2 slow sloth-themed maintenance drones (bigger, soft pink) patrolling that street only | Holo sloth breathes; pink drones patrol only that street |
 | **M10.3** | Awakening reaction: sign flares, holograph brightens + one slow stretch, sloth drones rise to hover for the pulse, then resume | Reaction plays during AWAKE, everything returns to idle after DECAY |
 | **M11.1** | Audio master graph: compressor → user-mute gain → destination; gesture-gated start (START button), resume-safe | Audio starts only after gesture; mute key mutes all; refresh/re-entry safe |
@@ -752,12 +752,44 @@ narrative (dormant → stir → awake → pulse → settle) in ≤ 30 s.
 ### M10 — Unsloth easter egg (subtle, integrated)
 
 #### M10.1 — Sloth monument + "UNSLOTH" sign
-- [ ] One side avenue, mid-distance: voxel **neon sloth** monument atop
+- [x] One side avenue, mid-distance: voxel **neon sloth** monument atop
       a compute tower + rooftop "UNSLOTH" holo sign, tagline cycles
       ("local ≠ slow" / "why rush?").
 - **Test:** monument + sign readable from street; tagline cycles; both
       outside the default intro-reveal framing.
 - **Commit when:** verified on screen + framing check.
+  Standalone child of `WORLD.root` (outside the chunk pools ⇒ chunk
+  regen / LOD / wave-restore never touch it). Deterministic pick
+  (`WORLD._pickMonument`, seeded city): plaza south side (bz > 0 ⇒
+  behind the spawn camera ⇒ outside the default intro-reveal framing),
+  avenue-adjacent, 100–300 m mid-distance, first
+  `buildingAt(bx,bz,0,['server'],minH)` hit with
+  `CFG.kit.slothMonument.minH = 30` — current seed ⇒ block (−4, +3),
+  (−84, +84), hTop ≈ 37.9 m, avenue x = −108. +3 draw calls, zero
+  per-frame allocation: dark merged voxel-sloth mesh (pedestal +
+  body + head + arms + legs + tail + face, `MATS.metalDark`) + neon
+  merged mesh (face plate + chest + pedestal trim, pulsing
+  `MeshBasicMaterial` 0xff6fb2) + billboard sign plane (shared
+  `signGeo` 8×3 m at local (0, 7.2, 0)) on `MATS.signMat.unsloth`
+  (map = `KIT.tex.signUnsloth`) — the "UNSLOTH" text, the 8 s tagline
+  cycle ("LOCAL ≠ SLOW" / "WHY RUSH?", `KIT._tagline`) and the 8 Hz
+  flicker redraw animate for free. Facing baked into the merged
+  geometries (face the plaza); per-frame `WORLD._updateMonument`
+  billboards the sign horizontally (M4 pattern, pre-allocated scratch)
+  + slow neon pulse. Subtle by design — scale consistent with the M4
+  city holo-signs; the awakening reaction is M10.3 (hooks through the
+  existing `ENTITY.eggReact` seam). Smoke M10.1 8 checks green
+  (registration: side avenue / south / mid-distance / server arch /
+  on roof / sign bound to the shared unsloth texture; outside the
+  spawn-pose framing via `SIM.project` NDC; tagline flips within 20 s
+  + texture frame advances; street pose — monument + sign inside NDC
+  and sign-region mean luminance on/off (8.2 → 9.6) with screenshots
+  `smoke/shots/m101-sloth-street.png` / `m101-sloth-off.png`; draw-
+  call delta exactly 3; chunk regen leaves the sign matrixWorld
+  byte-identical; heap flat). The only failures are the documented
+  pre-existing headless flakes (M7.5 key-N shake `energy=1.18` — the
+  documented baseline value, M8.1 star brightness, M9.3 heap-flat),
+  environmental, not M10.1 regressions.
 
 #### M10.2 — Holographic sloth + sloth drones
 - [ ] Relaxed holographic sloth silhouette on the tower's antenna arm,
