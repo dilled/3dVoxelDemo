@@ -97,6 +97,21 @@
     transition: opacity 0.5s ease;
   }
   #overlay.hide { opacity: 0; pointer-events: none; }
+  /* M12: intro mode — the cinematic plays on a clean canvas; the
+     * title/subtitle drop away and the START button stays as the
+     * skip affordance (M12.3: visible-delay + fade) */
+  #overlay.intro {
+    background: none;
+    pointer-events: none;
+  }
+  #overlay.intro .title,
+  #overlay.intro .subtitle { display: none; }
+  #overlay.intro #startBtn {
+    position: absolute;
+    bottom: 7vh;
+    left: 50%;
+    transform: translateX(-50%);
+  }
   #overlay .title {
     font-size: 15px;
     letter-spacing: 0.42em;
@@ -776,6 +791,27 @@ const CFG = {
       settle: 0.3,           // s — channel held a bit past its one-shot
     },
   },
+
+  /* ---- M12: intro cinematic — beat 1 is a dark server corridor:
+   * a near-black instanced tunnel of LED strips with a camera dolly
+   * on the INTRO timeline runner. No async resources: the tunnel is
+   * built synchronously at init. */
+  intro: {
+    corridor: {
+      len: 120,            // m — tunnel length (axis -Z, centred 0)
+      width: 10, height: 6, // m — tunnel cross-section
+      bg: 0x010208,        // near-black (scene bg + fog colour)
+      fogDensity: 0.022,   // the far end barely reads
+      rackGap: 5,          // m between rack pairs (both walls)
+      dashLines: 4,        // LED strip lines (2 per wall)
+      dashesPerLine: 24,   // flowing dashes per line
+      dashSpeed: 26,       // m/s — data flow along -Z
+      dashSize: [0.25, 0.15, 1.4], // m — one dash box
+      eyeY: 2.5,           // m — dolly eye height
+    },
+    beat1: { dur: 4.4 },  // s — corridor dolly length
+    street: { pos: [0, 4, 18], look: [0, 2, 0] }, // M0 spawn handoff
+  },
 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -800,20 +836,38 @@ const TIER = {
 };
 
 /* ------------------------------------------------------------------ *
- * BOOT — deterministic state machine: LOADER → RUNNING (→ ERROR)
+ * BOOT — deterministic state machine: LOADER → INTRO → RUNNING (→ ERROR)
  * - guards against double-start
  * - the START click is the user gesture that unlocks audio (M11 beds
- *   attach to the same unlock in a later milestone)
+ *   attach to the same unlock in a later milestone); during the M12
+ *   intro it is the skip affordance (INTRO → street camera → RUNNING)
  * ------------------------------------------------------------------ */
 const BOOT = {
-  state: 'LOADER',          // LOADER | RUNNING | ERROR
+  state: 'LOADER',          // LOADER | INTRO | RUNNING | ERROR
   started: false,
   frames: 0,
   t0: 0,                    // s: RUNNING entry time — intro-end anchor (M9.6)
+  looping: false,
+
+  /* the rAF loop starts at the first state that renders (INTRO or,
+   * without an intro, RUNNING) — never twice. */
+  _startLoop() {
+    if (BOOT.looping) return;
+    BOOT.looping = true;
+    lastNow = performance.now();
+    requestAnimationFrame(frame);          // one and only one loop
+  },
 
   enter(next) {
     if (BOOT.started && next === 'RUNNING') return;   // no double-init
     BOOT.state = next;
+    if (next === 'INTRO') {
+      /* M12: the cinematic auto-plays — no audio (no gesture yet); the
+       * corridor scene renders instead of the city until skip/end. */
+      document.getElementById('overlay').classList.add('intro');
+      BOOT._startLoop();
+      INTRO.play(INTRO._beat1(), INTRO._toStreet);
+    }
     if (next === 'RUNNING') {
       BOOT.started = true;
       BOOT.t0 = performance.now() / 1000; // M9.6: intro-end anchor
@@ -822,8 +876,7 @@ const BOOT = {
       document.getElementById('hud').classList.add('on');
       document.getElementById('hint').classList.add('on');
       document.getElementById('awakeBtn').classList.add('on');
-      lastNow = performance.now();
-      requestAnimationFrame(frame);        // one and only one loop
+      BOOT._startLoop();
     }
   },
 
@@ -6180,7 +6233,10 @@ const ENTITY = {
     if (!ENTITY._autoFired) {
       if (ENTITY._autoAt === null && BOOT.t0 > 0)
         ENTITY._autoAt = BOOT.t0 + CFG.entity.trigger.auto;
-      if (t >= ENTITY._autoAt) {
+      /* M12: the loop now also runs during the intro (BOOT.t0 = 0,
+       * _autoAt still null) — only fire once the anchor is set, so the
+       * auto-awaken stays a post-RUNNING event. */
+      if (ENTITY._autoAt !== null && t >= ENTITY._autoAt) {
         ENTITY._autoFired = true;
         if (!ENTITY._userTriggered) ENTITY.wake();
       }
@@ -7049,8 +7105,271 @@ const HUD = {
   },
 };
 
+/* ------------------------------------------------------------------ *
+ * INTRO — M12 intro cinematic: camera-keyframe timeline runner +
+ * beat 1 (dark server corridor).
+ *
+ * Timeline runner (no async resources anywhere): play(track, onDone)
+ * / cancel() / seek(t), driven from the central update loop. A track
+ * is a list of keyframes { t, pos: [x,y,z], look: [x,y,z] }, eased
+ * (smoothstep) between consecutive pairs. While playing, INTRO owns
+ * the camera pose — written AFTER CAMERA.update, so it wins the frame;
+ * on cancel the camera returns to CAMERA.pos on the next frame; at
+ * the track end onDone(t) runs (the intro hands off to the street
+ * camera via _toStreet). seek works playing or cancelled — it just
+ * applies the pose at time t.
+ *
+ * Beat 1: a near-black instanced tunnel of LED strips — shell + rack
+ * rows + strip lines + flowing dashes, built synchronously in init in
+ * its own scene (rendered instead of the city while INTRO plays). 4
+ * draw calls, zero per-frame allocation.
+ * ------------------------------------------------------------------ */
+const INTRO = {
+  name: 'INTRO',
+  scene: null,            // corridor scene (rendered while INTRO plays)
+  shell: null,            // merged tunnel shell (1 draw call)
+  racks: null,            // InstancedBox batcher — rack rows (1 call)
+  strips: null,           // merged LED strip lines (1 call)
+  dashes: null,           // InstancedBox batcher — flowing dashes (1 call)
+  _dashZ: null,           // Float32Array — dash z (flow along -Z, wrap)
+  _dashLine: null,        // Int16Array — dash line index
+  _lineXY: null,          // [[x, y], …] — strip line anchors
+  _m4: null,
+  _pos: null,             // pose scratch (Vector3)
+  _look: null,
+  playing: false,
+  track: null,            // keyframes [{ t, pos, look }]
+  t: 0,
+  dur: 0,
+  onDone: null,
+
+  init() {
+    const C = CFG.intro.corridor;
+    const L = C.len, W = C.width, H = C.height;
+    INTRO.scene = new THREE.Scene();
+    INTRO.scene.background = new THREE.Color(C.bg);
+    INTRO.scene.fog = new THREE.FogExp2(C.bg, C.fogDensity);
+    /* one dim ambient so the Lambert shell/racks read (the strips and
+     * dashes are unlit Basic — they carry the light). */
+    INTRO.scene.add(new THREE.AmbientLight(0x33445c, 0.9));
+
+    /* shell: floor / ceiling / side walls / end walls — merged into
+     * one static mesh (1 draw call). The end walls close the tunnel;
+     * M12.2's "corridor opens" beat removes/opens the far one. */
+    const box = (w, h, d, x, y, z) => ({
+      geo: new THREE.BoxGeometry(w, h, d),
+      matrix: new THREE.Matrix4().makeTranslation(x, y, z),
+    });
+    INTRO.shell = new THREE.Mesh(KIT.mergeGeometries([
+      box(W, 0.5, L, 0, -0.25, 0),              // floor
+      box(W, 0.5, L, 0, H + 0.25, 0),           // ceiling
+      box(0.5, H, L, -W / 2 - 0.25, H / 2, 0), // left wall
+      box(0.5, H, L, W / 2 + 0.25, H / 2, 0),  // right wall
+      box(W, H, 0.5, 0, H / 2, -L / 2 - 0.25), // far end wall
+      box(W, H, 0.5, 0, H / 2, L / 2 + 0.25),  // near end wall
+    ]), MATS.server);
+    INTRO.scene.add(INTRO.shell);
+
+    /* rack rows: instanced server racks along both walls (1 call),
+     * deterministic per-instance tint salt (no two neighbours equal). */
+    const perSide = Math.floor(L / C.rackGap);
+    INTRO.racks = KIT.InstancedBox(perSide * 2, [1.8, 3, 1.2], MATS.metalDark);
+    const tint = new THREE.Color();
+    for (let s = 0; s < 2; s++) {
+      const x = s === 0 ? -W / 2 + 0.65 : W / 2 - 0.65;
+      for (let i = 0; i < perSide; i++) {
+        const z = -L / 2 + C.rackGap / 2 + i * C.rackGap;
+        const v = 0.72 + ((i * 37 + s * 11) % 10) * 0.04;
+        tint.setRGB(v * 0.72, v * 0.82, v);
+        INTRO.racks.add(x, 1.5, z, 1, tint.getHex());
+      }
+    }
+    INTRO.racks.commit();
+    INTRO.scene.add(INTRO.racks.mesh);
+
+    /* LED strip lines: 4 long emissive strips (2 per wall) — merged,
+     * 1 draw call. The flowing dashes ride the same 4 lines. */
+    const sy = [0.4, H - 0.4];
+    INTRO._lineXY = [];
+    for (const s of [-1, 1]) for (const y of sy)
+      INTRO._lineXY.push([s * (W / 2 - 0.06), y]);
+    const sparts = [];
+    for (const [lx, ly] of INTRO._lineXY)
+      sparts.push({
+        geo: new THREE.BoxGeometry(0.12, 0.12, L),
+        matrix: new THREE.Matrix4().makeTranslation(lx, ly, 0),
+      });
+    INTRO._stripMat = new THREE.MeshBasicMaterial({
+      color: 0x3fd4ff, toneMapped: false,
+    });
+    INTRO.strips = new THREE.Mesh(KIT.mergeGeometries(sparts), INTRO._stripMat);
+    INTRO.scene.add(INTRO.strips);
+
+    /* flowing dashes: the "data" on the strips — instanced (1 call),
+     * flow along -Z and wrap. Per-instance colour set once at init.
+     * All per-dash state is pre-allocated ⇒ zero per-frame allocation. */
+    const n = C.dashLines * C.dashesPerLine;
+    INTRO._dashMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 0.95,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+      toneMapped: false,
+    });
+    INTRO.dashes = KIT.InstancedBox(n, C.dashSize, INTRO._dashMat);
+    INTRO._dashZ = new Float32Array(n);
+    INTRO._dashLine = new Int16Array(n);
+    INTRO._m4 = new THREE.Matrix4();
+    const span = L + 8;
+    const col = new THREE.Color();
+    for (let i = 0; i < n; i++) {
+      const line = i % C.dashLines;            // interleaved across lines
+      INTRO._dashLine[i] = line;
+      INTRO._dashZ[i] = -L / 2 - 4 + ((i * 97) % 1000) / 1000 * span;
+      INTRO._m4.makeTranslation(INTRO._lineXY[line][0], INTRO._lineXY[line][1], INTRO._dashZ[i]);
+      INTRO.dashes.mesh.setMatrixAt(i, INTRO._m4);
+      col.set(i % 13 === 0 ? 0xffd166 : i % 7 === 0 ? 0xffffff : 0x9ff2ff);
+      INTRO.dashes.mesh.setColorAt(i, col);
+    }
+    /* matrices written directly on the mesh (not via add) — set the
+     * batcher count so commit() exposes all instances. */
+    INTRO.dashes.count = n;
+    INTRO.dashes.commit();
+    INTRO.scene.add(INTRO.dashes.mesh);
+
+    INTRO._pos = new THREE.Vector3();
+    INTRO._look = new THREE.Vector3();
+  },
+
+  /* Beat 1: the corridor dolly — ease in, cruise, ease out (three
+   * keyframes, smoothstep between them); the look point stays 20 m
+   * ahead so the tunnel rushes by. */
+  _beat1() {
+    const C = CFG.intro.corridor;
+    const d = CFG.intro.beat1.dur;
+    const z0 = C.len / 2 - 6, z1 = -C.len / 2 + 6, y = C.eyeY;
+    return [
+      { t: 0,        pos: [0, y, z0], look: [0, y, z0 - 20] },
+      { t: d * 0.5,  pos: [0, y, 0],  look: [0, y, -20] },
+      { t: d,        pos: [0, y, z1], look: [0, y, z1 - 20] },
+    ];
+  },
+
+  /* ---- timeline runner API ---- */
+  play(track, onDone) {
+    if (!track || track.length < 2) return;
+    INTRO.track = track;
+    INTRO.t = 0;
+    INTRO.dur = track[track.length - 1].t;
+    INTRO.onDone = onDone || null;
+    INTRO.playing = true;
+    INTRO._applyPose();
+  },
+
+  cancel() {
+    if (!INTRO.playing) return;
+    INTRO.playing = false;
+    INTRO.onDone = null;
+    /* the camera returns to CAMERA.pos on the next frame — CAMERA
+     * update writes it; INTRO simply stops overwriting. */
+  },
+
+  seek(t) {
+    if (!INTRO.track) return;
+    INTRO.t = clamp(t, 0, INTRO.dur);
+    INTRO._applyPose();
+  },
+
+  update(dt, t) {
+    if (INTRO.playing) {
+      INTRO.t += dt;
+      if (INTRO.t >= INTRO.dur) {
+        INTRO.t = INTRO.dur;
+        INTRO.playing = false;
+        INTRO._applyPose();
+        const done = INTRO.onDone;
+        INTRO.onDone = null;
+        if (done) done(INTRO.t);
+      } else {
+        INTRO._applyPose();
+      }
+      INTRO._advanceDashes(dt);
+    }
+  },
+
+  /* keyframe pair + smoothstep → camera pose (position + lookAt) */
+  _applyPose() {
+    const kfs = INTRO.track;
+    if (!kfs) return;
+    let i = kfs.length - 2;
+    for (let j = 0; j < kfs.length - 1; j++) {
+      if (INTRO.t < kfs[j + 1].t) { i = j; break; }
+    }
+    const a = kfs[i], b = kfs[i + 1];
+    let u = (INTRO.t - a.t) / ((b.t - a.t) || 1);
+    u = clamp(u, 0, 1);
+    const e = u * u * (3 - 2 * u);            // smoothstep
+    const p = INTRO._pos, l = INTRO._look;
+    p.set(
+      a.pos[0] + (b.pos[0] - a.pos[0]) * e,
+      a.pos[1] + (b.pos[1] - a.pos[1]) * e,
+      a.pos[2] + (b.pos[2] - a.pos[2]) * e,
+    );
+    l.set(
+      a.look[0] + (b.look[0] - a.look[0]) * e,
+      a.look[1] + (b.look[1] - a.look[1]) * e,
+      a.look[2] + (b.look[2] - a.look[2]) * e,
+    );
+    camera.position.copy(p);
+    camera.lookAt(l);
+  },
+
+  /* flowing dashes: advance along -Z, wrap, rewrite matrices —
+   * pre-allocated scratch only (zero per-frame allocation). */
+  _advanceDashes(dt) {
+    const C = CFG.intro.corridor;
+    const span = C.len + 8;
+    const mesh = INTRO.dashes.mesh;
+    const m4 = INTRO._m4;
+    const n = C.dashLines * C.dashesPerLine;
+    for (let i = 0; i < n; i++) {
+      let z = INTRO._dashZ[i] - C.dashSpeed * dt;
+      if (z < -C.len / 2 - 4) z += span;
+      INTRO._dashZ[i] = z;
+      const xy = INTRO._lineXY[INTRO._dashLine[i]];
+      m4.makeTranslation(xy[0], xy[1], z);
+      mesh.setMatrixAt(i, m4);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  },
+
+  /* intro end (natural track end or skip) — hand off to the M0 street
+   * spawn so the camera is controllable; the M9.6 auto-awaken anchor
+   * (BOOT.t0) is set by enter('RUNNING') as before. */
+  _toStreet() {
+    INTRO.playing = false;
+    INTRO.onDone = null;
+    const S = CFG.intro.street;
+    camera.position.set(S.pos[0], S.pos[1], S.pos[2]);
+    camera.lookAt(S.look[0], S.look[1], S.look[2]);
+    CAMERA.pos.copy(camera.position);
+    camera.getWorldDirection(_camDir);
+    CAMERA.yaw = Math.atan2(-_camDir.x, -_camDir.z);
+    CAMERA.pitch = Math.asin(clamp(_camDir.y, -1, 1));
+    CAMERA.fov = 60;
+    camera.fov = 60;
+    camera.updateProjectionMatrix();
+    CAMERA.vel.set(0, 0, 0);
+    CAMERA.mode = 'GROUND';
+    CAMERA.blend = 0;
+    CAMERA.blendTarget = 0;
+    CAMERA.orbit = null;
+    CAMERA.shakeEnergy = 0;
+    BOOT.enter('RUNNING');
+  },
+};
+
 registerSystem(INPUT);
 registerSystem(CAMERA);
+registerSystem(INTRO);
 registerSystem(KIT);
 registerSystem(WORLD);
 registerSystem(ENTITY);
@@ -7091,7 +7410,9 @@ function frame(now) {
     }
   }
   renderer.info.reset();
-  renderer.render(scene, camera);
+  /* M12: while the intro cinematic plays, the corridor scene renders
+   * instead of the city (same camera — the runner owns its pose). */
+  renderer.render(BOOT.state === 'INTRO' ? INTRO.scene : scene, camera);
   /* M7.4: screen-space flash overlay — exactly one extra draw call
    * while the flash is alive, nothing at 0. */
   if (FX._flashPlane.visible) renderer.render(FX._flashScene, FX._flashCam);
@@ -7104,6 +7425,11 @@ function frame(now) {
 try {
   const startBtn = document.getElementById('startBtn');
   startBtn.addEventListener('click', () => {
+    if (BOOT.state === 'INTRO') {            // M12: skip the intro
+      startBtn.disabled = true;
+      INTRO._toStreet();
+      return;
+    }
     if (BOOT.state !== 'LOADER') return;     // idempotent gate
     BOOT.enter('RUNNING');
     startBtn.disabled = true;
@@ -7113,6 +7439,13 @@ try {
   // overlay ready — clear the watchdog, refresh will re-run all of it.
   window.__SIM_BOOTED__ = true;
   if (window.__SIM_BOOT_DEADLINE__) clearTimeout(window.__SIM_BOOT_DEADLINE__);
+
+  /* M12: the intro cinematic auto-plays (LOADER → INTRO → RUNNING).
+   * No audio before a gesture: the corridor is silent; if the intro
+   * ends on its own (no gesture), the AudioContext is created
+   * suspended and the M11.1 resume path unlocks it on the first
+   * gesture. The START click above skips it. */
+  if (BOOT.state === 'LOADER') BOOT.enter('INTRO');
 } catch (err) {
   BOOT.fail(
     'BOOT FAILURE — ' + (err && err.message ? err.message : 'unknown error') +
@@ -7127,6 +7460,7 @@ window.SIM = {
   BOOT,
   INPUT,
   CAMERA,
+  INTRO,
   KIT,
   WORLD,
   POOL,

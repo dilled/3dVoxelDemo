@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-09-19T05:24:05.174Z._
+_Auto-generated. Last updated 2026-09-19T07:44:56.975Z._
 
 - [entity-system-m5](pages/entity-system-m5.md) — category: decision | tags: [entity, m5, creature, instancing] | ENTITY is the 6th system in the fixed boot order (INPUT → CAMERA → KIT → WORLD → **ENTITY** → HUD), registered between WORLD and HUD in `ind
 - [m101-sloth-monument](pages/m101-sloth-monument.md) — category: decision | tags: [m10, unsloth, easter-egg, world] | M10.1 adds the unsloth monument as a **standalone** child of `WORLD.root`
@@ -10,6 +10,7 @@ _Auto-generated. Last updated 2026-09-19T05:24:05.174Z._
 - [m112-looping-beds](pages/m112-looping-beds.md) — category: decision | tags: [audio, webaudio, beds, ambient] | `AUDIO` (single `index.html`, exposed on `window.SIM`) now owns three always-on looping beds built at unlock and connected to `AUDIO.master`
 - [m113-event-sounds](pages/m113-event-sounds.md) — category: decision | tags: [audio, webaudio, events] | `AUDIO` (single `index.html`, exposed on `window.SIM`) now owns the four M11.3 **event sounds**, fired from the real M6–M9 emitter call site
 - [m114-spatial-mixing](pages/m114-spatial-mixing.md) — category: decision | tags: [audio, webaudio, spatial] | `AUDIO` (single `index.html`, exposed on `window.SIM`) now does **spatial-ish mixing** over the M11.3 event one-shots: a small fixed pool of
+- [m121-intro-timeline-runner](pages/m121-intro-timeline-runner.md) — category: decision | tags: [intro, cinematic, timeline, camera, corridor] | The `INTRO` system (single `index.html`, exposed on `window.SIM`, registered after CAMERA / before KIT) is the M12 intro cinematic engine: a
 - [m2-material-kit](pages/m2-material-kit.md) — category: decision | tags: [kit, materials, draw-calls, three] | M2's `KIT` system is the shared foundation every later visual milestone builds on:
 - [m61-object-pool](pages/m61-object-pool.md) — category: decision | tags: [pool, traffic, m6, performance] | `POOL` (top-level module in `index.html`, exposed as `window.SIM.POOL`) is the single object-pool foundation all M6/M7 emitters (drones, veh
 - [m62-traffic-drones](pages/m62-traffic-drones.md) — category: decision | tags: [m6, traffic, pool, tier] | ## Decided

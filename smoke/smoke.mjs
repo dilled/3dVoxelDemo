@@ -6,11 +6,12 @@
  * over a local HTTP server and drives index.html in headless Chrome:
  *
  *   M0 checks:
- *   - page boots to LOADER with the START button visible
- *   - START click -> RUNNING, loop alive, FPS > 0
+ *   - page boots to the intro cinematic (M12: LOADER → INTRO →
+ *     RUNNING) with the START button visible (skip affordance)
+ *   - START click -> RUNNING (skips the intro; loop alive, FPS > 0)
  *   - double-click START does not double-init (single loop, no errors)
  *   - window resize updates renderer size + camera aspect
- *   - page reload (refresh) returns to a fresh, unstuck LOADER and
+ *   - page reload (refresh) returns to a fresh, unstuck intro and
  *     START works again
  *
  *   M1 checks:
@@ -241,6 +242,9 @@
  *     (mean R − mean B) measurably higher in the outer zone than in
  *     the core zone (shots/m82-fog-{core,outer}.png)
  *   - no allocation per frame (heap flat)
+ *   (M12.1: the intro cinematic auto-plays on every fresh load —
+ *   LOADER → INTRO → RUNNING; the START click is the skip affordance;
+ *   see the M12.1 section below for the corridor beat + runner checks)
  *
  *   M8.3 checks (volumetric-ish light shafts — spires + creature core):
  *   - registered: additive fog-off cone meshes in ATMOS.shaftGroup
@@ -360,18 +364,18 @@ async function simState() {
 try {
   console.log(`smoke: ${url}\n`);
 
-  /* ---- 1. Initial load: LOADER + START button ---- */
+  /* ---- 1. Initial load: the intro cinematic auto-plays (M12) ---- */
   await page.goto(url, { waitUntil: 'load', timeout: 30000 });
   await page.waitForFunction(
-    () => window.SIM && window.SIM.BOOT && window.SIM.BOOT.state === 'LOADER',
+    () => window.SIM && window.SIM.BOOT && window.SIM.BOOT.state === 'INTRO',
     { timeout: 20000 },
   );
   {
     const s = await simState();
-    check('boots to LOADER without being stuck', s.state === 'LOADER', `state=${s.state}`);
+    check('boots to the intro cinematic without being stuck', s.state === 'INTRO', `state=${s.state}`);
   }
   const btnVisible = await page.locator('#startBtn').isVisible();
-  check('START button visible', btnVisible);
+  check('START button visible (skip affordance)', btnVisible);
 
   /* ---- 2. START click -> RUNNING, live loop ---- */
   await page.locator('#startBtn').click();
@@ -381,6 +385,8 @@ try {
   {
     const s = await simState();
     check('START leads to RUNNING', s.state === 'RUNNING');
+    const introCancelled = await page.evaluate(() => !window.SIM.INTRO.playing);
+    check('START skips the intro (timeline cancelled)', introCancelled);
   }
   /* M8.4: suppress the auto lightning timer for the whole suite — a
    * live event would add 2 draw calls + hemi/flash bumps into the
@@ -438,13 +444,15 @@ try {
   /* ---- 5. Refresh: never a stuck state; re-entry safe ---- */
   await page.reload({ waitUntil: 'load' });
   await page.waitForFunction(
-    () => window.SIM && window.SIM.BOOT.state === 'LOADER',
+    () => window.SIM && window.SIM.BOOT.state === 'INTRO',
     { timeout: 20000 },
   );
   {
     const s = await simState();
-    check('refresh returns to fresh LOADER (not stuck)', s.state === 'LOADER', `state=${s.state}`);
-    check('frames reset after refresh', s.frames === 0, `frames=${s.frames}`);
+    check('refresh returns to a fresh intro (not stuck)', s.state === 'INTRO', `state=${s.state}`);
+    /* M12: the intro loop is already running, so frames restarted at a
+     * small count (> 0, far below any long-running value). */
+    check('frames restarted after refresh', s.frames >= 1 && s.frames < 240, `frames=${s.frames}`);
     const btnVisible = await page.locator('#startBtn').isVisible();
     check('START button available after refresh', btnVisible);
   }
@@ -492,7 +500,7 @@ try {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
       JSON.stringify(names) === JSON.stringify(
-        ['INPUT', 'CAMERA', 'KIT', 'WORLD', 'ENTITY', 'TRAFFIC',
+        ['INPUT', 'CAMERA', 'INTRO', 'KIT', 'WORLD', 'ENTITY', 'TRAFFIC',
          'PARTS', 'FX', 'ATMOS', 'AUDIO', 'HUD']),
       names.join(', '));
   }
@@ -7994,8 +8002,9 @@ try {
    *  module fresh and hits the same path again.
    *
    *  This section reloads the page: the pre-gesture check ("no audio
-   *  before gesture") needs a fresh LOADER page, and the refresh /
-   *  re-entry check doubles as a second full re-entry.
+   *  before gesture") needs a fresh page (the intro auto-plays,
+   *  no gesture yet — M12), and the refresh / re-entry check doubles
+   *  as a second full re-entry.
    * ------------------------------------------------------------------ */
   {
     /* The headless Web Audio build exposes no inputs/outputs/
@@ -8031,7 +8040,7 @@ try {
     /* 1. fresh page: no audio before the user gesture */
     await page.reload({ waitUntil: 'load' });
     await page.waitForFunction(
-      () => window.SIM && window.SIM.BOOT && window.SIM.BOOT.state === 'LOADER',
+      () => window.SIM && window.SIM.BOOT && window.SIM.BOOT.state === 'INTRO',
       { timeout: 20000 },
     );
     {
@@ -8080,7 +8089,7 @@ try {
      *    gesture again, START unlocks a fresh context, no errors */
     await page.reload({ waitUntil: 'load' });
     await page.waitForFunction(
-      () => window.SIM && window.SIM.BOOT && window.SIM.BOOT.state === 'LOADER',
+      () => window.SIM && window.SIM.BOOT && window.SIM.BOOT.state === 'INTRO',
       { timeout: 20000 },
     );
     {
@@ -8634,6 +8643,299 @@ try {
     check('M11.4: bounded cost (heap flat while the listener drives)',
       h0 > 0 && h1 - h0 <= 2 * 1024 * 1024 && pageErrors.length === 0,
       `Δ=${((h1 - h0) / 1048576).toFixed(2)} MB, errors=${pageErrors.length}`);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * M12.1 — Intro engine: camera-keyframe timeline runner + beat 1
+   *          (dark server corridor)
+   *
+   *  The intro auto-plays on page load (LOADER → INTRO → RUNNING):
+   *  a near-black instanced tunnel of LED strips with a camera dolly
+   *  on the timeline runner. No async resources: the tunnel is built
+   *  synchronously at init. The runner: play(track, onDone) /
+   *  cancel() / seek(t), driven from the central update loop; while
+   *  playing it owns the camera pose (written after CAMERA.update);
+   *  on cancel the camera returns to CAMERA.pos. The poses below are
+   *  verified against the smoothstep formula computed in-page from
+   *  the runner's own clock (same frame ⇒ exact).
+   * ------------------------------------------------------------------ */
+  {
+    const introState = () => page.evaluate(() => {
+      const S = window.SIM, I = S.INTRO;
+      const m = S.camera.matrixWorld.elements;
+      return {
+        state: S.BOOT.state,
+        playing: I.playing,
+        t: I.t,
+        dur: I.dur,
+        trackLen: I.track ? I.track.length : -1,
+        cam: { x: S.camera.position.x, y: S.camera.position.y, z: S.camera.position.z },
+        fwd: { x: -m[8], y: -m[9], z: -m[10] },
+      };
+    });
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 250));
+      }
+      return m === Infinity ? -1 : m;
+    });
+
+    /* 1. fresh page: the corridor beat auto-plays (INTRO state) */
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT.state === 'INTRO',
+      { timeout: 20000 },
+    );
+    {
+      const s = await introState();
+      check('M12.1: intro auto-plays (INTRO, timeline running, dur from CFG)',
+        s.state === 'INTRO' && s.playing && s.trackLen === 3 &&
+        Math.abs(s.dur - 4.4) < 0.01,
+        `state=${s.state}, playing=${s.playing}, track=${s.trackLen}, dur=${s.dur}`);
+      const scene = await page.evaluate(() => {
+        const I = window.SIM.INTRO;
+        return {
+          scene: !!I.scene,
+          children: I.scene ? I.scene.children.length : -1,
+          shell: I.shell ? I.shell.type : 'none',
+          racks: I.racks ? I.racks.mesh.isInstancedMesh + ':' + I.racks.mesh.count : 'none',
+          dashes: I.dashes ? I.dashes.mesh.isInstancedMesh + ':' + I.dashes.mesh.count : 'none',
+          strips: I.strips ? I.strips.type : 'none',
+        };
+      });
+      check('M12.1: corridor scene built (shell + 48 racks + strips + 96 dashes)',
+        scene.scene && scene.children >= 4 && scene.shell === 'Mesh' &&
+        scene.racks === 'true:48' && scene.dashes === 'true:96' &&
+        scene.strips === 'Mesh',
+        JSON.stringify(scene));
+    }
+
+    /* 2. the dolly: the camera eases through the tunnel along -Z,
+     *    looking down the corridor */
+    {
+      const a = await introState();
+      await sleep(600);
+      const b = await introState();
+      check('M12.1: dolly advances through the tunnel (t + z advance, eye height, fwd -Z)',
+        b.t > a.t && b.cam.z < a.cam.z &&
+        Math.abs(b.cam.y - 2.5) < 0.01 && Math.abs(b.cam.x) < 0.01 &&
+        b.fwd.z < -0.99 && Math.abs(b.fwd.x) < 0.05 && Math.abs(b.fwd.y) < 0.05,
+        `t ${a.t.toFixed(2)} -> ${b.t.toFixed(2)}, z ${a.cam.z.toFixed(1)} -> ${b.cam.z.toFixed(1)}, fwd.z=${b.fwd.z.toFixed(2)}`);
+    }
+
+    /* 3. the LED dashes flow along the strips (instance matrices move) */
+    {
+      const hash = () => page.evaluate(() => {
+        const a = window.SIM.INTRO.dashes.mesh.instanceMatrix.array;
+        let h = 0;
+        for (let i = 0; i < a.length; i += 37) h = (h * 31 + a[i]) | 0;
+        return h;
+      });
+      const h0 = await hash();
+      await sleep(400);
+      const h1 = await hash();
+      check('M12.1: LED dashes flow (instance matrices advance)', h0 !== h1,
+        `hash ${h0} -> ${h1}`);
+    }
+
+    /* 4. the corridor renders in exactly 4 draw calls (shell / racks /
+     *    strips / dashes — the city is not rendered while the intro plays) */
+    {
+      const calls = await page.evaluate(async () => {
+        const r = window.SIM.renderer;
+        let m = Infinity;
+        for (let i = 0; i < 5; i++) {
+          await new Promise(res => requestAnimationFrame(res));
+          m = Math.min(m, r.info.render.calls);
+        }
+        return m;
+      });
+      check('M12.1: corridor renders in 4 draw calls (under budget)',
+        calls === 4, `calls=${calls}`);
+    }
+
+    /* 5. screenshot of the beat — a near-black tunnel with bright LED
+     *    lines (decoded in-page via dataURL → 2D canvas) */
+    {
+      const shot = await page.screenshot();
+      fs.writeFileSync(`${here}/shots/m121-corridor.png`, shot);
+      const lum = await page.evaluate(async (b64) => {
+        const img = new Image();
+        await new Promise((res, rej) => {
+          img.onload = res; img.onerror = rej;
+          img.src = 'data:image/png;base64,' + b64;
+        });
+        const c = document.createElement('canvas');
+        c.width = img.width; c.height = img.height;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const d = ctx.getImageData(0, 0, c.width, c.height).data;
+        let mean = 0, bright = 0;
+        const n = d.length / 4;
+        for (let i = 0; i < d.length; i += 4) {
+          const l = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+          mean += l;
+          if (l > 100) bright++;
+        }
+        return { mean: mean / n, bright: bright / n };
+      }, shot.toString('base64'));
+      const st = await introState();
+      check('M12.1: screenshot shows the dark corridor with LED lines (shots/m121-corridor.png)',
+        fs.existsSync(`${here}/shots/m121-corridor.png`) &&
+        st.state === 'INTRO' && lum.mean < 40 && lum.bright > 0.002,
+        `state=${st.state}, mean=${lum.mean.toFixed(1)}, bright=${(lum.bright * 100).toFixed(2)}%`);
+    }
+
+    /* 5b. bounded cost: dolly + flowing dashes are scratch-only —
+     *     heap flat while the beat plays */
+    {
+      const h0 = await heapMin();
+      const h1 = await heapMin();
+      check('M12.1: bounded cost (heap flat while the corridor beat plays)',
+        h0 > 0 && h1 - h0 <= 2 * 1024 * 1024,
+        `Δ=${((h1 - h0) / 1048576).toFixed(2)} MB`);
+    }
+
+    /* 6. natural end: the beat plays to the end → street-level RUNNING
+     *    (camera handed to the M0 street spawn) */
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT.state === 'RUNNING',
+      { timeout: 15000 },
+    );
+    {
+      const s = await introState();
+      check('M12.1: corridor beat plays to the end → street RUNNING (camera at spawn)',
+        s.state === 'RUNNING' && !s.playing &&
+        Math.abs(s.cam.x) < 0.01 && Math.abs(s.cam.y - 4) < 0.01 &&
+        Math.abs(s.cam.z - 18) < 0.01,
+        `state=${s.state}, playing=${s.playing}, cam=(${s.cam.x.toFixed(1)}, ${s.cam.y.toFixed(1)}, ${s.cam.z.toFixed(1)})`);
+      /* the reload re-seeded the live events — park them for the
+       * runner tests below (the M8.4/M9.6 sections own them). */
+      await page.evaluate(() => {
+        window.SIM.ATMOS._ltTimer = 1e9;
+        window.SIM.ENTITY._autoAt = Infinity;
+      });
+    }
+
+    /* 7. timeline runner: start / cancel mid-way / re-seek — all clean */
+    {
+      const track = [
+        { t: 0, pos: [10, 20, -30], look: [0, 0, 0] },
+        { t: 2, pos: [40, 30, 10], look: [0, 0, 0] },
+      ];
+      const poseAt = t => {
+        const u = t / 2, e = u * u * (3 - 2 * u);
+        return [10 + 30 * e, 20 + 10 * e, -30 + 40 * e];
+      };
+      const readPose = () => page.evaluate(() => {
+        const S = window.SIM;
+        const c = S.camera.position;
+        return { x: c.x, y: c.y, z: c.z, t: S.INTRO.t, playing: S.INTRO.playing };
+      });
+
+      /* 7a. start: play → the camera rides the eased keyframes */
+      const p0 = await page.evaluate((trk) => {
+        const I = window.SIM.INTRO;
+        window.__m121_done = 0;
+        I.play(trk, () => { window.__m121_done++; });
+        return { playing: I.playing, t: I.t, dur: I.dur };
+      }, track);
+      check('M12.1: runner start (play sets track, t=0, playing)',
+        p0.playing && p0.t === 0 && p0.dur === 2,
+        JSON.stringify(p0));
+      await sleep(400);
+      {
+        const r = await readPose();
+        const e = poseAt(r.t);
+        check('M12.1: play — camera on the eased keyframe curve (same-frame pose)',
+          r.playing &&
+          Math.abs(r.x - e[0]) < 0.01 && Math.abs(r.y - e[1]) < 0.01 &&
+          Math.abs(r.z - e[2]) < 0.01,
+          `t=${r.t.toFixed(3)}, cam=(${r.x.toFixed(2)}, ${r.y.toFixed(2)}, ${r.z.toFixed(2)}), want (${e[0].toFixed(2)}, ${e[1].toFixed(2)}, ${e[2].toFixed(2)})`);
+      }
+
+      /* 7b. seek mid-play: lands exactly on the eased pose */
+      const s1 = await page.evaluate(() => {
+        const I = window.SIM.INTRO;
+        I.seek(1.0);
+        const c = window.SIM.camera.position;
+        return { x: c.x, y: c.y, z: c.z, t: I.t };
+      });
+      check('M12.1: seek mid-play lands exactly on the eased pose (t=1.0)',
+        Math.abs(s1.x - 25) < 0.001 && Math.abs(s1.y - 25) < 0.001 &&
+        Math.abs(s1.z + 10) < 0.001,
+        `cam=(${s1.x.toFixed(3)}, ${s1.y.toFixed(3)}, ${s1.z.toFixed(3)}), want (25, 25, -10)`);
+
+      /* 7c. seek clamps at the track end */
+      const s2 = await page.evaluate(() => {
+        const I = window.SIM.INTRO;
+        I.seek(99);
+        const c = window.SIM.camera.position;
+        return { x: c.x, y: c.y, z: c.z, t: I.t };
+      });
+      check('M12.1: seek clamps at the track end (t=dur)',
+        s2.t === 2 && Math.abs(s2.x - 40) < 0.001 && Math.abs(s2.y - 30) < 0.001 &&
+        Math.abs(s2.z - 10) < 0.001,
+        `t=${s2.t}, cam=(${s2.x.toFixed(3)}, ${s2.y.toFixed(3)}, ${s2.z.toFixed(3)}), want (40, 30, 10)`);
+
+      /* 7d. cancel mid-way: playing off, camera returns to the street
+       *     spawn (CAMERA.update owns it again) */
+      await page.evaluate(() => {
+        const I = window.SIM.INTRO;
+        I.seek(1.0);           // back mid-way
+        I.cancel();
+      });
+      await sleep(120);
+      {
+        const r = await readPose();
+        check('M12.1: cancel mid-way — camera returns to the street spawn (clean)',
+          !r.playing && Math.abs(r.x) < 0.01 && Math.abs(r.y - 4) < 0.01 &&
+          Math.abs(r.z - 18) < 0.01,
+          `playing=${r.playing}, cam=(${r.x.toFixed(2)}, ${r.y.toFixed(2)}, ${r.z.toFixed(2)})`);
+      }
+
+      /* 7e. re-seek after cancel: the pose applies again, clean */
+      const s3 = await page.evaluate(() => {
+        const I = window.SIM.INTRO;
+        I.seek(0.5);
+        const c = window.SIM.camera.position;
+        return { x: c.x, y: c.y, z: c.z };
+      });
+      check('M12.1: re-seek after cancel applies the pose (t=0.5)',
+        Math.abs(s3.x - 14.6875) < 0.001 &&
+        Math.abs(s3.y - 21.5625) < 0.001 &&
+        Math.abs(s3.z + 23.75) < 0.001,
+        `cam=(${s3.x.toFixed(3)}, ${s3.y.toFixed(3)}, ${s3.z.toFixed(3)}), want (14.6875, 21.5625, -23.75)`);
+
+      /* 7f. play to the end: onDone fires once, camera back at spawn */
+      const p1 = await page.evaluate((trk) => {
+        const I = window.SIM.INTRO;
+        window.__m121_done = 0;
+        I.play(trk, () => { window.__m121_done++; });
+        return I.playing;
+      }, track);
+      await sleep(2400);
+      {
+        const r = await readPose();
+        const done = await page.evaluate(() => window.__m121_done);
+        check('M12.1: play to the end — onDone fires once, camera back at spawn',
+          p1 && done === 1 && !r.playing &&
+          Math.abs(r.x) < 0.01 && Math.abs(r.y - 4) < 0.01 &&
+          Math.abs(r.z - 18) < 0.01,
+          `done=${done}, playing=${r.playing}, cam=(${r.x.toFixed(2)}, ${r.y.toFixed(2)}, ${r.z.toFixed(2)})`);
+      }
+
+      /* 7g. bounded cost: the runner is scratch-only — heap flat */
+      const h0 = await heapMin();
+      await sleep(3000);
+      const h1 = await heapMin();
+      check('M12.1: bounded cost (heap flat while the runner idles)',
+        h0 > 0 && h1 - h0 <= 2 * 1024 * 1024 && pageErrors.length === 0,
+        `Δ=${((h1 - h0) / 1048576).toFixed(2)} MB, errors=${pageErrors.length}`);
+    }
   }
 
   /* ---- 10. No errors anywhere ---- */
