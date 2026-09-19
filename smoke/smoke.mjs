@@ -24,6 +24,18 @@
  *     (keypress, beat 5) — all three paths end in a controllable
  *     street-level camera with every beat FX off
  *
+ *   M13.1 checks:
+ *   - EVENTS registered in the fixed system order (after HUD)
+ *   - scheduler clock advances in the page loop (update wired)
+ *   - forced-seed 120 s drive (1200 × 0.1 s, page loop frozen):
+ *     one-at-a-time (no overlaps), min/max gap respected, per-event
+ *     cooldowns held, weighted picking (weight 2 fires more than 1),
+ *     gated event never fires while ineligible
+ *   - priority: a prio-2 event preempts the running lower-priority
+ *     event (victim interrupted, C starts exactly at victim's end),
+ *     fires once, gap resumes
+ *   - determinism: same seed + same steps ⇒ identical firing order
+ *
  *   M1 checks:
  *   - systems registry boots in fixed order
  *     (INPUT, CAMERA, KIT, WORLD, ENTITY, TRAFFIC, PARTS, HUD)
@@ -505,13 +517,14 @@ try {
 
   /* ---- 6a. Fixed-order systems registry (M5 adds ENTITY after WORLD,
    * M7.1 adds PARTS after TRAFFIC, M7.2 adds FX after PARTS, M8.1
-   * adds ATMOS after FX, M11.2 adds AUDIO after ATMOS) ---- */
+   * adds ATMOS after FX, M11.2 adds AUDIO after ATMOS, M13.1 adds
+   * EVENTS after HUD) ---- */
   {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
       JSON.stringify(names) === JSON.stringify(
         ['INPUT', 'CAMERA', 'INTRO', 'KIT', 'WORLD', 'ENTITY', 'TRAFFIC',
-         'PARTS', 'FX', 'ATMOS', 'AUDIO', 'HUD']),
+         'PARTS', 'FX', 'ATMOS', 'AUDIO', 'HUD', 'EVENTS']),
       names.join(', '));
   }
 
@@ -9491,6 +9504,143 @@ try {
       checkEnd('M12.3: natural finish ends in the street (fade done, beat FX off)', s);
       await checkControllable('M12.3: natural finish → controllable street camera (W moves forward)');
     }
+  }
+
+  /* ---- 9b. M13.1 — EVENTS scheduler: forced seed ⇒ legal firing
+   *    order (no overlaps, min/max gap respected, cooldowns held,
+   *    weighted picking, priority preemption, determinism) ---- */
+  {
+    /* synthetic registry: evA (weight 2, cd 2, prio 1), evB (weight 1,
+     * cd 4, prio 1), evC (prio 2, gated off until flipped — it must
+     * preempt whatever is running). Page is RUNNING (no reload). */
+    await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      S.CFG.events.gap = [2, 4];   // test pacing (shorter than CFG)
+      S.CFG.events.first = 0;
+      window.__m131 = { gate: false };
+      E.register({ id: 'evA', weight: 2, duration: [1, 1],
+                   cooldown: [2, 2], priority: 1 });
+      E.register({ id: 'evB', weight: 1, duration: [1, 1],
+                   cooldown: [4, 4], priority: 1 });
+      E.register({ id: 'evC', weight: 1, duration: [0.5, 0.5],
+                   cooldown: [1, 1], priority: 2,
+                   eligible: () => window.__m131.gate });
+    });
+
+    /* the page loop drives the scheduler (update wired into systems) */
+    const t0 = await page.evaluate(() => window.SIM.EVENTS._time);
+    await sleep(400);
+    const t1 = await page.evaluate(() => window.SIM.EVENTS._time);
+    check('M13.1: scheduler clock advances in the page loop (update wired)',
+      t1 > t0, `t ${t0.toFixed(3)} -> ${t1.toFixed(3)}`);
+
+    /* phase 1: freeze the page loop, force the seed, run 1200 × 0.1 s
+     * (120 s) — the firing order must be legal. */
+    const log1 = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E.paused = true;
+      E.reset();
+      E._rng = S.WORLD.mulberry(0x1337); // forced seed
+      for (let i = 0; i < 1200; i++) E.step(0.1);
+      return JSON.parse(JSON.stringify(E.log));
+    });
+    {
+      let noOverlap = true;
+      let gapsOk = true;
+      let cdOk = true;
+      const cdMin = { evA: 2, evB: 4, evC: 1 };
+      for (let i = 1; i < log1.length; i++) {
+        const gap = log1[i].start - log1[i - 1].end;
+        if (!(log1[i].start > log1[i - 1].end)) noOverlap = false;
+        /* gap ∈ [2, 4] plus one 0.1 s step of quantization */
+        if (!(gap >= 2 - 1e-9 && gap <= 4 + 0.1 + 1e-9)) gapsOk = false;
+        if (log1[i].id === log1[i - 1].id &&
+            !(gap >= Math.max(2, cdMin[log1[i].id]) - 1e-9)) cdOk = false;
+      }
+      const nA = log1.filter(e => e.id === 'evA').length;
+      const nB = log1.filter(e => e.id === 'evB').length;
+      const nC = log1.filter(e => e.id === 'evC').length;
+      check('M13.1: one-at-a-time (no overlapping events in the firing order)',
+        noOverlap && log1.length >= 10, `n=${log1.length}`);
+      check('M13.1: min/max gap respected (every gap in [2, 4] + step)',
+        gapsOk, `n=${log1.length}`);
+      check('M13.1: per-event cooldown held (same-id gap >= max(minGap, cd))',
+        cdOk);
+      check('M13.1: weighted picking (evA weight 2 fires more than evB weight 1)',
+        nA > nB && nB >= 1, `A=${nA}, B=${nB}`);
+      check('M13.1: gated event (evC) never fires while ineligible', nC === 0);
+    }
+
+    /* phase 2: priority — evC (prio 2) must preempt the RUNNING
+     * lower-priority event the moment its gate opens: the victim ends
+     * interrupted exactly where C starts (no overlap, no gap). */
+    const p2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      let i = 0;
+      while (!E._active && i < 300) { E.step(0.1); i++; }
+      const activeBefore = E._active ? E._active.id : null;
+      const victimIdx = E.log.length; // where the victim lands after the step
+      window.__m131.gate = true;
+      E.step(0.1); // victim → log (interrupted), evC → active
+      const preempted = E._active && E._active.id === 'evC';
+      window.__m131.gate = false;
+      for (let j = 0; j < 100; j++) E.step(0.1); // 10 s, C gated off
+      const tail = E.log.slice(victimIdx).map(e => ({ id: e.id, start: e.start,
+        end: e.end, interrupted: e.interrupted }));
+      return { activeBefore, preempted,
+        victim: tail[0] || null,
+        c: tail[1] || null,
+        tail };
+    });
+    check('M13.1: priority held (evC preempts the running lower-priority event)',
+      !!p2.c && !!p2.victim && p2.victim.id === p2.activeBefore &&
+      p2.victim.interrupted === true && p2.c.start === p2.victim.end &&
+      p2.preempted,
+      `active=${p2.activeBefore}, victim=${JSON.stringify(p2.victim)}, c=${JSON.stringify(p2.c)}`);
+    {
+      /* after the preemption: C fires exactly once (gated off after),
+       * no overlaps, and the normal gap resumes from C's end. */
+      let ok = p2.tail.length >= 2 && p2.tail[0].id === p2.victim.id &&
+        p2.tail[1].id === 'evC' &&
+        p2.tail.filter(e => e.id === 'evC').length === 1;
+      for (let i = 1; i < p2.tail.length && ok; i++) {
+        const gap = p2.tail[i].start - p2.tail[i - 1].end;
+        /* i=1 is the preemption pair: C starts exactly at the victim's
+         * end (no gap, no overlap) */
+        if (!(p2.tail[i].start >= p2.tail[i - 1].end - 1e-9)) ok = false;
+        if (i > 1) { /* gap rule applies from C's end onward */
+          if (!(gap >= 2 - 1e-9 && gap <= 4 + 0.1 + 1e-9)) ok = false;
+        }
+      }
+      check('M13.1: post-preemption (C fires once, no overlap, gap resumes)',
+        ok, `tail=${JSON.stringify(p2.tail.slice(0, 4))}`);
+    }
+
+    /* phase 3: determinism — same seed + same steps ⇒ identical log. */
+    const log2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E.reset();
+      E._rng = S.WORLD.mulberry(0x1337);
+      for (let i = 0; i < 1200; i++) E.step(0.1);
+      return JSON.parse(JSON.stringify(E.log));
+    });
+    check('M13.1: forced seed ⇒ identical firing order (deterministic)',
+      JSON.stringify(log2) === JSON.stringify(log1),
+      `n1=${log1.length}, n2=${log2.length}`);
+
+    /* cleanup: synthetic registry gone, real CFG/clock/rng restored */
+    await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E.unregister('evA');
+      E.unregister('evB');
+      E.unregister('evC');
+      S.CFG.events.gap = [14, 30];
+      S.CFG.events.first = 20;
+      E.reset();
+      E._rng = S.WORLD.mulberry(S.CFG.city.seed ^ S.CFG.events.seed);
+      E.paused = false;
+      delete window.__m131;
+    });
   }
 
   /* ---- 10. No errors anywhere ---- */

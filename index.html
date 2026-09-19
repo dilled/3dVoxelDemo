@@ -862,6 +862,14 @@ const CFG = {
      * intro; click/keypress skip work from t=0). */
     skip: { fade: 0.5, delay: 2 },
   },
+  /* M13.1: emergent event director — global pacing. Per-event
+   * weight/cooldown/priority live in the event definitions (M13.2+). */
+  events: {
+    gap: [14, 30],        // s between one event's end and the next start
+    retry: 1,            // s — re-check when nothing eligible at pick time
+    first: 20,           // s until the first pick attempt
+    seed: 0x13E5,        // ^ city seed — reproducible firing order
+  },
 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -7656,6 +7664,166 @@ const INTRO = {
   },
 };
 
+/* ====================================================================
+ * EVENTS — emergent event director (M13)
+ *
+ *  - Weighted random picking from the registry, per-event cooldowns,
+ *    global min/max gap between consecutive events, ONE event at a
+ *    time, priority preemption (strictly higher priority may
+ *    interrupt a running event — equal/lower never)
+ *  - Seeded PRNG (mulberry32, city seed) ⇒ reproducible firing order;
+ *    the clock (_time) advances ONLY via step(dt) with the dt it is
+ *    given ⇒ the firing order is fully deterministic for a forced
+ *    seed + dt sequence (smoke harness seam)
+ *  - M13.1 is the scheduler core only — no events are registered yet
+ *    (M13.2–M13.4 add the ambient events)
+ *
+ *  Event definition (EVENTS.register):
+ *    id         — unique string
+ *    weight     — picking weight (> 0, default 1)
+ *    duration   — s (or [min, max] — drawn from the rng)
+ *    cooldown   — s (or [min, max]) after end before it may fire again
+ *    priority   — number, higher preempts lower (default 0)
+ *    eligible() — optional gate; false defers the event (M13.4 AWAKE
+ *                 rule uses this)
+ *    start(a)   — optional, called at start (a = active handle)
+ *    update(a, dt, t) — optional per-frame hook
+ *    end(interrupted) — optional, called at end (true when preempted)
+ *
+ *  Manual trigger (M13.2): EVENTS.trigger(id) starts immediately,
+ *  preempting whatever is running (operator override, no gap).
+ * ==================================================================== */
+const EVENTS = {
+  name: 'EVENTS',
+  _rng: null,
+  _reg: new Map(),
+  _readyAt: new Map(),   // id → _time when its cooldown expires
+  _active: null,         // { id, def, t, startAt, dur }
+  _time: 0,
+  _nextAt: 0,            // _time of the next pick attempt
+  log: [],               // { id, start, end, interrupted } (capped)
+  enabled: true,
+  paused: false,         // harness seam: freezes the page-loop clock
+
+  init() {
+    this._rng = mulberry32(CFG.city.seed ^ CFG.events.seed);
+    this._nextAt = CFG.events.first;
+  },
+
+  register(def) {
+    if (!def || !def.id || this._reg.has(def.id)) return;
+    def.weight = def.weight > 0 ? def.weight : 1;
+    def.priority = def.priority === undefined ? 0 : def.priority;
+    def.cooldown = def.cooldown === undefined ? 0 : def.cooldown;
+    this._reg.set(def.id, def);
+    this._readyAt.set(def.id, 0);
+  },
+
+  unregister(id) {
+    this._reg.delete(id);
+    this._readyAt.delete(id);
+  },
+
+  /* Weighted pick among eligible events with priority > minPrio.
+   * (Normal picks use -Infinity; the preemption scan uses the
+   * active event's priority.) */
+  _pick(t, minPrio) {
+    let sum = 0;
+    const cands = [];
+    for (const def of this._reg.values()) {
+      if (def.priority <= minPrio) continue;
+      if (t < (this._readyAt.get(def.id) || 0)) continue;
+      if (def.eligible && !def.eligible()) continue;
+      cands.push(def);
+      sum += def.weight;
+    }
+    if (!sum) return null;
+    let r = this._rng() * sum;
+    for (const def of cands) {
+      r -= def.weight;
+      if (r <= 0) return def;
+    }
+    return cands[cands.length - 1];
+  },
+
+  _start(def, t) {
+    const d = def.duration;
+    const a = {
+      id: def.id,
+      def,
+      t: 0,
+      startAt: t,
+      dur: Array.isArray(d) ? d[0] + this._rng() * (d[1] - d[0]) : d,
+    };
+    this._active = a;
+    if (def.start) def.start(a);
+    return a;
+  },
+
+  _end(a, interrupted) {
+    const t = this._time;
+    if (a.def.end) a.def.end(interrupted);
+    const c = a.def.cooldown;
+    this._readyAt.set(a.id,
+      t + (Array.isArray(c) ? c[0] + this._rng() * (c[1] - c[0]) : c));
+    this.log.push({ id: a.id, start: a.startAt, end: t, interrupted });
+    if (this.log.length > 128) this.log.shift();
+    this._active = null;
+    const g = CFG.events.gap;
+    this._nextAt = t + g[0] + this._rng() * (g[1] - g[0]);
+  },
+
+  /* Advance the scheduler clock. The page loop calls update(dt);
+   * the smoke harness sets paused = true and drives step(dt) with
+   * fixed steps for a deterministic firing order. */
+  step(dt) {
+    if (!this.enabled || this._reg.size === 0) return;
+    this._time += dt;
+    const t = this._time;
+    if (this._active) {
+      /* Priority rule: while a lower-priority event runs, a strictly
+       * higher one may fire at ANY time (preempt, no gap). */
+      const pre = this._pick(t, this._active.def.priority);
+      if (pre) {
+        this._end(this._active, true);
+        this._start(pre, t);
+      }
+      const a = this._active;
+      a.t += dt;
+      if (a.def.update) a.def.update(a, dt, t);
+      if (a.t >= a.dur) this._end(a, false);
+    } else if (t >= this._nextAt) {
+      const def = this._pick(t, -Infinity);
+      if (def) this._start(def, t);
+      else this._nextAt = t + CFG.events.retry;
+    }
+  },
+
+  update(dt) {
+    if (this.paused) return;
+    this.step(dt);
+  },
+
+  /* Manual trigger (M13.2): start immediately, preempting whatever
+   * is running (operator override — ignores gap/cooldown/weight). */
+  trigger(id) {
+    const def = this._reg.get(id);
+    if (!def || (this._active && this._active.id === id)) return false;
+    if (this._active) this._end(this._active, true);
+    this._start(def, this._time);
+    return true;
+  },
+
+  /* Harness/test seam: full reset (clock, log, cooldowns, active). */
+  reset() {
+    this._time = 0;
+    this._nextAt = CFG.events.first;
+    this._active = null;
+    this.log.length = 0;
+    for (const id of this._readyAt.keys()) this._readyAt.set(id, 0);
+  },
+};
+
 registerSystem(INPUT);
 registerSystem(CAMERA);
 registerSystem(INTRO);
@@ -7668,6 +7836,7 @@ registerSystem(FX);
 registerSystem(ATMOS);
 registerSystem(AUDIO);
 registerSystem(HUD);
+registerSystem(EVENTS);
 for (const s of systems) if (s.init) s.init();
 /* M10.3: wire the unsloth easter-egg reaction (after all systems init —
  * ENTITY._eggReact is created in ENTITY.init; WORLD boots before ENTITY). */
@@ -7763,6 +7932,7 @@ window.SIM = {
   INPUT,
   CAMERA,
   INTRO,
+  EVENTS,
   KIT,
   WORLD,
   POOL,

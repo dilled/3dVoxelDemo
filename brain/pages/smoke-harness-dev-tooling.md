@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-19T06:22:07"
+updated: "2026-09-19T15:17:58"
 ---
 
 <!-- compiled_truth -->
@@ -75,4 +75,10 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
 - time: 2026-09-19T06:22:07
   kind: decision
   summary: "M11.3 extends the harness: new M11.3 section (8 checks after M11.2, page already RUNNING) — per-type fire counters (AUDIO.events) assert each emitter's real call site fires exactly once (FX.pulse / FX.arc / PARTS._spawnSteam / TRAFFIC._spawn), all-fire-while-muted choke-point check (counters move, muteGain 0), eventsWired flags (captured from connect() return values — headless build exposes no graph introspection), heap flat. Pattern: pools are saturated at cap ⇒ free a slot with the real trim path first (PARTS._sReleaseAt(0) / TRAFFIC._releaseAt(0)) before pool.acquire(); TRAFFIC._spawn early-returns (no dock) ⇒ retry loop; synthetic src {x,z,hTop,r} is valid for _spawnSteam"
+  affects: [smoke-harness-dev-tooling]
+
+- time: 2026-09-19T15:17:58
+  kind: decision
+  summary: "M13.1 extends the harness: fixed-order check is now …AUDIO→HUD→EVENTS; new M13.1 section (9 checks after M12.3, page already RUNNING, no reload) — synthetic evA/evB/evC registry, page-loop clock-advance check, then paused=true + reset + forced seed WORLD.mulberry(0x1337) + test pacing (CFG.events.gap=[2,4], first=0) + 1200×step(0.1): no overlaps / gap ∈ [2,4]+step / same-id cooldown / weighted A>B / gated-C-never; priority: gate flip preempts the running event (victim interrupted, c.start===victim.end exactly, fires once, gap resumes); determinism: same seed+steps ⇒ identical log; cleanup unregisters + restores CFG/clock/rng. Gotcha: the scheduler log holds ENDED events only — a just-preempted event is _active, not yet in the log"
+  source: M13.1 implementation
   affects: [smoke-harness-dev-tooling]
