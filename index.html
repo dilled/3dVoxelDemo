@@ -311,7 +311,7 @@ const CFG = {
   kit: {
     testTower: { x: 0, z: -80 },  // M2 gate demo (absorbed by the M3 city: keep-out area)
     ledHz: 15,                   // LED canvas redraw rate
-    signHz: 8,                  // holo-sign flicker redraw rate
+    signHz: { high: 8, med: 4, low: 2 },  // holo-sign flicker redraw rate per tier (M14.1)
     signTagCycle: 8,            // s per UNSLOTH tagline
     /* M10.1: the unsloth monument — voxel neon sloth atop one side-avenue
      * compute tower + rooftop UNSLOTH holo sign (shared unsloth texture) */
@@ -737,6 +737,23 @@ const CFG = {
     },
   },
 
+  /* ---- M14.1: perf monitor + quality tiers (HIGH / MED / LOW) ----
+   * Auto-detect (PERF.evaluate) drops one tier when the rolling
+   * window fps is under `down[tier]` and raises one tier when it is
+   * over `up[tier]` — hysteresis, evaluated every `autoEvery` s.
+   * Manual override: F1/F2/F3 pin HIGH/MED/LOW (auto off), F4 = auto.
+   * Everything tier-aware reads these tables keyed by TIER.name.
+   * The particle / drone / vehicle / shaft / star tier tables already
+   * existed as the M6.2 seam — this block adds the new ones. */
+  perf: {
+    fpsWindow: 0.5,    // s — rolling fps window (monitor + HUD)
+    autoEvery: 4.0,   // s — auto-tier evaluation period
+    down: { high: 50, med: 30 },           // window fps < this ⇒ tier down one
+    up:   { low: 45, med: 58 },            // window fps > this ⇒ tier up one
+    lodRadius: { high: 2, med: 2, low: 1 },  // chunk keep-set Chebyshev rings
+    bedGain: { high: 1.0, med: 0.7, low: 0.45 },  // audio bed level scale
+  },
+
   /* ---- M11.2: looping beds (all connect to AUDIO.master — M11.1) ----
    * Three always-on beds that make the city read as "machine city":
    * reactor hum (2 detuned sines + sub sine, slow swell), fans
@@ -931,17 +948,68 @@ const damp = (dt, rate) => 1 - Math.exp(-rate * dt);
  *
  *  - TRAFFIC reads CFG.traffic.drone.tiers[TIER.name] every frame, so a
  *    tier change trims / grows the drone fleet smoothly (excess drones
- *    are released back to the pool, the fleet regrows on spawn ticks)
- *  - M14.1 replaces TIER.set with FPS-based auto-detection; nothing
- *    downstream needs to change for that
+ *    are released back to the pool, the fleet regrows on spawn ticks);
+ *    the particle / light-shaft / star tier tables work the same way
+ *  - set() applies the tier's immediate scaling points (far-chunk LOD
+ *    radius + audio bed gains) the moment it fires
+ *  - M14.1: the FPS-based auto-detect (PERF.evaluate) and the F1–F4
+ *    keys all funnel through set(); PERF.auto gates the auto path and
+ *    a manual key pins the tier
  * ==================================================================== */
 const TIER = {
   order: ['low', 'med', 'high'],
   name: 'high',
   set(n) {
-    if (TIER.order.includes(n)) TIER.name = n;
+    if (!TIER.order.includes(n) || n === TIER.name) return;
+    TIER.name = n;
+    WORLD.setTierLod();     // far-chunk LOD radius: re-sync the keep-set
+    AUDIO._applyTier();     // re-scale the audio bed gains (no-op pre-audio)
   },
   active() { return TIER.name; },
+};
+
+/* ====================================================================
+ * PERF — rolling FPS monitor + auto quality tier (M14.1)
+ *
+ *  - tick(dt) runs from the central loop (NOT a registered system —
+ *    the fixed order … ATMOS, AUDIO, HUD, EVENTS stays intact): the
+ *    rolling fps over CFG.perf.fpsWindow, and every CFG.perf.autoEvery
+ *    s the completed window drives the auto tier rule when PERF.auto
+ *  - evaluate(f) is the pure auto rule (hysteresis: different down/up
+ *    thresholds) — directly callable with a synthetic fps (smoke)
+ *  - manual override: F1/F2/F3 pin HIGH/MED/LOW (auto off), F4 = auto
+ * ==================================================================== */
+const PERF = {
+  name: 'PERF',
+  auto: true,
+  fps: 0,                    // rolling fps (CFG.perf.fpsWindow window)
+  _acc: 0, _frames: 0,       // rolling window accumulator
+  _winAcc: 0, _winFrames: 0, // auto-eval window accumulator
+  _evalAcc: 0,
+  tick(dt) {
+    PERF._acc += dt; PERF._frames++;
+    if (PERF._acc >= CFG.perf.fpsWindow) {
+      PERF.fps = PERF._frames / PERF._acc;
+      PERF._acc = 0; PERF._frames = 0;
+    }
+    PERF._winAcc += dt; PERF._winFrames++;
+    PERF._evalAcc += dt;
+    if (PERF._evalAcc >= CFG.perf.autoEvery) {
+      PERF._evalAcc -= CFG.perf.autoEvery;
+      const w = PERF._winFrames / PERF._winAcc;
+      PERF._winAcc = 0; PERF._winFrames = 0;
+      if (PERF.auto) PERF.evaluate(w);
+    }
+  },
+  /* Auto rule: sustained under `down` ⇒ drop one tier, sustained over
+   * `up` ⇒ raise one tier (a no-op at both boundaries). */
+  evaluate(f) {
+    const i = TIER.order.indexOf(TIER.name);
+    const down = CFG.perf.down[TIER.name];
+    const up = CFG.perf.up[TIER.name];
+    if (down !== undefined && f < down) TIER.set(TIER.order[i - 1]);
+    else if (up !== undefined && f > up) TIER.set(TIER.order[i + 1]);
+  },
 };
 
 /* ------------------------------------------------------------------ *
@@ -1240,7 +1308,8 @@ const AUDIO = {
       fan.filter.frequency.value = C.fan.band.f;
       fan.filter.Q.value = C.fan.band.q;
       fan.gain = ctx.createGain();
-      fan.gain.gain.value = C.fan.gain;
+      fan.gain.gain.value =
+        C.fan.gain * CFG.perf.bedGain[TIER.name];   // M14.1 tier
       fan.src.connect(fan.filter);
       fan.filter.connect(fan.gain);
       fan.gain.connect(AUDIO.master);
@@ -1258,7 +1327,8 @@ const AUDIO = {
       machine.filter.type = 'lowpass';
       machine.filter.frequency.value = C.machine.lowpass;
       machine.gain = ctx.createGain();
-      machine.gain.gain.value = C.machine.gain;
+      machine.gain.gain.value =
+        C.machine.gain * CFG.perf.bedGain[TIER.name];   // M14.1 tier
       machine.src.connect(machine.filter);
       machine.filter.connect(machine.gain);
       machine.gain.connect(AUDIO.master);
@@ -1305,6 +1375,17 @@ const AUDIO = {
      * from the graph forever). */
     osc.onended = () => { g.disconnect(); };
     m.thumpCount++;
+  },
+
+  /* M14.1: tier-scale the audio beds. The fan / machine bed gains are
+   * set once at build, so a tier change re-writes them; the hum bed
+   * gain is recomputed every frame in update() with the same scale.
+   * No-op before the audio unlock (beds null). */
+  _applyTier() {
+    if (!AUDIO.beds) return;
+    const m = CFG.perf.bedGain[TIER.name];
+    AUDIO.beds.fan.gain.gain.value = CFG.audio.fan.gain * m;
+    AUDIO.beds.machine.gain.gain.value = CFG.audio.machine.gain * m;
   },
 
   /* System update (fixed boot order, after ATMOS / before HUD):
@@ -1357,7 +1438,8 @@ const AUDIO = {
     const beds = AUDIO.beds;
     beds.hum.gain.gain.value =
       C.hum.gain * (1 + C.hum.lfoDepth *
-        Math.sin(t * 2 * Math.PI * C.hum.lfo));
+        Math.sin(t * 2 * Math.PI * C.hum.lfo)) *
+      CFG.perf.bedGain[TIER.name];   // M14.1 tier scale
     const s = C.fan.sweep;
     beds.fan.filter.frequency.value =
       (s.range[0] + s.range[1]) / 2 +
@@ -1706,6 +1788,18 @@ const INPUT = {
       if (e.code === 'KeyL' && !e.repeat) INPUT.lightningTrigger = true;
       if (e.code === 'KeyF' && !e.repeat) INPUT.wakeTrigger = true;
       if (e.code === 'KeyM' && !e.repeat) AUDIO.toggleMute();   // M11.1
+      /* M14.1 quality tiers: F1/F2/F3 pin HIGH/MED/LOW (manual, auto
+       * off); F4 restores auto-detect. */
+      if (!e.repeat && e.code.indexOf('F') === 0 &&
+          (e.code === 'F1' || e.code === 'F2' ||
+           e.code === 'F3' || e.code === 'F4')) {
+        if (e.code === 'F4') {
+          PERF.auto = true;
+        } else {
+          PERF.auto = false;
+          TIER.set(e.code === 'F1' ? 'high' : e.code === 'F2' ? 'med' : 'low');
+        }
+      }
       INPUT.keys.add(e.code);
       if (e.code === 'Space') e.preventDefault();
     });
@@ -2493,7 +2587,7 @@ const KIT = {
     }
     /* holo signs: 8 Hz flicker redraw + slow tagline cycle */
     KIT._acc2 += dt;
-    const signStep = 1 / CFG.kit.signHz;
+    const signStep = 1 / CFG.kit.signHz[TIER.name];   // M14.1 tier
     if (KIT._acc2 >= signStep) {
       KIT._acc2 %= signStep;
       KIT.tex.signQwen.redraw(t);
@@ -2582,6 +2676,7 @@ const WORLD = {
   BLOCK: CFG.city.block,
   CHUNK: CFG.city.chunkBlocks,
   RADIUS: CFG.city.radius,
+  _lodR: CFG.perf.lodRadius[TIER.name],  // M14.1 tier LOD radius
   root: null,
   ground: null,
   chunks: new Map(),      // "cx,cz" -> chunk
@@ -3039,11 +3134,21 @@ const WORLD = {
     }
   },
 
+  /* M14.1: tier far-chunk LOD radius — a tier change re-syncs the
+   * keep-set at once (retire beyond, build ahead; pooled, no alloc). */
+  setTierLod() {
+    const r = CFG.perf.lodRadius[TIER.name];
+    if (r === WORLD._lodR) return;
+    WORLD._lodR = r;
+    WORLD._sync();
+  },
+
   /* (re)build the keep-set around the player, retire the rest */
   _sync() {
     const keep = new Set();
-    for (let dx = -WORLD.RADIUS; dx <= WORLD.RADIUS; dx++) {
-      for (let dz = -WORLD.RADIUS; dz <= WORLD.RADIUS; dz++) {
+    const R = WORLD._lodR;
+    for (let dx = -R; dx <= R; dx++) {
+      for (let dz = -R; dz <= R; dz++) {
         const cx = WORLD._pcx + dx, cz = WORLD._pcz + dz;
         const key = cx + ',' + cz;
         keep.add(key);
@@ -3714,7 +3819,8 @@ const WORLD = {
     WORLD.stats.chunks = WORLD.chunks.size;
     WORLD.stats.instances = inst;
     WORLD.stats.ring = ring;
-    WORLD.stats.meters = (2 * WORLD.RADIUS + 1) * WORLD.CHUNK * WORLD.BLOCK;
+    WORLD.stats.meters =
+      (2 * WORLD._lodR + 1) * WORLD.CHUNK * WORLD.BLOCK;
   },
 
 };
@@ -7255,7 +7361,7 @@ const HUD = {
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
       'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
       'P particles · R pulse · T arcs · B flash · N shake · L lightning\n' +
-      'F awaken · M mute';
+      'F awaken · M mute\nF1–F3 quality · F4 auto';
     /* M9.6: HUD awaken button — same entry as the F key: the manual
      * trigger path routes through ENTITY.wake() (no-op unless DORMANT)
      * and marks the session user-triggered so the one-shot auto skips. */
@@ -7272,7 +7378,7 @@ const HUD = {
     HUD.acc += dt;
     HUD.accFrames++;
     if (HUD.acc >= 0.5) {
-      HUD.fps = HUD.accFrames / HUD.acc;
+      HUD.fps = PERF.fps;      // M14.1 rolling FPS monitor
       HUD.acc = 0;
       HUD.accFrames = 0;
       if (HUD.el) {
@@ -7280,8 +7386,10 @@ const HUD = {
         const mouse = INPUT.pointerLocked ? 'locked' : 'click to capture';
         const pad = INPUT.pad.connected ? 'PAD' : '-';
         const mute = AUDIO.muted ? 'MUTED' : 'mute: M';
+        const q = TIER.name.toUpperCase() + (PERF.auto ? ' · auto' : '');
         HUD.el.textContent =
           `FPS ${String(Math.round(HUD.fps)).padStart(2, ' ')}\n` +
+          `Q ${q}\n` +
           `STATE ${BOOT.state}\n` +
           `AI ${ENTITY.state}\n` +
           `CAM ${mode} · FOV ${Math.round(camera.fov)} · ${mouse} · ${pad}\n` +
@@ -8538,6 +8646,7 @@ function frame(now) {
   const dt = Math.min((now - lastNow) / 1000, 0.1);   // clamp (tab-hide)
   lastNow = now;
   const t = now / 1000;
+  PERF.tick(dt);
   for (const s of systems) {
     if (!s.update) continue;
     try {
@@ -8628,6 +8737,7 @@ window.SIM = {
   FX,
   ATMOS,
   TIER,
+  PERF,
   AUDIO,
   HUD,
   CFG,

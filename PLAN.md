@@ -84,7 +84,7 @@ smoke-test evidence.
 | **M13.2** ✅ | Ambient events A: data pulse (dot along conduit, both ends flash — M7 cable) + section power cycle (one ring chunk dims/brightens 3–6 s, per-chunk color multiplier) | Both events fire and resolve cleanly on manual + scheduled triggers |
 | **M13.3** ✅ | Ambient events B: cooling emergency (fan spin-up, steam burst, warning LEDs, drone dispatch, 20 s, resolves) + drone launch (roof-bay panel opens, 2–4 drones fly to patrol) | Both events run start→resolve with no leftover state; visible from street level |
 | **M13.4** ✅ | Ambient events C: mechanical reposition (giant fan/antenna/ring slow move + rumble + tiny shake) + distant EM discharge (far lightning + a few city arcs); awakening-compat: during AWAKE only creature-priority events fire | 3-min idle play shows ≥ 4 different events, none conflicting, none breaking perf; AWAKE window respected |
-| **M14.1** | Perf monitor + quality tiers: rolling FPS, `HIGH/MED/LOW` (auto + manual); tiers scale LOD radius, particle/drone/vehicle caps, sign texture updates, light shafts, audio beds | Forcing each tier in smoke run: stats within budget, no stutter on tier switch |
+| **M14.1** ✅ | Perf monitor + quality tiers: rolling FPS, `HIGH/MED/LOW` (auto + manual); tiers scale LOD radius, particle/drone/vehicle caps, sign texture updates, light shafts, audio beds | Forcing each tier in smoke run: stats within budget, no stutter on tier switch |
 | **M14.2** | HUD stats (small, corner, toggleable): FPS, visible instances, active drones, chunk id, AI state | HUD matches measured stats; toggle hides it; costs nothing hidden |
 | **M14.3** | Polish pass: shake tuning, flash tuning, title fade, mute key (`M`), help overlay (`H`), cheap DOM vignette | Each control verified working; feel pass recorded (3-min run) |
 | **M14.4** | Robustness pass: refresh mid-game, tab-hide/resume (dt clamp), resize mid-awakening, gamepad plug/unplug — no errors, no stuck states | Robustness checklist in smoke run fully green |
@@ -1129,7 +1129,7 @@ events, none conflicting, none breaking perf.
 ### M14 — Performance, quality tiers, polish pass
 
 #### M14.1 — FPS monitor + quality tiers
-- [ ] Rolling FPS monitor; tiers `HIGH / MED / LOW` (auto + manual).
+- [x] Rolling FPS monitor; tiers `HIGH / MED / LOW` (auto + manual).
       Tiers scale: far-chunk LOD radius, particle caps, drone/vehicle
       counts, holo-sign texture updates, light shafts, audio beds.
 - **Test:** forcing each tier in the smoke run keeps stats within budget;

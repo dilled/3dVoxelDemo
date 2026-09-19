@@ -348,6 +348,18 @@
  *     hides it again
  *   - no allocation per frame (heap flat)
  *
+ *   M14.1 checks (perf monitor + quality tiers):
+ *   - rolling FPS monitor: PERF.fps live, HUD shows the tier line
+ *   - manual override: F1/F2/F3 pin HIGH/MED/LOW (auto off), F4 = auto
+ *   - forcing each tier: far-chunk LOD radius + keep-set, fleet caps,
+ *     particle budget, sign redraw rate, shaft/star tiers + audio bed
+ *     gains all follow; draw calls < 150 (stats within budget)
+ *   - no stutter on tier switch (2× LOW→HIGH keep-set churn < 500 ms)
+ *   - auto-detect: synthetic fps drive (down/up + hysteresis) + the
+ *     live rAF tick path stepping HIGH → MED → LOW on slow windows
+ *   - frustum + ring culling via stats (chunk meshes frustum-culled,
+ *     high orbit down > horizon call counts)
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -477,9 +489,13 @@ try {
    * M9.6: park the one-shot auto-awaken the same way — a live auto
    * at 30 s would inject a full sequence into the earlier sections.
    * The M9.6 section verifies it explicitly. */
+  /* M14.1: park the auto quality tier too — headless fps would step the
+   * tier down mid-suite and leak into the earlier sections' HIGH-tier
+   * expectations. The M14.1 section owns the tier explicitly. */
   await page.evaluate(() => {
     window.SIM.ATMOS._ltTimer = 1e9;
     window.SIM.ENTITY._autoAt = Infinity;
+    window.SIM.PERF.auto = false;
   });
   await sleep(1500);
   {
@@ -559,6 +575,7 @@ try {
     window.SIM.ATMOS._ltTimer = 1e9;
     window.SIM.ENTITY._autoAt = Infinity;
     window.SIM.EVENTS.paused = true;
+    window.SIM.PERF.auto = false;   // M14.1: keep the tier manual
   });
 
   /* ------------------------------------------------------------------
@@ -8199,6 +8216,7 @@ try {
     await page.evaluate(() => {
       window.SIM.ATMOS._ltTimer = 1e9;
       window.SIM.ENTITY._autoAt = Infinity;
+      window.SIM.PERF.auto = false;   // M14.1: keep the tier manual
     });
   }
 
@@ -9568,6 +9586,10 @@ try {
       const s = await endState();
       checkEnd('M12.3: natural finish ends in the street (fade done, beat FX off)', s);
       await checkControllable('M12.3: natural finish → controllable street camera (W moves forward)');
+      /* the M13.x sections continue on this fresh page: keep the
+       * M14.1 auto tier off (the pre-M14.1 suite ran HIGH always,
+       * which the M13.x checks assume). */
+      await page.evaluate(() => { window.SIM.PERF.auto = false; });
     }
   }
 
@@ -10305,11 +10327,19 @@ try {
    *    gate, determinism, no leftover state, live perf window) ---- */
   {
     /* take over the scheduler (page is RUNNING, no reload) */
-    await page.evaluate(() => {
-      const E = window.SIM.EVENTS;
+    await page.evaluate(async () => {
+      const S = window.SIM, E = S.EVENTS, ENT = S.ENTITY;
       if (E._active) E._end(E._active, true);
       E.reset();
       E.paused = true;
+      ENT._autoAt = Infinity;
+      /* a natural auto-awaken (boot + 25–40 s) still in flight would
+       * reject the priority-0 trigger below (pre-existing headless
+       * race) — park the re-arm and wait out its 12–20 s resolution
+       * so the section starts from a deterministic DORMANT state. */
+      const t0 = Date.now();
+      while (ENT.state !== 'DORMANT' && Date.now() - t0 < 30000)
+        await new Promise((r) => setTimeout(r, 200));
     });
 
     /* street-level screenshot helpers (M6.2/M13.3 pose pattern) —
@@ -10670,6 +10700,239 @@ try {
       E._rng = S.WORLD.mulberry(S.CFG.city.seed ^ S.CFG.events.seed);
       E.paused = false;
     });
+  }
+
+  /* ---- 9f. M14.1 — perf monitor + quality tiers (auto + manual) ---- */
+  {
+    const tierStats = () => page.evaluate(() => {
+      const S = window.SIM;
+      let culled = true;
+      for (const ch of S.WORLD.chunks.values())
+        for (const d of [ch.boxA, ch.boxG, ch.cyl, ch.fan, ch.dish,
+                        ch.pulse, ch.sign, ch.ledWin])
+          /* empty detail meshes stay frustumCulled=false (invisible,
+           * 0 draw calls); live meshes must be culled */
+          if (d.count > 0 && !d.mesh.frustumCulled) culled = false;
+      return {
+        tier: S.TIER.active(),
+        lodR: S.WORLD._lodR,
+        chunks: S.WORLD.chunks.size,
+        ring: S.WORLD.stats.ring.join('/'),
+        drones: S.TRAFFIC.count,
+        vehicles: S.TRAFFIC.vcount,
+        parts: S.CFG.parts.tiers[S.TIER.active()],
+        signHz: S.CFG.kit.signHz[S.TIER.active()],
+        shafts: S.CFG.atmos.shaft.tiers[S.TIER.active()],
+        stars: S.CFG.atmos.stars.tiers[S.TIER.active()],
+        bedFan: S.AUDIO.beds ? S.AUDIO.beds.fan.gain.gain.value : -1,
+        bedMach: S.AUDIO.beds ? S.AUDIO.beds.machine.gain.gain.value : -1,
+        culled,
+        calls: S.renderer.info.render.calls,
+      };
+    });
+
+    /* 1. rolling FPS monitor: PERF.fps live + HUD tier line */
+    await sleep(700);
+    const mon = await page.evaluate(() => ({
+      fps: window.SIM.PERF.fps,
+      hud: document.getElementById('hud').textContent,
+    }));
+    check('M14.1: rolling FPS monitor live (PERF.fps > 0, HUD shows the tier line)',
+      mon.fps > 0 && /Q (HIGH|MED|LOW)( · auto)?/.test(mon.hud),
+      `fps=${Math.round(mon.fps)}, hud=[${mon.hud.split('\n').join(' | ')}]`);
+
+    /* 2. manual override: F1/F2/F3 pin the tier (auto off), F4 = auto */
+    await page.keyboard.press('F2');
+    await sleep(120);
+    const m1 = await page.evaluate(() => ({
+      tier: window.SIM.TIER.active(), auto: window.SIM.PERF.auto }));
+    await page.keyboard.press('F1');
+    await sleep(120);
+    const m2 = await page.evaluate(() => ({
+      tier: window.SIM.TIER.active(), auto: window.SIM.PERF.auto }));
+    await page.keyboard.press('F3');
+    await sleep(120);
+    const m3 = await page.evaluate(() => ({
+      tier: window.SIM.TIER.active(), auto: window.SIM.PERF.auto }));
+    await page.keyboard.press('F4');
+    await sleep(120);
+    const m4 = await page.evaluate(() => ({
+      tier: window.SIM.TIER.active(), auto: window.SIM.PERF.auto }));
+    await page.evaluate(() => {
+      window.SIM.PERF.auto = false;   // manual from here on
+      window.SIM.TIER.set('high');
+    });
+    check('M14.1: manual override — F1/F2/F3 pin HIGH/MED/LOW (auto off), F4 restores auto',
+      m1.tier === 'med' && m1.auto === false &&
+      m2.tier === 'high' && m2.auto === false &&
+      m3.tier === 'low' && m3.auto === false && m4.auto === true,
+      `F2=${m1.tier}/${m1.auto}, F1=${m2.tier}, F3=${m3.tier}, F4 auto=${m4.auto}`);
+
+    /* 3. forcing each tier: every scaling point follows + stats within
+     * budget (draw calls < 150 live) */
+    const want = {
+      high: { lodR: 2, chunks: 25, ring: '1/8/16', parts: 280,
+             signHz: 8, shafts: 4, stars: 1600, bg: 1.0 },
+      med:  { lodR: 2, chunks: 25, ring: '1/8/16', parts: 160,
+             signHz: 4, shafts: 2, stars: 900, bg: 0.7 },
+      low:  { lodR: 1, chunks: 9,  ring: '1/8/0',  parts: 72,
+             signHz: 2, shafts: 1, stars: 500,  bg: 0.45 },
+    };
+    for (const tier of ['high', 'med', 'low']) {
+      const w = want[tier];
+      await page.evaluate(t => {
+        window.SIM.TIER.set(t);
+        window.SIM.PERF.auto = false;
+      }, tier);
+      await sleep(1500);   // fleet trim + keep-set re-sync settle
+      const s = await tierStats();
+      const caps = await page.evaluate(t => ({
+        drones: window.SIM.CFG.traffic.drone.tiers[t],
+        vehicles: window.SIM.CFG.traffic.vehicle.tiers[t],
+      }), tier);
+      check(`M14.1: ${tier} tier — LOD radius, keep-set, sign redraw, shaft/star/particle tiers + fleet caps all follow`,
+        s.lodR === w.lodR && s.chunks === w.chunks && s.ring === w.ring &&
+        s.parts === w.parts && s.signHz === w.signHz &&
+        s.shafts === w.shafts && s.stars === w.stars &&
+        s.drones <= caps.drones && s.vehicles <= caps.vehicles &&
+        s.culled,
+        `lodR=${s.lodR}, chunks=${s.chunks}, ring=${s.ring},` +
+        ` drones=${s.drones}/${caps.drones},` +
+        ` vehicles=${s.vehicles}/${caps.vehicles}, parts=${s.parts},` +
+        ` signHz=${s.signHz}, shafts=${s.shafts}, stars=${s.stars}`);
+      check(`M14.1: ${tier} tier — audio beds scaled (bedGain ${w.bg}) + draw calls < 150 (stats within budget)`,
+        s.bedFan > 0 && Math.abs(s.bedFan - 0.16 * w.bg) < 1e-5 &&
+        Math.abs(s.bedMach - 0.10 * w.bg) < 1e-5 && s.calls < 150,
+        `fan=${s.bedFan}, mach=${s.bedMach}, calls=${s.calls}`);
+    }
+
+    /* 4. no stutter on tier switch: the full LOW→HIGH keep-set churn
+     * completes in one tight budget and the loop stays live after it */
+    const sw = await page.evaluate(() => {
+      const S = window.SIM;
+      const t0 = performance.now();
+      S.TIER.set('low');
+      S.TIER.set('high');
+      const churn = performance.now() - t0;
+      S.TIER.set('low');
+      S.TIER.set('high');
+      return { churn: performance.now() - t0, f0: S.BOOT.frames };
+    });
+    await sleep(1500);
+    const live = await page.evaluate(() => ({
+      frames: window.SIM.BOOT.frames,
+      calls: window.SIM.renderer.info.render.calls,
+      chunks: window.SIM.WORLD.chunks.size,
+    }));
+    check('M14.1: no stutter on tier switch — 2× LOW→HIGH keep-set churn < 500 ms, loop live after (draw calls < 150, keep-set rebuilt)',
+      sw.churn < 500 && live.frames > sw.f0 && live.calls < 150 &&
+      live.chunks === 25,
+      `churn=${sw.churn.toFixed(1)} ms, frames ${sw.f0} → ${live.frames},` +
+      ` calls=${live.calls}, chunks=${live.chunks}`);
+
+    /* 5. auto-detect rules: synthetic drive through the pure rule
+     * (deterministic — down/up thresholds + hysteresis + no-op at
+     * boundaries) */
+    const auto = await page.evaluate(() => {
+      const S = window.SIM;
+      S.TIER.set('high');
+      const seq = [];
+      S.PERF.evaluate(45); seq.push(S.TIER.name);   // < 50 ⇒ med
+      S.PERF.evaluate(25); seq.push(S.TIER.name);   // < 30 ⇒ low
+      S.PERF.evaluate(52); seq.push(S.TIER.name);   // > 45 ⇒ med
+      S.PERF.evaluate(60); seq.push(S.TIER.name);   // > 58 ⇒ high
+      S.PERF.evaluate(52); seq.push(S.TIER.name);   // hysteresis: stays
+      return seq.join(',');
+    });
+    check('M14.1: auto-detect rules with hysteresis (synthetic fps drive)',
+      auto === 'med,low,med,high,high', `seq=${auto}`);
+
+    /* 6. auto-detect live: the rAF-driven tick() path lowers the tier
+     * from real slow headless windows (fps ≪ the down thresholds) */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CFG.perf.autoEvery = 1;
+      S.PERF.auto = true;
+      S.TIER.set('high');
+    });
+    let liveAuto = 'timeout';
+    try {
+      await page.waitForFunction(
+        () => window.SIM.TIER.active() === 'low',
+        undefined, { timeout: 15000 });
+      liveAuto = await page.evaluate(() => {
+        const S = window.SIM;
+        const res = S.TIER.active();
+        S.CFG.perf.autoEvery = 4;
+        S.PERF.auto = false;
+        S.TIER.set('high');
+        return res;
+      });
+    } catch (_) { /* timeout ⇒ FAIL below */ }
+    check('M14.1: auto-detect live — slow windows step HIGH → MED → LOW via the loop tick',
+      liveAuto === 'low', `tier=${liveAuto}`);
+
+    /* 7. frustum + ring culling via stats: every chunk mesh is
+     * frustum-culled; a high orbit aimed at the city costs measurably
+     * more draw calls than the same orbit aimed at the horizon (the
+     * city grid falls out of the frustum) */
+    const culled = await page.evaluate(() => {
+      const S = window.SIM;
+      let all = true;
+      for (const ch of S.WORLD.chunks.values())
+        for (const d of [ch.boxA, ch.boxG, ch.cyl, ch.fan, ch.dish,
+                        ch.pulse, ch.sign, ch.ledWin])
+          if (d.count > 0 && !d.mesh.frustumCulled) all = false;
+      return all;
+    });
+    /* high orbit in CINE free-fly (no ground clamp): the GROUND→CINE
+     * mode blend takes 0.55 s, so settle before posing the camera */
+    await page.evaluate(() => window.SIM.CAMERA.setMode('CINE'));
+    await sleep(900);
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(0, 600, 0.1);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = -1.2;   // looking down at the whole keep-set
+    });
+    await sleep(800);
+    const down = await page.evaluate(
+      () => window.SIM.renderer.info.render.calls);
+    await page.evaluate(() => {
+      window.SIM.CAMERA.pitch = 0;   // same height, aimed at the horizon
+    });
+    await sleep(800);
+    const horizon = await page.evaluate(
+      () => window.SIM.renderer.info.render.calls);
+    await page.evaluate(() => window.SIM.CAMERA.setMode('GROUND'));
+    await sleep(900);   // blend back (the ground clamp fades in)
+    check('M14.1: frustum + ring culling via stats — chunk meshes frustum-culled; looking down > looking at the horizon',
+      culled === true && down > horizon && down > 40 && horizon < 40,
+      `culled=${culled}, down=${down}, horizon=${horizon}`);
+
+    /* cleanup + no leftover state: back to HIGH + auto off, keep-set
+     * rebuilt at the street spawn */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.TIER.set('high');
+      S.PERF.auto = false;
+      S.CAMERA.pos.set(0, 4, 18);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = 0;
+    });
+    await sleep(1200);
+    const fin = await page.evaluate(() => ({
+      tier: window.SIM.TIER.active(),
+      auto: window.SIM.PERF.auto,
+      chunks: window.SIM.WORLD.chunks.size,
+      calls: window.SIM.renderer.info.render.calls,
+    }));
+    check('M14.1: no leftover state — HIGH + auto off, keep-set rebuilt, draw calls < 150',
+      fin.tier === 'high' && fin.auto === false && fin.chunks === 25 &&
+      fin.calls < 150,
+      JSON.stringify(fin));
   }
 
   /* ---- 10. No errors anywhere ---- */
