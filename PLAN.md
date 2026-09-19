@@ -83,7 +83,7 @@ smoke-test evidence.
 | **M13.1** ✅ | `EVENTS` scheduler: weighted picking, cooldowns, min/max gap, event registry, one-at-a-time + priority rules | Scheduler smoke test: forced random seed yields legal firing order (no overlap, gaps respected) |
 | **M13.2** ✅ | Ambient events A: data pulse (dot along conduit, both ends flash — M7 cable) + section power cycle (one ring chunk dims/brightens 3–6 s, per-chunk color multiplier) | Both events fire and resolve cleanly on manual + scheduled triggers |
 | **M13.3** ✅ | Ambient events B: cooling emergency (fan spin-up, steam burst, warning LEDs, drone dispatch, 20 s, resolves) + drone launch (roof-bay panel opens, 2–4 drones fly to patrol) | Both events run start→resolve with no leftover state; visible from street level |
-| **M13.4** | Ambient events C: mechanical reposition (giant fan/antenna/ring slow move + rumble + tiny shake) + distant EM discharge (far lightning + a few city arcs); awakening-compat: during AWAKE only creature-priority events fire | 3-min idle play shows ≥ 4 different events, none conflicting, none breaking perf; AWAKE window respected |
+| **M13.4** ✅ | Ambient events C: mechanical reposition (giant fan/antenna/ring slow move + rumble + tiny shake) + distant EM discharge (far lightning + a few city arcs); awakening-compat: during AWAKE only creature-priority events fire | 3-min idle play shows ≥ 4 different events, none conflicting, none breaking perf; AWAKE window respected |
 | **M14.1** | Perf monitor + quality tiers: rolling FPS, `HIGH/MED/LOW` (auto + manual); tiers scale LOD radius, particle/drone/vehicle caps, sign texture updates, light shafts, audio beds | Forcing each tier in smoke run: stats within budget, no stutter on tier switch |
 | **M14.2** | HUD stats (small, corner, toggleable): FPS, visible instances, active drones, chunk id, AI state | HUD matches measured stats; toggle hides it; costs nothing hidden |
 | **M14.3** | Polish pass: shake tuning, flash tuning, title fade, mute key (`M`), help overlay (`H`), cheap DOM vignette | Each control verified working; feel pass recorded (3-min run) |
@@ -1114,10 +1114,10 @@ paths end in a controllable camera, zero console errors.
 - **Commit when:** both verified.
 
 #### M13.4 — Ambient events C + awakening compatibility
-- [ ] Mechanical reposition: one giant fan/antenna/ring moves slowly
+- [x] Mechanical reposition: one giant fan/antenna/ring moves slowly
       with rumble audio + tiny shake.
-- [ ] Distant EM discharge: lightning far off + a few arcs in the city.
-- [ ] Awakening compatibility: during AWAKE only creature-priority events
+- [x] Distant EM discharge: lightning far off + a few arcs in the city.
+- [x] Awakening compatibility: during AWAKE only creature-priority events
       may fire.
 - **Test:** 3-minute idle play shows ≥ 4 different events, none
       conflicting, none breaking perf; AWAKE-window rule respected.

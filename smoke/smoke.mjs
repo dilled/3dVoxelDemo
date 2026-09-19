@@ -70,6 +70,32 @@
  *   - no leftover state: warn/panel/bay hidden, no drones holding an
  *     event role, no live event, nothing active
  *
+ *   M13.4 checks:
+ *   - ambient events C registered (mech-reposition, em-discharge) +
+ *     the mech-reposition rumble one-shot counter on AUDIO.events
+ *   - mech-reposition manual: one tensor ring slews (base quaternion
+ *     moving q0 → q1), tiny camera-shake impulse fired, rumble
+ *     counter +1; street-level screenshot of the ring mid-slew
+ *     (shots/m134-mech-reposition-street.png); em-discharge PREEMPTS
+ *     it (victim interrupted, starts exactly at the victim's end) and
+ *     the ring's base quaternion stays frozen at the interrupted value
+ *   - em-discharge in flight: one far lightning strike
+ *     (ATMOS.ltFired +1) + 2–3 staggered city arcs (FX.arc between the
+ *     nearest live substations); resolves clean (natural end, dur in
+ *     [3, 5], no bookkeeping left)
+ *   - AWAKE-window rule: while ENTITY is forced AWAKE, a manual
+ *     trigger of an ambient (priority 0) event is REFUSED, no
+ *     ambient event starts in a 30 s drive, but a synthetic
+ *     creature-priority (priority 1) event FIRES; after DORMANT,
+ *     ambient events fire again
+ *   - 3-minute gate: real pacing (gap [14, 30], first 20), forced
+ *     seed, 1800 × 0.1 s — >= 4 DISTINCT events fire, no overlaps,
+ *     gap >= 14, per-id cooldowns held, deterministic; no leftover
+ *     state (all event state null, drones home, meshes hidden, ring
+ *     base quaternion stable)
+ *   - perf proxy: live page window (first event at t=0) — draw calls
+ *     stay < 150 while events fire, no errors
+ *
  *   M1 checks:
  *   - systems registry boots in fixed order
  *     (INPUT, CAMERA, KIT, WORLD, ENTITY, TRAFFIC, PARTS, HUD)
@@ -9554,18 +9580,21 @@ try {
      * preempt whatever is running). Page is RUNNING (no reload). */
     await page.evaluate(() => {
       const S = window.SIM, E = S.EVENTS;
-      /* M13.2: the ambient events (data-pulse / power-cycle, and the
-       * M13.3 cooling-emergency / drone-launch) are registered from
-       * boot — this section tests the scheduler with a synthetic
-       * registry only, so end anything live, unregister the ambient
-       * events, and un-park the page loop (the boot park above froze
-       * it for the preceding sections). Cleanup re-registers the
-       * ambient events. */
+      /* M13.2: the ambient events (data-pulse / power-cycle, the
+       * M13.3 cooling-emergency / drone-launch, and the M13.4
+       * mech-reposition / em-discharge) are registered from boot —
+       * this section tests the scheduler with a synthetic registry
+       * only, so end anything live, unregister the ambient events,
+       * and un-park the page loop (the boot park above froze it for
+       * the preceding sections). Cleanup re-registers the ambient
+       * events. */
       if (E._active) E._end(E._active, true);
       E.unregister('data-pulse');
       E.unregister('power-cycle');
       E.unregister('cooling-emergency');
       E.unregister('drone-launch');
+      E.unregister('mech-reposition');
+      E.unregister('em-discharge');
       E.paused = false;
       S.CFG.events.gap = [2, 4];   // test pacing (shorter than CFG)
       S.CFG.events.first = 0;
@@ -10262,6 +10291,379 @@ try {
     /* cleanup: real CFG/clock/rng restored, page loop resumes */
     await page.evaluate(() => {
       const S = window.SIM, E = S.EVENTS;
+      S.CFG.events.gap = [14, 30];
+      S.CFG.events.first = 20;
+      E.reset();
+      E._rng = S.WORLD.mulberry(S.CFG.city.seed ^ S.CFG.events.seed);
+      E.paused = false;
+    });
+  }
+
+  /* ---- 9e. M13.4 — Ambient events C: mechanical reposition +
+   *    distant EM discharge + the AWAKE-window rule (manual trigger
+   *    + preemption, street-level screenshot, scheduled 3-minute
+   *    gate, determinism, no leftover state, live perf window) ---- */
+  {
+    /* take over the scheduler (page is RUNNING, no reload) */
+    await page.evaluate(() => {
+      const E = window.SIM.EVENTS;
+      if (E._active) E._end(E._active, true);
+      E.reset();
+      E.paused = true;
+    });
+
+    /* street-level screenshot helpers (M6.2/M13.3 pose pattern) —
+     * the pose search tries 8 bearings × 3 distances at street level
+     * (y = 1.7) and keeps the first with a provably clear line of
+     * sight against the instanced building boxes; the spawn pose is
+     * restored after. */
+    const streetPose = async (tg) => page.evaluate((tg) => {
+      const S = window.SIM;
+      const boxes = [];
+      for (const ch of S.WORLD.chunks.values()) {
+        if (!ch.group || !ch.group.visible) continue;
+        for (const b of [ch.boxA, ch.boxG, ch.cyl, ch.ledWin])
+          if (b && b.count > 0) boxes.push(b);
+      }
+      const inv = S.TRAFFIC._m.clone();
+      const la = S.TRAFFIC._p.clone();
+      function segHits(arr, o, ax, ay, az, bx, by, bz) {
+        inv.fromArray(arr, o);
+        inv.invert();
+        const p = la.set(ax, ay, az).applyMatrix4(inv);
+        const px = p.x, py = p.y, pz = p.z;
+        const q = la.set(bx, by, bz).applyMatrix4(inv);
+        const pp = [px, py, pz], qq = [q.x, q.y, q.z];
+        let t0 = 0, t1 = 1;
+        for (let k = 0; k < 3; k++) {
+          const dK = qq[k] - pp[k];
+          if (Math.abs(dK) < 1e-9) {
+            if (pp[k] < -0.5 || pp[k] > 0.5) return false;
+          } else {
+            let te = (-0.5 - pp[k]) / dK, tx = (0.5 - pp[k]) / dK;
+            if (te > tx) { const tm = te; te = tx; tx = tm; }
+            if (t0 < te) t0 = te;
+            if (t1 > tx) t1 = tx;
+            if (t0 > t1) return false;
+          }
+        }
+        return true;
+      }
+      function occluded(ax, ay, az, bx, by, bz) {
+        const dx = bx - ax, dy = by - ay, dz = bz - az;
+        const l2 = dx * dx + dy * dy + dz * dz;
+        for (const b of boxes) {
+          const arr = b.mesh.instanceMatrix.array;
+          for (let i = 0; i < b.count; i++) {
+            const o = i * 16;
+            const cx = arr[o + 12], cy = arr[o + 13], cz = arr[o + 14];
+            const sx = Math.abs(arr[o]) + Math.abs(arr[o + 1]) + Math.abs(arr[o + 2]);
+            const sy = Math.abs(arr[o + 4]) + Math.abs(arr[o + 5]) + Math.abs(arr[o + 6]);
+            const sz = Math.abs(arr[o + 8]) + Math.abs(arr[o + 9]) + Math.abs(arr[o + 10]);
+            const tt = ((cx - ax) * dx + (cy - ay) * dy + (cz - az) * dz) / l2;
+            if (tt < 0 || tt > 1) continue;
+            const px = ax + dx * tt, py = ay + dy * tt, pz = az + dz * tt;
+            const ex = Math.max(sx, sy, sz) * 0.5 + 1;
+            const ex2 = cx - px, ey = cy - py, ez = cz - pz;
+            if (ex2 * ex2 + ey * ey + ez * ez > ex * ex) continue;
+            if (segHits(arr, o, ax, ay, az, bx, by, bz)) return true;
+          }
+        }
+        return false;
+      }
+      const tx = tg.x, ty = tg.y, tz = tg.z;
+      for (let k = 0; k < 8; k++) {
+        const ang = k * 0.7854 + 0.4;
+        for (const rad of [50, 80, 110]) {
+          const x = tx - Math.cos(ang) * rad;
+          const z = tz - Math.sin(ang) * rad;
+          if (occluded(x, 1.7, z, tx, ty, tz)) continue;
+          const dx = tx - x, dz = tz - z;
+          return { x, z,
+            yaw: Math.atan2(-dx, -dz),
+            pitch: Math.atan2(ty - 1.7, Math.hypot(dx, dz)) };
+        }
+      }
+      const dist = Math.hypot(tx, tz);
+      const nx = tx / dist, nz = tz / dist;
+      return { x: tx - nx * 70, z: tz - nz * 70,
+        yaw: Math.atan2(-nx, -nz), pitch: Math.atan2(ty - 1.7, 70) };
+    }, tg);
+    const streetShot = async (name, pose) => {
+      if (!pose) return false;
+      await page.evaluate((p) => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(p.x, 1.7, p.z);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = p.yaw;
+        S.CAMERA.pitch = p.pitch;
+      }, pose);
+      await sleep(450);
+      await page.screenshot({ path: `${here}/shots/${name}.png` });
+      const ok = fs.existsSync(`${here}/shots/${name}.png`);
+      await page.evaluate(() => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(0, 4, 18);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = 0;
+        S.CAMERA.pitch = 0;
+      });
+      await sleep(250);
+      return ok;
+    };
+
+    /* 1. registration: both ambient events C + the rumble one-shot
+     * counter (the creature's rings are the reposition target) */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      return {
+        mr: !!E._reg.get('mech-reposition'),
+        ed: !!E._reg.get('em-discharge'),
+        mrCd: S.CFG.events.mechReposition.cd,
+        edArcs: S.CFG.events.emDischarge.arcs,
+        hasRumble: typeof S.AUDIO.events.rumble === 'number',
+        rings: S.ENTITY._ringBaseQ.length,
+        subList: S.PARTS._subList.length,
+      };
+    });
+    check('M13.4: ambient events C registered (mech-reposition, em-discharge) + rumble counter',
+      reg.mr && reg.ed && reg.hasRumble && reg.rings === 3 &&
+      reg.subList >= 2 && reg.mrCd[0] >= 60 && reg.edArcs[1] >= 2,
+      JSON.stringify(reg));
+
+    /* 2. mech-reposition manual: one tensor ring slews (base
+     * quaternion moving q0 → q1), tiny camera-shake impulse + the
+     * rumble one-shot fired; street-level screenshot of the ring
+     * mid-slew; then em-discharge PREEMPTS it and the ring's base
+     * quaternion stays frozen at the interrupted value */
+    const mr = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E._rng = S.WORLD.mulberry(0x1344);
+      const shake0 = S.CAMERA.shakeEnergy;
+      const rumble0 = S.AUDIO.events.rumble;
+      const lt0 = S.ATMOS.ltFired;
+      const ok = E.trigger('mech-reposition');
+      const i = E._mr.i;
+      const q0 = E._mr.q0, q1 = E._mr.q1;
+      const ang01 = 2 * Math.acos(Math.min(1, Math.abs(
+        q0.x * q1.x + q0.y * q1.y + q0.z * q1.z + q0.w * q1.w)));
+      for (let k = 0; k < 30; k++) E.step(0.1);   // 3 s into [6, 10]
+      const base = S.ENTITY._ringBaseQ[i];
+      const moved = 2 * Math.acos(Math.min(1, Math.abs(
+        base.x * q0.x + base.y * q0.y + base.z * q0.z + base.w * q0.w)));
+      const frozen = { x: base.x, y: base.y, z: base.z, w: base.w };
+      /* em-discharge preempts the running mech-reposition */
+      const victimIdx = E.log.length;
+      const okEd = E.trigger('em-discharge');
+      const victim = E.log[victimIdx];
+      const active = E._active ? E._active.id : null;
+      const edStart = E._active ? E._active.startAt : null;
+      for (let k = 0; k < 5; k++) E.step(0.1);   // 0.5 s — ring frozen
+      const base2 = S.ENTITY._ringBaseQ[i];
+      return { ok, okEd, i, ang01, moved, edStart,
+        shake: S.CAMERA.shakeEnergy, shake0,
+        rumble: S.AUDIO.events.rumble, rumble0,
+        ltFired: S.ATMOS.ltFired, lt0,
+        victim: victim ? { id: victim.id, start: victim.start,
+          end: victim.end, interrupted: victim.interrupted } : null,
+        active, nPairs: E._ed ? E._ed.pairs.length / 2 : -1,
+        frozenSame: base2.x === frozen.x && base2.y === frozen.y &&
+          base2.z === frozen.z && base2.w === frozen.w };
+    });
+    check('M13.4: mech-reposition — ring slews (base quaternion moving q0 → q1), tiny shake + rumble fired',
+      mr.ok && mr.i >= 0 && mr.i <= 2 && mr.ang01 > 0.1 &&
+      mr.moved > 0.03 &&
+      mr.shake >= Math.min(1.5, mr.shake0 + 0.25) - 1e-9 &&
+      mr.rumble === mr.rumble0 + 1,
+      `ring=${mr.i}, q0→q1 ${(mr.ang01 * 57.2958).toFixed(1)} deg,` +
+      ` moved ${(mr.moved * 57.2958).toFixed(1)} deg,` +
+      ` shake ${mr.shake0.toFixed(3)} → ${mr.shake.toFixed(3)},` +
+      ` rumble ${mr.rumble0} → ${mr.rumble}`);
+    check('M13.4: em-discharge PREEMPTS mech-reposition (victim interrupted, starts exactly at the victim\'s end), ring frozen at the interrupted value',
+      mr.okEd && !!mr.victim && mr.victim.id === 'mech-reposition' &&
+      mr.victim.interrupted === true && mr.active === 'em-discharge' &&
+      mr.victim.end === mr.edStart && mr.frozenSame &&
+      mr.ltFired === mr.lt0 + 1 && mr.nPairs >= 2,
+      `victim=${JSON.stringify(mr.victim)}, active=${mr.active},` +
+      ` ltFired ${mr.lt0} → ${mr.ltFired}, pairs=${mr.nPairs}`);
+
+    /* street-level screenshot of the ring mid-slew (it stays at the
+     * interrupted pose — the reposition is permanent) */
+    const poseMr = await streetPose({ x: 0, y: 44, z: 0 });
+    check('M13.4: street-level screenshot of the ring mid-slew (shots/m134-mech-reposition-street.png)',
+      await streetShot('m134-mech-reposition-street', poseMr));
+
+    /* 3. em-discharge in flight: the staggered city arcs all fire
+     * (bolt k at k · 0.4 s), the arcs are live (FX.arcCount >= 1),
+     * and it resolves clean — natural end, dur in [3, 5], no
+     * bookkeeping left */
+    const ed = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      let i = 0;
+      while (E._active && E._ed &&
+             E._ed.fired < E._ed.pairs.length / 2 && i < 30) {
+        E.step(0.1); i++;
+      }
+      const arcs = S.FX.arcCount;
+      let guard = 0;
+      while (E._active && guard < 60) { E.step(0.1); guard++; }
+      const entry = E.log[E.log.length - 1];
+      return {
+        allFired: E._ed === null && arcs >= 1,
+        arcs, active: E._active ? E._active.id : null,
+        id: entry.id, start: entry.start, end: entry.end,
+        interrupted: entry.interrupted };
+    });
+    check('M13.4: em-discharge in flight — staggered city arcs all fire, resolves clean (natural end, dur in [3, 5])',
+      ed.allFired && ed.id === 'em-discharge' && ed.interrupted === false &&
+      ed.end - ed.start >= 3 - 1e-9 && ed.end - ed.start <= 5 + 1e-9 &&
+      !ed.active,
+      `arcs=${ed.arcs}, dur=${(ed.end - ed.start).toFixed(2)} s,` +
+      ` active=${ed.active}`);
+
+    /* 4. AWAKE-window rule: while the creature is forced AWAKE,
+     * manual triggers of ambient (priority 0) events are REFUSED,
+     * no ambient event starts in a 30 s drive, but a synthetic
+     * creature-priority (priority 1) event FIRES; after DORMANT,
+     * ambient events fire again */
+    const aw = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS, EN = S.ENTITY;
+      EN._awakeDur = 1e9;
+      EN._enterState('AWAKE', performance.now() / 1000);
+      const refusedDp = E.trigger('data-pulse');
+      const refusedMr = E.trigger('mech-reposition');
+      E.register({ id: 'creature-test', weight: 1, duration: [1, 1],
+                   cooldown: [1, 1], priority: 1 });
+      const mark = E.log.length;
+      let i = 0;
+      while (!E._active && i < 300) { E.step(0.1); i++; }
+      const firedId = E._active ? E._active.id : null;
+      const ambientWhileAwake = E.log.slice(mark)
+        .filter(e => e.id !== 'creature-test').length;
+      if (E._active) E._end(E._active, true);
+      E.unregister('creature-test');
+      /* back to DORMANT — ambient events may fire again */
+      EN._enterState('DORMANT', performance.now() / 1000);
+      const mark2 = E.log.length;
+      for (let k = 0; k < 600; k++) E.step(0.1);
+      const after = E.log.length - mark2;
+      return { refusedDp, refusedMr, firedId, ambientWhileAwake, after };
+    });
+    check('M13.4: AWAKE-window rule — ambient (priority 0) events refused + never start while AWAKE; creature-priority fires; DORMANT restores ambient',
+      aw.refusedDp === false && aw.refusedMr === false &&
+      aw.firedId === 'creature-test' && aw.ambientWhileAwake === 0 &&
+      aw.after >= 1,
+      `refused dp/mr=${aw.refusedDp}/${aw.refusedMr},` +
+      ` fired=${aw.firedId}, ambientWhileAwake=${aw.ambientWhileAwake},` +
+      ` afterDormant=${aw.after}`);
+
+    /* 5. the 3-minute gate: REAL pacing (gap [14, 30], first 20),
+     * forced seed, 1800 × 0.1 s — >= 4 DISTINCT events fire, no
+     * overlaps, gap >= 14, per-id cooldowns held, deterministic.
+     * (The page loop is frozen — this is a pure scheduler drive.) */
+    const gate = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      S.CFG.events.gap = [14, 30];
+      S.CFG.events.first = 20;
+      E.reset();
+      E._rng = S.WORLD.mulberry(0x1345);
+      for (let i = 0; i < 1800; i++) E.step(0.1);
+      return JSON.parse(JSON.stringify(E.log));
+    });
+    {
+      const ids = new Set(gate.map(e => e.id));
+      let noOverlap = true, gapsOk = true, cdOk = true;
+      const cdMin = { 'data-pulse': 12, 'power-cycle': 12,
+                      'cooling-emergency': 45, 'drone-launch': 45,
+                      'mech-reposition': 60, 'em-discharge': 45 };
+      for (let i = 1; i < gate.length; i++) {
+        const gap = gate[i].start - gate[i - 1].end;
+        if (!(gate[i].start > gate[i - 1].end)) noOverlap = false;
+        if (!(gap >= 14 - 1e-9)) gapsOk = false;
+        if (gate[i].id === gate[i - 1].id &&
+            !(gap >= cdMin[gate[i].id] - 1e-9)) cdOk = false;
+      }
+      check('M13.4: 3-minute gate — >= 4 DISTINCT ambient events fire (no conflicts)',
+        ids.size >= 4 && gate.length >= 4,
+        `ids=[${[...ids].join(', ')}], n=${gate.length}`);
+      check('M13.4: 3-minute gate — no overlaps, gap >= 14 held, per-id cooldowns held',
+        noOverlap && gapsOk && cdOk, `n=${gate.length}`);
+    }
+    const gate2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E.reset();
+      E._rng = S.WORLD.mulberry(0x1345);
+      for (let i = 0; i < 1800; i++) E.step(0.1);
+      return JSON.parse(JSON.stringify(E.log));
+    });
+    check('M13.4: 3-minute gate — forced seed ⇒ identical firing order (deterministic)',
+      JSON.stringify(gate2) === JSON.stringify(gate),
+      `n1=${gate.length}, n2=${gate2.length}`);
+
+    /* 6. no leftover state: all event state null, drones home, every
+     * event mesh hidden, the ring base quaternion stable (the
+     * reposition is a permanent rest pose, not a leftover animation)
+     */
+    await sleep(1000);
+    const clean = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      while (E._active) E.step(0.1);
+      let state4 = 0;
+      for (let i = 0; i < S.TRAFFIC.count; i++)
+        if (S.TRAFFIC._live[i].state === 4) state4++;
+      const b0 = S.ENTITY._ringBaseQ.map(
+        q => ({ x: q.x, y: q.y, z: q.z, w: q.w }));
+      for (let k = 0; k < 5; k++) E.step(0.1);
+      const stable = S.ENTITY._ringBaseQ.every((q, i) =>
+        q.x === b0[i].x && q.y === b0[i].y &&
+        q.z === b0[i].z && q.w === b0[i].w);
+      return {
+        state4,
+        ce: E._ce === null, dl: E._dl === null,
+        dp: E._dp === null, pc: E._pc === null,
+        mr: E._mr === null, ed: E._ed === null,
+        warnHidden: !E._warn.visible,
+        panelHidden: !E._bayPanel.visible,
+        bayHidden: !E._bayBay.visible,
+        dotHidden: !E._dot.visible,
+        stable, active: E._active ? E._active.id : null };
+    });
+    check('M13.4: no leftover state (all event state null, drones home, meshes hidden, ring base stable, nothing active)',
+      clean.state4 === 0 && clean.ce && clean.dl && clean.dp &&
+      clean.pc && clean.mr && clean.ed && clean.warnHidden &&
+      clean.panelHidden && clean.bayHidden && clean.dotHidden &&
+      clean.stable && !clean.active,
+      JSON.stringify(clean));
+
+    /* 7. perf proxy: live page window (real pacing, first event at
+     * t=0) — while events fire, draw calls stay under budget and
+     * nothing errors. 7 samples × 2 s = 14 s. */
+    await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      S.CFG.events.gap = [14, 30];
+      S.CFG.events.first = 0;
+      E.reset();
+      E._rng = S.WORLD.mulberry(0x1346);
+      E.paused = false;
+    });
+    const live = [];
+    for (let k = 0; k < 7; k++) {
+      await sleep(2000);
+      live.push(await page.evaluate(() => ({
+        calls: window.SIM.renderer.info.render.calls,
+        n: window.SIM.EVENTS.log.length,
+        active: window.SIM.EVENTS._active
+          ? window.SIM.EVENTS._active.id : null })));
+    }
+    check('M13.4: perf proxy — live window (14 s) with events firing: draw calls < 150, >= 1 event fired',
+      live.every(s => s.calls < 150) && live[6].n >= 1,
+      `calls=[${live.map(s => s.calls).join(', ')}],` +
+      ` n=${live[6].n}, active=${live[6].active}`);
+
+    /* cleanup: real CFG/clock/rng restored, page loop resumes */
+    await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      while (E._active) E.step(0.1);
       S.CFG.events.gap = [14, 30];
       S.CFG.events.first = 20;
       E.reset();

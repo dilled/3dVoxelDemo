@@ -809,6 +809,14 @@ const CFG = {
         band: [700, 1800],   // Hz — band-pass center rise (rotor spin-up)
         q: 1.2,
       },
+      rumble: {              // EVENTS mech-reposition — low rumble
+        gain: 0.35,
+        f: [52, 24],           // Hz — sine pitch drop
+        dur: 2.5,              // s — rumble decay length
+        attack: 0.5,           // s — gain ramp-in
+        noise: 0.4,            // noise level relative to the rumble gain
+        filter: 120,           // Hz — low-pass on the noise
+      },
     },
 
     /* ---- M11.4: spatial-ish mixing — a small pool of panner +
@@ -897,6 +905,20 @@ const CFG = {
       count: [2, 4],                // drones that fly out to patrol
       panel: { open: 1.5, close: 1.5 },
       hover: 2,                     // s the drones hold at the open bay
+    },
+    /* M13.4: ambient events C (mech reposition + distant EM discharge).
+     * The AWAKE-window rule is a gate in the scheduler itself (only
+     * priority > 0 = creature-priority events may start while
+     * ENTITY.state !== 'DORMANT') — no per-event config for it. */
+    mechReposition: {
+      weight: 0.7, cd: [60, 120], dur: [6, 10],
+      reach: [10, 320],             // m from the player to the plaza
+      tilt: 0.3,                    // rad — ring rest-pose change size
+      shake: 0.25,                 // tiny camera-shake impulse at start
+    },
+    emDischarge: {
+      weight: 0.7, cd: [45, 90], dur: [3, 5],
+      arcs: [2, 3],                // city substation bolts (0.4 s stagger)
     },
   },
 };
@@ -1017,8 +1039,10 @@ const AUDIO = {
   muted: false,
   wired: false,
   beds: null,                 // M11.2: { hum, fan, machine } sub-graphs
-  events: { pulse: 0, arc: 0, steam: 0, drone: 0 },  // M11.3 fire counters
-  eventsWired: { pulse: false, arc: false, steam: false, drone: false },
+  events: { pulse: 0, arc: 0, steam: 0, drone: 0, rumble: 0 },
+  // M11.3 fire counters (M13.4 adds the mech-reposition rumble)
+  eventsWired: { pulse: false, arc: false, steam: false, drone: false,
+                 rumble: false },
   _evNoise: null,             // M11.3: shared short noise buffer (one-shots)
   spatial: null,              // M11.4: channel pool (null = no panner here)
   spatialWired: false,        // M11.4: channel output → AUDIO.master
@@ -1508,6 +1532,49 @@ const AUDIO = {
     /* drop the one-shot from the graph when it ends (see pulseThump) */
     src.onended = () => { g.disconnect(); };
     AUDIO.events.drone++;
+  },
+
+  /* mech-reposition rumble: a low sine pitch drop under a low-passed
+   * noise bed — the giant ring slewing to a new rest pose
+   * (EVENTS 'mech-reposition', M13.4). pos: emitter {x,y,z}
+   * (see pulseThump). */
+  rumble(pos) {
+    if (!AUDIO.ctx) return;
+    const ctx = AUDIO.ctx;
+    const C = CFG.audio.events.rumble;
+    const t0 = ctx.currentTime + 0.01;
+    const sink = pos ? AUDIO._spatialSink('rumble', pos.x, pos.y, pos.z, C.dur) : null;
+    const g = AUDIO._evGain('rumble', C.gain, sink);
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(C.f[0], t0);
+    osc.frequency.exponentialRampToValueAtTime(C.f[1], t0 + C.dur);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(0.0001, t0);
+    og.gain.exponentialRampToValueAtTime(1, t0 + C.attack);
+    og.gain.exponentialRampToValueAtTime(0.0001, t0 + C.dur);
+    osc.connect(og);
+    og.connect(g);
+    osc.start(t0);
+    osc.stop(t0 + C.dur + 0.1);
+    const src = ctx.createBufferSource();
+    src.buffer = AUDIO._evNoise;
+    src.loop = true;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = C.filter;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(C.noise, t0);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t0 + C.dur);
+    src.connect(lp);
+    lp.connect(ng);
+    ng.connect(g);
+    src.start(t0);
+    src.stop(t0 + C.dur + 0.05);
+    /* the last source (the oscillator) stops last — drop the whole
+     * one-shot from the graph so it is collected (see pulseThump). */
+    osc.onended = () => { g.disconnect(); };
+    AUDIO.events.rumble++;
   },
 
   setMuted(on) {
@@ -7776,6 +7843,9 @@ const EVENTS = {
   _bayPanel: null, _bayBay: null, // roof-bay panel + recess (idle-hidden)
   _ceCands: null, _ceT: -1e9, _ce: null,
   _dlCands: null, _dlT: -1e9, _dl: null,
+  /* M13.4: ambient events C state */
+  _mr: null,                    // mech reposition (ring slerp q0 → q1)
+  _ed: null,                   // distant EM discharge (staggered arcs)
   _v: new THREE.Vector3(),
   _m4: new THREE.Matrix4(),
   _q: new THREE.Quaternion(),
@@ -7810,6 +7880,11 @@ const EVENTS = {
     const cands = [];
     for (const def of this._reg.values()) {
       if (def.priority <= minPrio) continue;
+      /* M13.4 awakening-compat: during the awakening window (any
+       * non-DORMANT entity state) only creature-priority events
+       * (priority > 0) may start — ambient (priority 0) events wait.
+       * A running event is never interrupted by this gate. */
+      if (ENTITY.state !== 'DORMANT' && def.priority <= 0) continue;
       if (t < (this._readyAt.get(def.id) || 0)) continue;
       if (def.eligible && !def.eligible()) continue;
       cands.push(def);
@@ -7960,6 +8035,23 @@ const EVENTS = {
       start: (a) => EVENTS._dlStart(a),
       update: (a, dt, t) => EVENTS._dlUpdate(a, dt, t),
       end: (i) => EVENTS._dlEnd(i),
+    });
+    const mr = CFG.events.mechReposition, ed = CFG.events.emDischarge;
+    this.register({
+      id: 'mech-reposition',
+      weight: mr.weight, duration: mr.dur, cooldown: mr.cd, priority: 0,
+      eligible: (t) => EVENTS._mrReady(t),
+      start: (a) => EVENTS._mrStart(a),
+      update: (a, dt, t) => EVENTS._mrUpdate(a, dt, t),
+      end: (i) => EVENTS._mrEnd(i),
+    });
+    this.register({
+      id: 'em-discharge',
+      weight: ed.weight, duration: ed.dur, cooldown: ed.cd, priority: 0,
+      eligible: () => EVENTS._edReady(),
+      start: (a) => EVENTS._edStart(a),
+      update: (a, dt, t) => EVENTS._edUpdate(a, dt, t),
+      end: (i) => EVENTS._edEnd(i),
     });
   },
 
@@ -8296,11 +8388,113 @@ const EVENTS = {
     this._dl = null;
   },
 
+  /* ==================================================================
+   * M13.4: ambient events C — mechanical reposition + distant EM
+   * discharge, plus the AWAKE-window gate (in _pick/trigger: only
+   * creature-priority events may start while the creature is not
+   * DORMANT).
+   * ================================================================== */
+
+  /* mech-reposition: one of the creature's giant tensor rings slowly
+   * slews to a NEW rest orientation. The render seam is
+   * ENTITY._ringBaseQ[i] — ENTITY.update copies it into the ring
+   * group's quaternion every frame (× the surge tilt while awake),
+   * so slerping the base quaternion IS the animation. The move is a
+   * PERMANENT reposition: end() just stops the slerp (the ring stays
+   * where it is — including mid-move when preempted, so there is
+   * nothing to restore and no snap). */
+  _mrReady(t) {
+    const P = CAMERA.pos, R = CFG.events.mechReposition.reach;
+    const d = Math.hypot(P.x, P.z);   // player → plaza (the creature)
+    return d >= R[0] && d <= R[1];
+  },
+  _mrStart(a) {
+    const C = CFG.events.mechReposition;
+    const i = (this._rng() * 3) | 0;
+    const q0 = ENTITY._ringBaseQ[i].clone();
+    /* a seeded tilt around a horizontal axis — the ring's new rest
+     * pose (magnitude in [0.6·tilt, tilt], direction seeded) */
+    const th = this._rng() * 6.2831853;
+    const q1 = q0.clone().multiply(new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(Math.sin(th) * C.tilt, 0,
+                      Math.cos(th) * C.tilt * 0.6)));
+    this._mr = { i, q0, q1 };
+    /* tiny shake + the low rumble (M11.3 one-shot pattern) */
+    CAMERA.shake(C.shake);
+    AUDIO.rumble({ x: 0, y: 44, z: 0 });
+  },
+  _mrUpdate(a) {
+    const e = this._mr;
+    if (!e) return;
+    /* ease-in-out slerp q0 → q1; u = 1 exactly at the natural end */
+    const u = Math.min(1, a.t / a.dur);
+    const s = u * u * (3 - 2 * u);
+    ENTITY._ringBaseQ[e.i].copy(e.q0).slerp(e.q1, s);
+  },
+  _mrEnd() {
+    /* the ring keeps its new rest pose (see _mrStart) — nothing to
+     * restore */
+    this._mr = null;
+  },
+
+  /* distant EM discharge: a lightning strike far off (the M8.4 ATMOS
+   * event, seeded far point) + a few bolts across the CITY (M7.3
+   * FX.arc between the nearest live substations, staggered 0.4 s).
+   * Both channels are self-contained (the arcs live 2.2 s on their
+   * own, the lightning resolves in its own update) ⇒ end() just
+   * drops the bookkeeping. */
+  _edReady() {
+    return PARTS._subList.length >= 2;
+  },
+  _edStart(a) {
+    const C = CFG.events.emDischarge;
+    const list = PARTS._subList;
+    /* nearest substations in order; arc k = (s_k → s_{k+1}) */
+    const P = CAMERA.pos;
+    const order = [];
+    for (let i = 0; i < list.length; i++)
+      order.push([Math.hypot(list[i].x - P.x, list[i].z - P.z), i]);
+    order.sort((a2, b2) => a2[0] - b2[0]);
+    const n = C.arcs[0] +
+      ((this._rng() * (C.arcs[1] - C.arcs[0] + 1)) | 0);
+    const pairs = [];
+    for (let k = 0; k < n && k + 1 < order.length; k++) {
+      const s1 = list[order[k][1]], s2 = list[order[k + 1][1]];
+      pairs.push(
+        { x: s1.x, y: s1.hTop + 0.5, z: s1.z },
+        { x: s2.x, y: s2.hTop + 0.5, z: s2.z });
+    }
+    this._ed = { pairs, fired: 0 };
+    /* the far strike (seeded ⇒ deterministic per forced seed) */
+    ATMOS._fireLightning();
+    if (pairs.length) {
+      FX.arc(pairs[0], pairs[1]);
+      this._ed.fired = 1;
+    }
+  },
+  _edUpdate(a) {
+    const e = this._ed;
+    if (!e) return;
+    /* stagger: bolt k fires at k · 0.4 s (while-loop ⇒ a large dt
+     * still catches up, frame-rate independent) */
+    while (e.fired < e.pairs.length / 2 && a.t >= e.fired * 0.4) {
+      FX.arc(e.pairs[2 * e.fired], e.pairs[2 * e.fired + 1]);
+      e.fired++;
+    }
+  },
+  _edEnd() {
+    this._ed = null;
+  },
+
   /* Manual trigger (M13.2): start immediately, preempting whatever
-   * is running (operator override — ignores gap/cooldown/weight). */
+   * is running (operator override — ignores gap/cooldown/weight).
+   * The M13.4 AWAKE-window rule still applies: an ambient
+   * (priority 0) event is refused while the creature is not
+   * DORMANT — the awakening owns the show. */
   trigger(id) {
     const def = this._reg.get(id);
     if (!def || (this._active && this._active.id === id)) return false;
+    if (ENTITY.state !== 'DORMANT' && def.priority <= 0) return false;
     if (this._active) this._end(this._active, true);
     this._start(def, this._time);
     return true;
