@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [intro, cinematic, timeline, camera, corridor]
 created: "2026-09-19T10:21:43"
-updated: "2026-09-19T10:44:56"
+updated: "2026-09-19T12:33:26"
 ---
 
 <!-- compiled_truth -->
@@ -41,3 +41,9 @@ The `INTRO` system (single `index.html`, exposed on `window.SIM`, registered aft
   summary: Rewrote compiled_truth to the new best understanding
   source: "M12.1 implementation + full smoke suite"
   affects: [m121-intro-timeline-runner]
+
+- time: 2026-09-19T12:33:26
+  kind: note
+  summary: "M12.2 consumed the recorded seam: the far end wall is the 'corridor opens' element (INTRO.endWall + portal glow) and the multi-beat track lives in INTRO._track (32 kfs / 15.2 s, beats 2–5) — see [[m122-intro-beats-reveal-orbit-title-drop]]"
+  source: M12.2 implementation
+  affects: [m121-intro-timeline-runner, m122-intro-beats-reveal-orbit-title-drop]

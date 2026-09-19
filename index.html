@@ -145,6 +145,30 @@
     box-shadow: 0 0 34px rgba(0, 190, 255, 0.45), inset 0 0 22px rgba(0, 170, 255, 0.2);
   }
   #startBtn:disabled { cursor: default; opacity: 0.4; }
+  /* M12.2: intro beat FX — the beat 4 title card + the white
+     scene-switch flash. Both are driven from INTRO (opacity as a
+     function of timeline t); hidden outside the intro. */
+  #introTitle {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 26px;
+    letter-spacing: 0.3em;
+    text-indent: 0.3em;
+    color: #bff2ff;
+    text-shadow: 0 0 24px rgba(0, 190, 255, 0.8);
+    opacity: 0;
+    pointer-events: none;
+  }
+  #introFade {
+    position: absolute;
+    inset: 0;
+    background: #eaf6ff;
+    opacity: 0;
+    pointer-events: none;
+  }
   /* ---- Boot failure / watchdog message ---- */
   #bootError {
     position: absolute;
@@ -203,6 +227,8 @@
     <div class="subtitle">VOXEL DATACENTER CITY &middot; SIMULATION BUILD</div>
     <button id="startBtn" type="button">ENTER SIMULATION</button>
   </div>
+  <div id="introTitle" aria-hidden="true"></div>
+  <div id="introFade"></div>
   <div id="bootError"></div>
 </div>
 
@@ -810,6 +836,16 @@ const CFG = {
       eyeY: 2.5,           // m — dolly eye height
     },
     beat1: { dur: 4.4 },  // s — corridor dolly length
+    /* M12.2: beats 2–5 — corridor opens → wide reveal dolly over the
+     * city → 1.5-orbit low orbit of the dormant creature → title card
+     * (DOM, fades) → lerp into the street spawn. Total ≈ 15.2 s. */
+    beat2: { dur: 2.8, rush: 0.8, fade: 0.6, fadeOut: 0.8 },
+    beat3: { dur: 4.4, dive: 0.8, orbits: 1.5, radius: 104, height: 64 },
+    beat4: {
+      dur: 2.0, fadeIn: 0.5, fadeOut: 0.6, rise: 8,
+      text: 'QWEN FLASH // AWAKENING',
+    },
+    beat5: { dur: 1.6 },
     street: { pos: [0, 4, 18], look: [0, 2, 0] }, // M0 spawn handoff
   },
 };
@@ -866,7 +902,7 @@ const BOOT = {
        * corridor scene renders instead of the city until skip/end. */
       document.getElementById('overlay').classList.add('intro');
       BOOT._startLoop();
-      INTRO.play(INTRO._beat1(), INTRO._toStreet);
+      INTRO.play(INTRO._track(), INTRO._toStreet);
     }
     if (next === 'RUNNING') {
       BOOT.started = true;
@@ -7123,14 +7159,35 @@ const HUD = {
  * rows + strip lines + flowing dashes, built synchronously in init in
  * its own scene (rendered instead of the city while INTRO plays). 4
  * draw calls, zero per-frame allocation.
+ *
+ * M12.2 — beats 2–5 (`_track`, ~15.2 s total):
+ *   B2 the corridor opens — the far end wall is hidden, a portal glow
+ *      floods the opening, the camera rushes through, a white DOM
+ *      flash (#introFade) carries the scene switch, and the CITY scene
+ *      renders (INTRO._inCity) in a wide reveal dolly out over the city;
+ *   B3 a dive into a 1.5-orbit low orbit around the dormant creature
+ *      (dense 30° linear keyframes ⇒ constant angular speed);
+ *   B4 the DOM title card (#introTitle, text from CFG.intro.beat4)
+ *      fades in/out while the orbit drifts on and rises;
+ *   B5 a smoothstep lerp into the M0 street spawn → _toStreet.
+ * All beat FX (end wall / portal / flash / city scene / title) is a
+ * pure function of INTRO.t (`_applyBeatFx`) ⇒ seek-safe; the corridor
+ * keyframes and the city keyframes share the scene-switch time (the
+ * pair search picks the first pair with t < next.t, so at that instant
+ * the city pose wins).
  * ------------------------------------------------------------------ */
 const INTRO = {
   name: 'INTRO',
   scene: null,            // corridor scene (rendered while INTRO plays)
   shell: null,            // merged tunnel shell (1 draw call)
+  endWall: null,          // far end wall — hidden when the corridor opens
+  portal: null,          // glow beyond the opening (fades in on open)
   racks: null,            // InstancedBox batcher — rack rows (1 call)
   strips: null,           // merged LED strip lines (1 call)
   dashes: null,           // InstancedBox batcher — flowing dashes (1 call)
+  _fadeEl: null,          // DOM: white scene-switch flash (beat 2)
+  _titleEl: null,         // DOM: beat 4 title card
+  _inCity: false,         // beat 2 onward: the city scene renders
   _dashZ: null,           // Float32Array — dash z (flow along -Z, wrap)
   _dashLine: null,        // Int16Array — dash line index
   _lineXY: null,          // [[x, y], …] — strip line anchors
@@ -7138,7 +7195,7 @@ const INTRO = {
   _pos: null,             // pose scratch (Vector3)
   _look: null,
   playing: false,
-  track: null,            // keyframes [{ t, pos, look }]
+  track: null,            // keyframes [{ t, pos, look, ease? }]
   t: 0,
   dur: 0,
   onDone: null,
@@ -7153,9 +7210,10 @@ const INTRO = {
      * dashes are unlit Basic — they carry the light). */
     INTRO.scene.add(new THREE.AmbientLight(0x33445c, 0.9));
 
-    /* shell: floor / ceiling / side walls / end walls — merged into
-     * one static mesh (1 draw call). The end walls close the tunnel;
-     * M12.2's "corridor opens" beat removes/opens the far one. */
+    /* shell: floor / ceiling / side walls / near end wall — merged
+     * into one static mesh (1 draw call). The far end wall is a
+     * separate mesh: the M12.2 "corridor opens" beat removes it, and
+     * the portal glow sits just behind where it stood. */
     const box = (w, h, d, x, y, z) => ({
       geo: new THREE.BoxGeometry(w, h, d),
       matrix: new THREE.Matrix4().makeTranslation(x, y, z),
@@ -7165,10 +7223,29 @@ const INTRO = {
       box(W, 0.5, L, 0, H + 0.25, 0),           // ceiling
       box(0.5, H, L, -W / 2 - 0.25, H / 2, 0), // left wall
       box(0.5, H, L, W / 2 + 0.25, H / 2, 0),  // right wall
-      box(W, H, 0.5, 0, H / 2, -L / 2 - 0.25), // far end wall
       box(W, H, 0.5, 0, H / 2, L / 2 + 0.25),  // near end wall
     ]), MATS.server);
     INTRO.scene.add(INTRO.shell);
+    INTRO.endWall = new THREE.Mesh(
+      new THREE.BoxGeometry(W, H, 0.5), MATS.server);
+    INTRO.endWall.position.set(0, H / 2, -L / 2 - 0.25);
+    INTRO.scene.add(INTRO.endWall);
+    /* portal: the glow beyond the opening — a big unlit quad that
+     * fades in as the corridor opens (behind the end wall). */
+    INTRO.portal = new THREE.Mesh(
+      new THREE.BoxGeometry(24, 16, 0.3),
+      new THREE.MeshBasicMaterial({
+        color: 0xcfeeff, toneMapped: false,
+        transparent: true, opacity: 0,
+      }));
+    INTRO.portal.position.set(0, 8, -L / 2 - 0.2);
+    INTRO.portal.visible = false;   // the corridor opens in beat 2
+    INTRO.scene.add(INTRO.portal);
+    /* M12.2: the DOM beat FX — the scene-switch flash + the beat 4
+     * title card (opacity is driven from the timeline in _applyBeatFx). */
+    INTRO._fadeEl = document.getElementById('introFade');
+    INTRO._titleEl = document.getElementById('introTitle');
+    INTRO._titleEl.textContent = CFG.intro.beat4.text;
 
     /* rack rows: instanced server racks along both walls (1 call),
      * deterministic per-instance tint salt (no two neighbours equal). */
@@ -7253,6 +7330,76 @@ const INTRO = {
     ];
   },
 
+  /* Beats 2–5 (M12.2) — the full intro track (~15.2 s):
+   * B2 the corridor opens (far wall hidden, portal glow) → rush
+   * through → white flash → the CITY scene appears and dollies out
+   * in a wide reveal; B3 a dive into a 1.5-orbit low orbit around
+   * the dormant creature (dense 30° linear keyframes ⇒ reads as a
+   * circle); B4 the DOM title card fades in/out while the orbit
+   * drifts on and rises; B5 a smoothstep lerp into the M0 street
+   * spawn. The duplicate keyframe time at the corridor→city switch
+   * is intentional: the pair search picks the first pair with
+   * `t < next.t`, so at the switch time the city pose wins and the
+   * corridor pose only ever renders for t < switch. */
+  _track() {
+    const C = CFG.intro.corridor;
+    const B1 = CFG.intro.beat1.dur;
+    const B2 = CFG.intro.beat2;
+    const B3 = CFG.intro.beat3;
+    const B4 = CFG.intro.beat4;
+    const B5 = CFG.intro.beat5.dur;
+    const t1 = B1;
+    const t2 = t1 + B2.dur;
+    const t3 = t2 + B3.dur;
+    const t4 = t3 + B4.dur;
+    const t5 = t4 + B5;
+    const y = C.eyeY;
+    const kfs = INTRO._beat1();               // beat 1: corridor dolly
+    /* beat 2: the far end opens at t1; rush through the portal and
+     * pass the wall during the white flash; the city keyframe at the
+     * same t is the wide reveal dolly out. */
+    const tRush = t1 + B2.rush;
+    const tSw = tRush + B2.fade;
+    kfs.push(
+      { t: tRush, pos: [0, y, -C.len / 2 + 0.4], look: [0, y, -80] },
+      { t: tSw, pos: [0, y, -C.len / 2 - 8], look: [0, y, -100] },
+      { t: tSw, pos: [0, 160, 300], look: [0, 26, 0] },
+      { t: t2, pos: [0, 260, 460], look: [0, 18, 0] },
+    );
+    /* beat 3: dive to the orbit start (θ = 0, +Z side — the street
+     * side), then exactly B3.orbits turns. */
+    const nSeg = Math.round(B3.orbits * 12);  // 30° per segment
+    const segDur = (B3.dur - B3.dive) / nSeg;
+    const tDive = t2 + B3.dive;
+    const orbitKf = (k, h) => {
+      const th = k * (Math.PI / 6);
+      return {
+        pos: [B3.radius * Math.sin(th), h, B3.radius * Math.cos(th)],
+        look: [0, 32, 0],
+        ease: 'linear',
+      };
+    };
+    kfs.push({ t: tDive, ...orbitKf(0, B3.height) });
+    for (let k = 1; k <= nSeg; k++)
+      kfs.push({ t: tDive + k * segDur, ...orbitKf(k, B3.height) });
+    /* beat 4: the title card plays while the orbit drifts on — 4 more
+     * 30° segments, rising slightly. */
+    const b4seg = B4.dur / 4;
+    for (let k = 1; k <= 4; k++)
+      kfs.push({
+        t: t3 + k * b4seg,
+        ...orbitKf(nSeg + k, B3.height + B4.rise * (k / 4)),
+      });
+    /* beat 5: lerp into the M0 street spawn (smoothstep — no ease on
+     * the start keyframe, so the drop eases in AND out: a gentle
+     * landing on the street). */
+    const S = CFG.intro.street;
+    const endOrbit = orbitKf(nSeg + 4, B3.height + B4.rise);
+    kfs.push({ t: t4, pos: endOrbit.pos, look: endOrbit.look });
+    kfs.push({ t: t5, pos: S.pos, look: S.look });
+    return kfs;
+  },
+
   /* ---- timeline runner API ---- */
   play(track, onDone) {
     if (!track || track.length < 2) return;
@@ -7262,12 +7409,14 @@ const INTRO = {
     INTRO.onDone = onDone || null;
     INTRO.playing = true;
     INTRO._applyPose();
+    INTRO._applyBeatFx();
   },
 
   cancel() {
     if (!INTRO.playing) return;
     INTRO.playing = false;
     INTRO.onDone = null;
+    INTRO._resetFx();
     /* the camera returns to CAMERA.pos on the next frame — CAMERA
      * update writes it; INTRO simply stops overwriting. */
   },
@@ -7276,6 +7425,7 @@ const INTRO = {
     if (!INTRO.track) return;
     INTRO.t = clamp(t, 0, INTRO.dur);
     INTRO._applyPose();
+    INTRO._applyBeatFx();
   },
 
   update(dt, t) {
@@ -7285,14 +7435,65 @@ const INTRO = {
         INTRO.t = INTRO.dur;
         INTRO.playing = false;
         INTRO._applyPose();
+        /* onDone → _toStreet resets the beat FX — do NOT re-apply the
+         * end-state FX here (t = dur would re-open the corridor). */
         const done = INTRO.onDone;
         INTRO.onDone = null;
         if (done) done(INTRO.t);
       } else {
         INTRO._applyPose();
+        INTRO._applyBeatFx();
       }
       INTRO._advanceDashes(dt);
     }
+  },
+
+  /* Beat FX — end wall / portal / white flash / city scene / title
+   * card. Everything here is a pure function of INTRO.t, so seeking
+   * to any time reproduces the exact beat state (seek-safe). */
+  _applyBeatFx() {
+    const B1 = CFG.intro.beat1.dur;
+    const B2 = CFG.intro.beat2;
+    const B3 = CFG.intro.beat3;
+    const B4 = CFG.intro.beat4;
+    const t = INTRO.t;
+    const tRush = B1 + B2.rush;
+    const tSw = tRush + B2.fade;
+    const tFo = tSw + B2.fadeOut;
+    /* beat 2: the corridor opens — the far wall is gone, the portal
+     * glow floods the opening, the white flash carries the scene
+     * switch, and from tSw the CITY scene renders. */
+    INTRO.endWall.visible = t < B1;
+    INTRO.portal.visible = t >= B1;
+    INTRO.portal.material.opacity = clamp((t - B1) / 0.6, 0, 1);
+    let fade = 0;
+    if (t >= tRush && t < tSw) fade = (t - tRush) / B2.fade;
+    else if (t >= tSw && t < tFo) fade = 1 - (t - tSw) / B2.fadeOut;
+    INTRO._fadeEl.style.opacity = fade;
+    INTRO._inCity = t >= tSw;
+    /* beat 4: the title card fades in, holds, fades out. */
+    const tT0 = B1 + B2.dur + B3.dur;
+    let op = 0;
+    if (t >= tT0 && t < tT0 + B4.dur) {
+      const lt = t - tT0;
+      op = lt < B4.fadeIn
+        ? lt / B4.fadeIn
+        : lt > B4.dur - B4.fadeOut
+          ? (B4.dur - lt) / B4.fadeOut
+          : 1;
+    }
+    INTRO._titleEl.style.opacity = clamp(op, 0, 1);
+  },
+
+  /* skip / natural end — the beat FX is off, the corridor closes
+   * again, and the city scene is the one that renders. */
+  _resetFx() {
+    INTRO.endWall.visible = true;
+    INTRO.portal.visible = false;
+    INTRO.portal.material.opacity = 0;
+    INTRO._fadeEl.style.opacity = 0;
+    INTRO._titleEl.style.opacity = 0;
+    INTRO._inCity = false;
   },
 
   /* keyframe pair + smoothstep → camera pose (position + lookAt) */
@@ -7306,7 +7507,9 @@ const INTRO = {
     const a = kfs[i], b = kfs[i + 1];
     let u = (INTRO.t - a.t) / ((b.t - a.t) || 1);
     u = clamp(u, 0, 1);
-    const e = u * u * (3 - 2 * u);            // smoothstep
+    /* per-keyframe easing: 'linear' for the orbit segments (constant
+     * angular speed), smoothstep everywhere else. */
+    const e = a.ease === 'linear' ? u : u * u * (3 - 2 * u);
     const p = INTRO._pos, l = INTRO._look;
     p.set(
       a.pos[0] + (b.pos[0] - a.pos[0]) * e,
@@ -7347,6 +7550,7 @@ const INTRO = {
   _toStreet() {
     INTRO.playing = false;
     INTRO.onDone = null;
+    INTRO._resetFx();
     const S = CFG.intro.street;
     camera.position.set(S.pos[0], S.pos[1], S.pos[2]);
     camera.lookAt(S.look[0], S.look[1], S.look[2]);
@@ -7411,8 +7615,12 @@ function frame(now) {
   }
   renderer.info.reset();
   /* M12: while the intro cinematic plays, the corridor scene renders
-   * instead of the city (same camera — the runner owns its pose). */
-  renderer.render(BOOT.state === 'INTRO' ? INTRO.scene : scene, camera);
+   * instead of the city (same camera — the runner owns its pose);
+   * from the beat 2 scene switch (INTRO._inCity) the CITY scene
+   * renders with the wide reveal dolly. */
+  renderer.render(
+    BOOT.state === 'INTRO' && !INTRO._inCity ? INTRO.scene : scene,
+    camera);
   /* M7.4: screen-space flash overlay — exactly one extra draw call
    * while the flash is alive, nothing at 0. */
   if (FX._flashPlane.visible) renderer.render(FX._flashScene, FX._flashCam);

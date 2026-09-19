@@ -8692,8 +8692,8 @@ try {
     {
       const s = await introState();
       check('M12.1: intro auto-plays (INTRO, timeline running, dur from CFG)',
-        s.state === 'INTRO' && s.playing && s.trackLen === 3 &&
-        Math.abs(s.dur - 4.4) < 0.01,
+        s.state === 'INTRO' && s.playing && s.trackLen === 32 &&
+        Math.abs(s.dur - 15.2) < 0.01,
         `state=${s.state}, playing=${s.playing}, track=${s.trackLen}, dur=${s.dur}`);
       const scene = await page.evaluate(() => {
         const I = window.SIM.INTRO;
@@ -8741,8 +8741,9 @@ try {
         `hash ${h0} -> ${h1}`);
     }
 
-    /* 4. the corridor renders in exactly 4 draw calls (shell / racks /
-     *    strips / dashes — the city is not rendered while the intro plays) */
+    /* 4. the corridor renders in exactly 5 draw calls (shell / end
+     *    wall / racks / strips / dashes — the city is not rendered
+     *    while the intro plays; the portal stays hidden until beat 2) */
     {
       const calls = await page.evaluate(async () => {
         const r = window.SIM.renderer;
@@ -8753,8 +8754,8 @@ try {
         }
         return m;
       });
-      check('M12.1: corridor renders in 4 draw calls (under budget)',
-        calls === 4, `calls=${calls}`);
+      check('M12.1: corridor renders in 5 draw calls (under budget)',
+        calls === 5, `calls=${calls}`);
     }
 
     /* 5. screenshot of the beat — a near-black tunnel with bright LED
@@ -8803,7 +8804,7 @@ try {
      *    (camera handed to the M0 street spawn) */
     await page.waitForFunction(
       () => window.SIM && window.SIM.BOOT.state === 'RUNNING',
-      { timeout: 15000 },
+      { timeout: 30000 },
     );
     {
       const s = await introState();
@@ -8935,6 +8936,333 @@ try {
       check('M12.1: bounded cost (heap flat while the runner idles)',
         h0 > 0 && h1 - h0 <= 2 * 1024 * 1024 && pageErrors.length === 0,
         `Δ=${((h1 - h0) / 1048576).toFixed(2)} MB, errors=${pageErrors.length}`);
+    }
+  }
+
+  /* ------------------------------------------------------------------
+   * M12.2 — Intro beats 2–5: reveal, orbit, title, drop
+   *
+   *  The full ~15.2 s intro auto-plays on every fresh load:
+   *  B1 corridor dolly → B2 the corridor opens (far wall hidden,
+   *  portal glow), the camera rushes through, a white DOM flash
+   *  carries the scene switch and the CITY scene renders in a wide
+   *  reveal dolly out → B3 a dive into a 1.5-orbit low orbit around
+   *  the dormant creature → B4 the `QWEN FLASH // AWAKENING` title
+   *  card (DOM, fades) while the orbit drifts on → B5 a lerp into
+   *  the M0 street spawn → RUNNING with a controllable camera.
+   *  Every pose below is verified same-frame (seek + read in one
+   *  round-trip) against the keyframe math.
+   * ------------------------------------------------------------------ */
+  {
+    const introState = () => page.evaluate(() => {
+      const S = window.SIM, I = S.INTRO;
+      const fadeEl = document.getElementById('introFade');
+      const titleEl = document.getElementById('introTitle');
+      const c = S.camera.position;
+      return {
+        state: S.BOOT.state,
+        playing: I.playing,
+        t: I.t,
+        dur: I.dur,
+        trackLen: I.track ? I.track.length : -1,
+        inCity: I._inCity,
+        cam: { x: c.x, y: c.y, z: c.z },
+        fade: parseFloat(fadeEl.style.opacity),
+        titleOp: parseFloat(titleEl.style.opacity),
+        titleText: titleEl.textContent,
+        endWall: I.endWall.visible,
+        portalVisible: I.portal.visible,
+        portalOp: I.portal.material.opacity,
+      };
+    });
+
+    /* seek + read the pose/state in one round-trip (same frame ⇒
+     * exact against the keyframes). */
+    const seekState = (t) => page.evaluate((tt) => {
+      const S = window.SIM, I = S.INTRO;
+      I.seek(tt);
+      const c = S.camera.position;
+      const fadeEl = document.getElementById('introFade');
+      const titleEl = document.getElementById('introTitle');
+      return {
+        x: c.x, y: c.y, z: c.z, t: I.t, inCity: I._inCity,
+        fade: parseFloat(fadeEl.style.opacity),
+        titleOp: parseFloat(titleEl.style.opacity),
+        titleText: titleEl.textContent,
+        endWall: I.endWall.visible,
+        portalVisible: I.portal.visible,
+        portalOp: I.portal.material.opacity,
+      };
+    }, t);
+
+    /* is the camera exactly on the track's eased keyframe curve at t? */
+    const onCurve = (t) => page.evaluate((tt) => {
+      const S = window.SIM, I = S.INTRO;
+      I.seek(tt);
+      const kfs = I.track;
+      let i = kfs.length - 2;
+      for (let j = 0; j < kfs.length - 1; j++)
+        if (I.t < kfs[j + 1].t) { i = j; break; }
+      const a = kfs[i], b = kfs[i + 1];
+      let u = (I.t - a.t) / ((b.t - a.t) || 1);
+      u = Math.min(1, Math.max(0, u));
+      const e = a.ease === 'linear' ? u : u * u * (3 - 2 * u);
+      const c = S.camera.position;
+      return Math.abs(c.x - (a.pos[0] + (b.pos[0] - a.pos[0]) * e)) < 1e-3 &&
+        Math.abs(c.y - (a.pos[1] + (b.pos[1] - a.pos[1]) * e)) < 1e-3 &&
+        Math.abs(c.z - (a.pos[2] + (b.pos[2] - a.pos[2]) * e)) < 1e-3;
+    }, t);
+
+    /* 1. fresh page: the full intro auto-plays (32 keyframes, ~15.2 s) */
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT.state === 'INTRO',
+      { timeout: 20000 },
+    );
+    {
+      const s = await introState();
+      check('M12.2: full intro auto-plays (INTRO, 32 keyframes, ~15.2 s)',
+        s.state === 'INTRO' && s.playing && s.trackLen === 32 &&
+        Math.abs(s.dur - 15.2) < 0.01 &&
+        s.titleText === 'QWEN FLASH // AWAKENING',
+        `state=${s.state}, track=${s.trackLen}, dur=${s.dur}, title=${JSON.stringify(s.titleText)}`);
+    }
+
+    /* 2. beat 2a: the corridor opens — the far wall is gone, the
+     *    portal glow fades in, and the camera rushes toward it */
+    {
+      const a = await seekState(4.6);
+      const ok = await onCurve(4.6);
+      check('M12.2: beat 2 — corridor opens (wall hidden, portal in, rush)',
+        a.endWall === false && a.portalVisible === true &&
+        Math.abs(a.portalOp - 1 / 3) < 0.05 && a.inCity === false &&
+        a.y === 2.5 && a.z < -54 && ok,
+        `wall=${a.endWall}, portal=${a.portalOp.toFixed(2)}, z=${a.z.toFixed(1)}, inCity=${a.inCity}, onCurve=${ok}`);
+    }
+
+    /* 2b. beat 2b: the white flash ramps up as the camera passes the
+     *    wall (corridor scene until the switch time) */
+    {
+      const a = await seekState(5.5);
+      check('M12.2: beat 2 — white flash ramping (t=5.5, fade 0.5, still corridor)',
+        Math.abs(a.fade - 0.5) < 0.01 && a.inCity === false &&
+        a.z < -60 && Math.abs(a.y - 2.5) < 0.01,
+        `fade=${a.fade.toFixed(3)}, z=${a.z.toFixed(1)}, inCity=${a.inCity}`);
+    }
+
+    /* 2c. beat 2c: AT the switch time the CITY scene owns the frame —
+     *    camera at the wide reveal start, flash fully up */
+    {
+      const a = await seekState(5.8);
+      check('M12.2: beat 2 — scene switch at t=5.8 (city scene, flash 1.0)',
+        a.inCity === true && a.fade === 1 &&
+        Math.abs(a.x) < 1e-3 && Math.abs(a.y - 160) < 1e-3 &&
+        Math.abs(a.z - 300) < 1e-3,
+        `inCity=${a.inCity}, fade=${a.fade.toFixed(3)}, cam=(${a.x.toFixed(1)}, ${a.y.toFixed(1)}, ${a.z.toFixed(1)})`);
+    }
+
+    /* 2d. beat 2d: the flash releases and the wide reveal dolly runs
+     *    out over the city (screenshot of the wide shot) */
+    {
+      const a = await seekState(6.6);
+      const ok = await onCurve(6.6);
+      check('M12.2: beat 2 — flash released, wide reveal dolly out',
+        a.fade === 0 && a.inCity === true &&
+        a.y > 160 && a.y < 260 && a.z > 300 && ok,
+        `fade=${a.fade.toFixed(3)}, cam=(${a.x.toFixed(1)}, ${a.y.toFixed(1)}, ${a.z.toFixed(1)}), onCurve=${ok}`);
+      await page.evaluate(() => window.SIM.INTRO.seek(7.0));
+      await sleep(120); // let a city frame render
+      const shot = await page.screenshot();
+      fs.writeFileSync(`${here}/shots/m122-reveal.png`, shot);
+      const lum = await page.evaluate(async (b64) => {
+        const img = new Image();
+        await new Promise((res, rej) => {
+          img.onload = res; img.onerror = rej;
+          img.src = 'data:image/png;base64,' + b64;
+        });
+        const c = document.createElement('canvas');
+        c.width = img.width; c.height = img.height;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const d = ctx.getImageData(0, 0, c.width, c.height).data;
+        let mean = 0, bright = 0;
+        const n = d.length / 4;
+        for (let i = 0; i < d.length; i += 4) {
+          const l = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+          mean += l;
+          if (l > 100) bright++;
+        }
+        return { mean: mean / n, bright: bright / n };
+      }, shot.toString('base64'));
+      const st = await introState();
+      check('M12.2: screenshot shows the wide city reveal (shots/m122-reveal.png)',
+        fs.existsSync(`${here}/shots/m122-reveal.png`) &&
+        st.state === 'INTRO' && st.inCity &&
+        lum.mean > 2 && lum.mean < 80 && lum.bright > 0.001,
+        `state=${st.state}, inCity=${st.inCity}, mean=${lum.mean.toFixed(1)}, bright=${(lum.bright * 100).toFixed(2)}%`);
+    }
+
+    /* 3. beat 3: the low orbit — the camera rides a 104 m circle at
+     *    64 m, looking at the dormant creature, for exactly 1.5 turns */
+    const orbitPose = await page.evaluate(() => {
+      const S = window.SIM, I = S.INTRO;
+      I.seek(10.0);
+      S.camera.updateMatrixWorld();   // pose was just written — matrixWorld lags one render
+      const c = S.camera.position;
+      const m = S.camera.matrixWorld.elements;
+      const fwd = { x: -m[8], y: -m[9], z: -m[10] };
+      /* look target (0, 32, 0): direction from the orbit point */
+      const lx = -c.x, ly = 32 - c.y, lz = -c.z;
+      const ll = Math.hypot(lx, ly, lz);
+      return {
+        x: c.x, y: c.y, z: c.z,
+        dot: (fwd.x * lx + fwd.y * ly + fwd.z * lz) / ll,
+      };
+    });
+    {
+      const a = orbitPose;
+      const r = Math.hypot(a.x, a.z);
+      const dot = a.dot;
+      check('M12.2: beat 3 — low orbit (r=104, h=64, looking at the creature)',
+        Math.abs(r - 104) < 0.5 && Math.abs(a.y - 64) < 0.01 && dot > 0.99,
+        `r=${r.toFixed(1)}, y=${a.y.toFixed(1)}, lookDot=${dot.toFixed(3)}`);
+      /* 1.5 turns: at t=11.6 the orbit has swept 540° (≡ 180°) ⇒ the
+       * far (-Z) side, exactly (0, 64, -104) */
+      const b = await seekState(11.6);
+      check('M12.2: beat 3 — exactly 1.5 orbits at t=11.6 (0, 64, -104)',
+        Math.abs(b.x) < 0.5 && Math.abs(b.y - 64) < 0.01 &&
+        Math.abs(b.z + 104) < 0.5,
+        `cam=(${b.x.toFixed(1)}, ${b.y.toFixed(1)}, ${b.z.toFixed(1)})`);
+      /* the orbit keyframes: exactly 18 linear r=104 keyframes inside
+       * the beat 3 window (the dive start and beat-5 start keyframes
+       * also sit on the circle but outside it) */
+      const orbitKfs = await page.evaluate(() => {
+        const I = window.SIM.INTRO, C = window.SIM.CFG.intro;
+        const tDive = C.beat1.dur + C.beat2.dur + C.beat3.dive;
+        const tEnd = C.beat1.dur + C.beat2.dur + C.beat3.dur;
+        return I.track.filter(k => k.ease === 'linear' &&
+          Math.abs(Math.hypot(k.pos[0], k.pos[2]) - 104) < 0.01 &&
+          k.t > tDive + 1e-9 && k.t <= tEnd + 1e-9).length;
+      });
+      check('M12.2: beat 3 — orbit is 18 linear r=104 keyframes (30° each)',
+        orbitKfs === 18, `linearOrbitKfs=${orbitKfs}`);
+    }
+
+    /* 4. beat 4: the title card — DOM, fades in, holds, fades out,
+     *    while the orbit drifts on and rises */
+    {
+      const a = await seekState(12.3);
+      const ok = await onCurve(12.3);
+      check('M12.2: beat 4 — title card visible (opacity 1, orbit drifting up)',
+        a.titleOp === 1 &&
+        a.titleText === 'QWEN FLASH // AWAKENING' &&
+        a.y > 64 && ok,
+        `titleOp=${a.titleOp.toFixed(2)}, y=${a.y.toFixed(1)}, onCurve=${ok}`);
+      /* on an orbit keyframe the radius is exactly 104 */
+      const kf = await seekState(12.6);
+      check('M12.2: beat 4 — orbit keyframe on the r=104 circle (t=12.6)',
+        Math.abs(Math.hypot(kf.x, kf.z) - 104) < 0.01 &&
+        Math.abs(kf.y - 68) < 0.01,
+        `cam=(${kf.x.toFixed(1)}, ${kf.y.toFixed(1)}, ${kf.z.toFixed(1)})`);
+      /* fade in / fade out windows */
+      const f1 = await seekState(12.05);
+      const f2 = await seekState(13.4);
+      check('M12.2: beat 4 — title fades (in at 12.05 ≈ 0.9, out at 13.4 ≈ 0.33)',
+        Math.abs(f1.titleOp - 0.9) < 0.05 && Math.abs(f2.titleOp - 1 / 3) < 0.05,
+        `t12.05=${f1.titleOp.toFixed(2)}, t13.4=${f2.titleOp.toFixed(2)}`);
+      await page.evaluate(() => window.SIM.INTRO.seek(12.3));
+      await sleep(120);
+      const shot = await page.screenshot();
+      fs.writeFileSync(`${here}/shots/m122-title.png`, shot);
+      const lum = await page.evaluate(async (b64) => {
+        const img = new Image();
+        await new Promise((res, rej) => {
+          img.onload = res; img.onerror = rej;
+          img.src = 'data:image/png;base64,' + b64;
+        });
+        const c = document.createElement('canvas');
+        c.width = img.width; c.height = img.height;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const d = ctx.getImageData(0, 0, c.width, c.height).data;
+        let bright = 0;
+        const n = d.length / 4;
+        for (let i = 0; i < d.length; i += 4) {
+          const l = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+          if (l > 150) bright++;
+        }
+        return bright / n;
+      }, shot.toString('base64'));
+      check('M12.2: screenshot shows the title card (shots/m122-title.png)',
+        fs.existsSync(`${here}/shots/m122-title.png`) && lum > 0.001,
+        `bright=${(lum * 100).toFixed(2)}%`);
+    }
+
+    /* 5. beat 5: the drop — the camera lerps from the orbit end into
+     *    the M0 street spawn */
+    {
+      const a = await seekState(14.5);
+      const ok = await onCurve(14.5);
+      check('M12.2: beat 5 — drop into the street spawn (lerp, on curve)',
+        ok && a.x > -90.1 && a.x < 0 && a.y > 4 && a.y < 72 &&
+        a.z > 18 && a.z < 52,
+        `cam=(${a.x.toFixed(1)}, ${a.y.toFixed(1)}, ${a.z.toFixed(1)}), onCurve=${ok}`);
+    }
+
+    /* 6. full natural play: the ~15.2 s intro plays to the end →
+     *    RUNNING with a CONTROLLABLE street-level camera, and every
+     *    beat FX is off */
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT.state === 'INTRO',
+      { timeout: 20000 },
+    );
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT.state === 'RUNNING',
+      { timeout: 30000 },
+    );
+    {
+      const s = await introState();
+      check('M12.2: full intro plays to the end → street RUNNING (beat FX off)',
+        s.state === 'RUNNING' && !s.playing &&
+        Math.abs(s.dur - 15.2) < 0.01 &&
+        Math.abs(s.cam.x) < 0.05 && Math.abs(s.cam.y - 4) < 0.05 &&
+        Math.abs(s.cam.z - 18) < 0.05 &&
+        s.fade === 0 && s.titleOp === 0 &&
+        s.endWall === true && s.portalVisible === false &&
+        s.inCity === false,
+        `state=${s.state}, cam=(${s.cam.x.toFixed(1)}, ${s.cam.y.toFixed(1)}, ${s.cam.z.toFixed(1)}), fade=${s.fade}, title=${s.titleOp}, wall=${s.endWall}`);
+      /* controllable: W moves the camera forward from the spawn */
+      await page.keyboard.down('w');
+      await sleep(700);
+      await page.keyboard.up('w');
+      const c2 = await page.evaluate(() => {
+        const c = window.SIM.camera.position;
+        return { x: c.x, y: c.y, z: c.z, state: window.SIM.BOOT.state };
+      });
+      check('M12.2: street-level camera is controllable (W moves forward)',
+        c2.state === 'RUNNING' && c2.z < 17.5,
+        `cam=(${c2.x.toFixed(1)}, ${c2.y.toFixed(1)}, ${c2.z.toFixed(1)}), state=${c2.state}`);
+    }
+
+    /* 7. bounded cost: the full intro is scratch-only — heap flat
+     *    while the city beats play */
+    {
+      await page.evaluate(() => window.SIM.INTRO.seek(9.0));
+      const heapMin = () => page.evaluate(async () => {
+        let m = Infinity;
+        for (let i = 0; i < 3; i++) {
+          if (window.gc) window.gc();
+          if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+          await new Promise(r => setTimeout(r, 250));
+        }
+        return m === Infinity ? -1 : m;
+      });
+      const h0 = await heapMin();
+      const h1 = await heapMin();
+      check('M12.2: bounded cost (heap flat while the city beats play)',
+        h0 > 0 && h1 - h0 <= 2 * 1024 * 1024,
+        `Δ=${((h1 - h0) / 1048576).toFixed(2)} MB`);
     }
   }
 
