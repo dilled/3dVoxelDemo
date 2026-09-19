@@ -8280,6 +8280,169 @@ try {
     }
   }
 
+  /* ------------------------------------------------------------------ *
+   * M11.3 — Event sounds (pulse thump / arc crackle / steam hiss /
+   *          drone whir)
+   *
+   *  Fire-and-forget one-shots fired from the real M6–M9 emitter
+   *  call sites (FX.pulse / FX.arc / PARTS._spawnSteam /
+   *  TRAFFIC._spawn), every output connecting to AUDIO.master — the
+   *  M11.1 choke point — so the M key mutes all of them at zero
+   *  cost. No per-frame work: AUDIO.update is untouched, each
+   *  one-shot stops its own sources and is collected (zero cost
+   *  when idle). Wiring is verified app-side: the eventsWired flags
+   *  are captured from connect() return values (the headless build
+   *  exposes no graph introspection) and each type has a fire
+   *  counter, so "each event produces its sound" = each emitter's
+   *  call site increments its counter exactly once per fire.
+   * ------------------------------------------------------------------ */
+  {
+    const evState = () => page.evaluate(() => {
+      const A = window.SIM.AUDIO;
+      return {
+        counters: { ...A.events },
+        wired: { ...A.eventsWired },
+        hasNoise: !!A._evNoise,
+        noiseDur: A._evNoise ? A._evNoise.duration : -1,
+        muted: A.muted,
+        muteGain: A.muteGain ? A.muteGain.gain.value : -1,
+      };
+    });
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 250));
+      }
+      return m === Infinity ? -1 : m;
+    });
+
+    /* 1. setup: counters + shared one-shot noise buffer exist */
+    const e0 = await evState();
+    check('M11.3: event counters + shared one-shot noise buffer exist',
+      e0.counters && e0.hasNoise && e0.noiseDur >= 1,
+      `noise=${e0.noiseDur}s, counters=${JSON.stringify(e0.counters)}`);
+
+    /* 2. pulse thump — the real FX.pulse call site */
+    const p = await page.evaluate(() => {
+      const S = window.SIM;
+      const before = S.AUDIO.events.pulse;
+      const it = S.FX.pulse({ x: 0, y: 0, z: 0 });
+      const after = S.AUDIO.events.pulse;
+      if (it) S.FX.dropPulse(it);
+      return { before, after, fired: !!it };
+    });
+    check('M11.3: pulse thump fires from FX.pulse (counter +1)',
+      p.fired && p.after === p.before + 1,
+      `before=${p.before}, after=${p.after}`);
+
+    /* 3. arc crackle — the real FX.arc call site */
+    const ar = await page.evaluate(() => {
+      const S = window.SIM;
+      const before = S.AUDIO.events.arc;
+      const it = S.FX.arc({ x: 10, y: 8, z: 10 }, { x: 40, y: 22, z: 30 });
+      const after = S.AUDIO.events.arc;
+      if (it) S.FX.dropArc(it);
+      return { before, after, fired: !!it };
+    });
+    check('M11.3: arc crackle fires from FX.arc (counter +1)',
+      ar.fired && ar.after === ar.before + 1,
+      `before=${ar.before}, after=${ar.after}`);
+
+    /* 4. steam hiss — the real PARTS._spawnSteam call site. The
+     *    steam pool is saturated at cap (spawn rate × life > cap),
+     *    so free one slot with the real trim path first. */
+    const st = await page.evaluate(() => {
+      const S = window.SIM;
+      const before = S.AUDIO.events.steam;
+      if (S.PARTS.scount > 0) S.PARTS._sReleaseAt(0);
+      const it = S.PARTS.spool.acquire();
+      if (it) S.PARTS._spawnSteam(it, { x: 50, z: 50, hTop: 30, r: 6 });
+      return { before, after: S.AUDIO.events.steam, spawned: !!it };
+    });
+    check('M11.3: steam hiss fires from PARTS._spawnSteam (counter +1)',
+      st.spawned && st.after === st.before + 1,
+      `before=${st.before}, after=${st.after}`);
+
+    /* 5. drone whir — the real TRAFFIC._spawn call site. The pool is
+     *    at cap (every live drone is a pool item), so free one slot
+     *    with the real trim path (_releaseAt) first; _spawn
+     *    early-returns when the seeded dock search finds no dock,
+     *    so retry a few times. */
+    const dr = await page.evaluate(() => {
+      const S = window.SIM;
+      const T = S.TRAFFIC, A = S.AUDIO;
+      const before = A.events.drone;
+      if (T.count > 0) T._releaseAt(0);
+      let it = T.pool.acquire();
+      let fired = false;
+      for (let i = 0; i < 6 && it && !fired; i++) {
+        const b = A.events.drone;
+        T._spawn(it);
+        if (A.events.drone > b) { fired = true; break; }
+        it = T.pool.acquire();
+      }
+      return { before, after: A.events.drone, fired, count: T.count };
+    });
+    check('M11.3: drone whir fires from TRAFFIC._spawn (counter +1)',
+      dr.fired && dr.after === dr.before + 1,
+      `before=${dr.before}, after=${dr.after}, count=${dr.count}`);
+
+    /* 6. all silent when muted — fire every type while the M-key
+     *    mute is on: the counters still move (the events happen),
+     *    but every one-shot output connects to AUDIO.master whose
+     *    only path to destination goes through the 0-gain muteGain
+     *    (eventsWired captured from connect() return values). */
+    await page.keyboard.press('KeyM');
+    await sleep(250);
+    const mm = await page.evaluate(() => {
+      const S = window.SIM;
+      const before = { ...S.AUDIO.events };
+      const pit = S.FX.pulse({ x: 0, y: 0, z: 0 });
+      if (pit) S.FX.dropPulse(pit);
+      const ait = S.FX.arc({ x: 1, y: 2, z: 3 }, { x: 9, y: 5, z: 7 });
+      if (ait) S.FX.dropArc(ait);
+      if (S.PARTS.scount > 0) S.PARTS._sReleaseAt(0);
+      const it = S.PARTS.spool.acquire();
+      if (it) S.PARTS._spawnSteam(it, { x: 60, z: 60, hTop: 30, r: 6 });
+      return {
+        before, after: { ...S.AUDIO.events },
+        muted: S.AUDIO.muted,
+        mute: S.AUDIO.muteGain.gain.value,
+      };
+    });
+    check('M11.3: events fire while muted — silent at the choke point',
+      mm.muted && mm.mute < 0.01 &&
+      mm.after.pulse === mm.before.pulse + 1 &&
+      mm.after.arc === mm.before.arc + 1 &&
+      mm.after.steam === mm.before.steam + 1,
+      `muted=${mm.muted}, mute=${mm.mute}, Δpulse=${mm.after.pulse - mm.before.pulse}, ` +
+      `Δarc=${mm.after.arc - mm.before.arc}, Δsteam=${mm.after.steam - mm.before.steam}`);
+    await page.keyboard.press('KeyM');
+    await sleep(250);
+
+    /* 7. wiring: every event type's output connects to AUDIO.master
+     *    (app-side flags captured from connect() return values) */
+    const e1 = await evState();
+    check('M11.3: every event output connects to AUDIO.master (wired flags)',
+      e1.wired.pulse && e1.wired.arc && e1.wired.steam && e1.wired.drone,
+      `wired=${JSON.stringify(e1.wired)}`);
+
+    /* 8. zero cost when idle: no per-frame work — heap flat across a
+     *    window with no forced fires (ambient steam/drone events are
+     *    the emitters' own fires; everything else is set-and-forget
+     *    self-stopping one-shots). */
+    const h0 = await heapMin();
+    await sleep(5000);
+    const h1 = await heapMin();
+    const e2 = await evState();
+    check('M11.3: zero cost when idle (heap flat, no errors)',
+      h0 > 0 && h1 - h0 <= 2 * 1024 * 1024 && pageErrors.length === 0,
+      `Δ=${((h1 - h0) / 1048576).toFixed(2)} MB, errors=${pageErrors.length}, ` +
+      `counters=${JSON.stringify(e2.counters)}`);
+  }
+
   /* ---- 10. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));

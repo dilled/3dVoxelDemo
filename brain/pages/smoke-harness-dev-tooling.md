@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-19T04:02:20"
+updated: "2026-09-19T06:22:07"
 ---
 
 <!-- compiled_truth -->
@@ -71,3 +71,8 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   summary: "WebAudio gotcha (M11.2): AudioParam.value returns the BASE value — connected-input (oscillator LFO) modulation is NOT reflected in .value reads (headless or not). Verify bed motion driven from update() against the exact deterministic formula (tolerances for ≤ ~0.1 s frame/IPC lag); connected-LFO graphs are unobservable via .value and the graph has no inputs/outputs introspection in this build."
   source: M11.2 verification
   affects: [smoke-harness-dev-tooling, m112-looping-beds]
+
+- time: 2026-09-19T06:22:07
+  kind: decision
+  summary: "M11.3 extends the harness: new M11.3 section (8 checks after M11.2, page already RUNNING) — per-type fire counters (AUDIO.events) assert each emitter's real call site fires exactly once (FX.pulse / FX.arc / PARTS._spawnSteam / TRAFFIC._spawn), all-fire-while-muted choke-point check (counters move, muteGain 0), eventsWired flags (captured from connect() return values — headless build exposes no graph introspection), heap flat. Pattern: pools are saturated at cap ⇒ free a slot with the real trim path first (PARTS._sReleaseAt(0) / TRAFFIC._releaseAt(0)) before pool.acquire(); TRAFFIC._spawn early-returns (no dock) ⇒ retry loop; synthetic src {x,z,hTop,r} is valid for _spawnSteam"
+  affects: [smoke-harness-dev-tooling]

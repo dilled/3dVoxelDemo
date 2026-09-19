@@ -724,6 +724,42 @@ const CFG = {
         gain: 1.2,             // thump level relative to the machine bed gain
       },
     },
+
+    /* ---- M11.3: event sounds — fire-and-forget one-shots fired from
+     * the M6–M9 emitter call sites into AUDIO.master (the M11.1 choke
+     * point ⇒ the M key mutes them at zero cost). Nothing here runs
+     * per frame — each one-shot stops its own sources and is
+     * collected. Levels are on the master bus (0.8) before the
+     * compressor, relative to the beds. */
+    events: {
+      pulse: {                // FX.pulse — "thump"
+        gain: 0.50,           // thump level on the master bus
+        f: [130, 38],         // Hz — sine pitch drop (exponential)
+        dur: 0.6,             // s — thump decay length
+        hit: 0.5,             // noise-hit level relative to the thump gain
+        hitDur: 0.25,         // s — noise-hit length
+        hitFilter: 420,      // Hz — low-pass on the noise hit
+      },
+      arc: {                 // FX.arc — crackle
+        gain: 0.16,
+        dur: 0.5,             // s — crackle span
+        bursts: 5,            // sharp on/off noise bursts over the span
+        band: 2400,           // Hz — band-pass center
+        q: 0.8,
+      },
+      steam: {               // PARTS._spawnSteam — hiss
+        gain: 0.05,
+        dur: 1.2,             // s — hiss decay length
+        band: 3200,           // Hz — band-pass center (air, not rumble)
+        q: 0.7,
+      },
+      drone: {               // TRAFFIC._spawn — whir
+        gain: 0.07,
+        dur: 0.7,             // s — whir length
+        band: [700, 1800],   // Hz — band-pass center rise (rotor spin-up)
+        q: 1.2,
+      },
+    },
   },
 };
 
@@ -812,6 +848,10 @@ const BOOT = {
  * the live parts are all in `update()` (a system in the fixed boot
  * order): the random low-thump scheduler + the slow deterministic
  * bed motion (hum swell, fan band-pass sweep).
+ *
+ * M11.3 event sounds (pulse thump / arc crackle / steam hiss / drone
+ * whir) are fire-and-forget one-shots fired from the M6–M9 emitter
+ * call sites into `master` — no per-frame work, self-stopping nodes.
  * ------------------------------------------------------------------ */
 const AUDIO = {
   name: 'AUDIO',
@@ -822,6 +862,9 @@ const AUDIO = {
   muted: false,
   wired: false,
   beds: null,                 // M11.2: { hum, fan, machine } sub-graphs
+  events: { pulse: 0, arc: 0, steam: 0, drone: 0 },  // M11.3 fire counters
+  eventsWired: { pulse: false, arc: false, steam: false, drone: false },
+  _evNoise: null,             // M11.3: shared short noise buffer (one-shots)
   _rng: null,
   _gestureWired: false,
 
@@ -848,6 +891,11 @@ const AUDIO = {
       AUDIO.wired = c1 === AUDIO.comp && c2 === AUDIO.muteGain &&
         c3 === AUDIO.ctx.destination;
       AUDIO._startBeds();
+      /* M11.3: shared short noise buffer for every noise one-shot
+       * (pulse hit, arc crackle, steam hiss, drone whir) — one
+       * buffer, looped where needed, so an event allocates only its
+       * self-stopping one-shot nodes. */
+      AUDIO._evNoise = AUDIO._noise(2);
     } catch (_) {
       AUDIO.ctx = null;
     }
@@ -973,6 +1021,10 @@ const AUDIO = {
     g.connect(m.gain);
     osc.start(t0);
     osc.stop(t0 + dur + 0.1);
+    /* drop the one-shot from the graph when it ends so it is
+     * collected (a node wired into the bed gain stays reachable
+     * from the graph forever). */
+    osc.onended = () => { g.disconnect(); };
     m.thumpCount++;
   },
 
@@ -1001,6 +1053,157 @@ const AUDIO = {
     AUDIO._thump();
     const e = C.machine.thump.every;
     m.nextThumpAt = t + e[0] + AUDIO._rng() * (e[1] - e[0]);
+  },
+
+  /* ---- M11.3: event sounds — fire-and-forget one-shots fired from
+   * the M6–M9 emitter call sites (FX.pulse / FX.arc /
+   * PARTS._spawnSteam / TRAFFIC._spawn). Every one-shot connects to
+   * AUDIO.master — the M11.1 choke point — so the M key mutes all of
+   * them at zero cost and nothing here costs anything when idle:
+   * no per-frame work (update() is untouched), each one-shot stops its
+   * own sources and is collected. eventsWired is captured from
+   * connect() return values (the headless smoke build exposes no
+   * graph introspection); the counters serve the smoke harness. */
+  _evGain(type, level) {
+    const ctx = AUDIO.ctx;
+    const g = ctx.createGain();
+    g.gain.value = level;
+    if (g.connect(AUDIO.master) === AUDIO.master) AUDIO.eventsWired[type] = true;
+    return g;
+  },
+
+  /* pulse thump: sine pitch drop + short low-passed noise hit
+   * (FX.pulse — the M7.2 seam). */
+  pulseThump() {
+    if (!AUDIO.ctx) return;
+    const ctx = AUDIO.ctx;
+    const C = CFG.audio.events.pulse;
+    const t0 = ctx.currentTime + 0.01;
+    const g = AUDIO._evGain('pulse', C.gain);
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(C.f[0], t0);
+    osc.frequency.exponentialRampToValueAtTime(C.f[1], t0 + C.dur);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(0.0001, t0);
+    og.gain.exponentialRampToValueAtTime(1, t0 + 0.03);
+    og.gain.exponentialRampToValueAtTime(0.0001, t0 + C.dur);
+    osc.connect(og);
+    og.connect(g);
+    osc.start(t0);
+    osc.stop(t0 + C.dur + 0.1);
+    const src = ctx.createBufferSource();
+    src.buffer = AUDIO._evNoise;
+    src.loop = true;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = C.hitFilter;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.0001, t0);
+    ng.gain.exponentialRampToValueAtTime(C.hit, t0 + 0.015);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t0 + C.hitDur);
+    src.connect(lp);
+    lp.connect(ng);
+    ng.connect(g);
+    src.start(t0);
+    src.stop(t0 + C.hitDur + 0.05);
+    /* the last source (the oscillator) stops last — drop the whole
+     * one-shot from the graph so it is collected (a node wired into
+     * master stays reachable from the graph forever). */
+    osc.onended = () => { g.disconnect(); };
+    AUDIO.events.pulse++;
+  },
+
+  /* arc crackle: a few sharp band-passed noise bursts (FX.arc — the
+   * M7.3 seam). */
+  arcCrackle() {
+    if (!AUDIO.ctx) return;
+    const ctx = AUDIO.ctx;
+    const C = CFG.audio.events.arc;
+    const t0 = ctx.currentTime + 0.01;
+    const g = AUDIO._evGain('arc', C.gain);
+    const src = ctx.createBufferSource();
+    src.buffer = AUDIO._evNoise;
+    src.loop = true;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = C.band;
+    bp.Q.value = C.q;
+    const eg = ctx.createGain();
+    const gap = C.dur / C.bursts;
+    eg.gain.setValueAtTime(0.0001, t0);
+    for (let k = 0; k < C.bursts; k++) {
+      const s = t0 + k * gap;
+      eg.gain.setValueAtTime(1, s);
+      eg.gain.setValueAtTime(0.0001, s + gap * 0.55);
+    }
+    src.connect(bp);
+    bp.connect(eg);
+    eg.connect(g);
+    src.start(t0);
+    src.stop(t0 + C.dur + 0.05);
+    /* drop the one-shot from the graph when it ends (see pulseThump) */
+    src.onended = () => { g.disconnect(); };
+    AUDIO.events.arc++;
+  },
+
+  /* steam hiss: band-passed noise, fast attack, long decay
+   * (PARTS._spawnSteam — one per puff). */
+  steamHiss() {
+    if (!AUDIO.ctx) return;
+    const ctx = AUDIO.ctx;
+    const C = CFG.audio.events.steam;
+    const t0 = ctx.currentTime + 0.01;
+    const g = AUDIO._evGain('steam', C.gain);
+    const src = ctx.createBufferSource();
+    src.buffer = AUDIO._evNoise;
+    src.loop = true;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = C.band;
+    bp.Q.value = C.q;
+    const eg = ctx.createGain();
+    eg.gain.setValueAtTime(0.0001, t0);
+    eg.gain.exponentialRampToValueAtTime(1, t0 + 0.08);
+    eg.gain.exponentialRampToValueAtTime(0.0001, t0 + C.dur);
+    src.connect(bp);
+    bp.connect(eg);
+    eg.connect(g);
+    src.start(t0);
+    src.stop(t0 + C.dur + 0.05);
+    /* drop the one-shot from the graph when it ends (see pulseThump) */
+    src.onended = () => { g.disconnect(); };
+    AUDIO.events.steam++;
+  },
+
+  /* drone whir: band-passed noise with a rising center sweep (rotor
+   * spin-up) — TRAFFIC._spawn, one per drone launch. */
+  droneWhir() {
+    if (!AUDIO.ctx) return;
+    const ctx = AUDIO.ctx;
+    const C = CFG.audio.events.drone;
+    const t0 = ctx.currentTime + 0.01;
+    const g = AUDIO._evGain('drone', C.gain);
+    const src = ctx.createBufferSource();
+    src.buffer = AUDIO._evNoise;
+    src.loop = true;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = C.q;
+    bp.frequency.setValueAtTime(C.band[0], t0);
+    bp.frequency.linearRampToValueAtTime(C.band[1], t0 + C.dur);
+    const eg = ctx.createGain();
+    eg.gain.setValueAtTime(0.0001, t0);
+    eg.gain.exponentialRampToValueAtTime(1, t0 + 0.1);
+    eg.gain.exponentialRampToValueAtTime(0.0001, t0 + C.dur);
+    src.connect(bp);
+    bp.connect(eg);
+    eg.connect(g);
+    src.start(t0);
+    src.stop(t0 + C.dur + 0.05);
+    /* drop the one-shot from the graph when it ends (see pulseThump) */
+    src.onended = () => { g.disconnect(); };
+    AUDIO.events.drone++;
   },
 
   setMuted(on) {
@@ -3801,6 +4004,7 @@ const TRAFFIC = {
     TRAFFIC._live[TRAFFIC.count++] = it;
     TRAFFIC._plan(it);
     TRAFFIC.mesh.setColorAt(TRAFFIC.count - 1, it.tint);
+    AUDIO.droneWhir();               // M11.3: whir (→ AUDIO.master)
   },
 
   _releaseAt(i) {
@@ -4508,6 +4712,7 @@ const PARTS = {
     const b = 0.85 + r() * 0.3;
     it.cR = 0.62 * b; it.cG = 0.72 * b; it.cB = 0.82 * b;
     PARTS._sLive[PARTS.scount++] = it;
+    AUDIO.steamHiss();               // M11.3: hiss (→ AUDIO.master)
   },
 
   /* spawn one spark at a substation roof (brief ballistic life) */
@@ -4879,7 +5084,7 @@ const FX = {
       it.cR = FX._c.r; it.cG = FX._c.g; it.cB = FX._c.b;
     }
     FX._live[FX.count++] = it;
-    /* audio thump: wired in M11.3 */
+    AUDIO.pulseThump();              // M11.3: thump (→ AUDIO.master)
     return it;
   },
 
@@ -4933,7 +5138,7 @@ const FX = {
     FX._regenArc(FX.arcCount - 1);
     FX.arcs.geometry.setDrawRange(0, FX.arcCount * FX._arcVerts);
     FX.arcs.geometry.attributes.position.needsUpdate = true;
-    /* audio crackle: wired in M11.3 */
+    AUDIO.arcCrackle();              // M11.3: crackle (→ AUDIO.master)
     return it;
   },
 
@@ -4952,7 +5157,8 @@ const FX = {
     } else {
       FX._flashTint.setHex(CFG.fx.flash.color);
     }
-    /* audio: wired in M11.3 */
+    /* no audio: the flash is silent — M11.3 events cover pulse/arc/
+     * steam/drone (lightning/arc events carry the crackle). */
     return FX._flash;
   },
 

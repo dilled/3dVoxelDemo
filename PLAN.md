@@ -75,7 +75,7 @@ smoke-test evidence.
 | **M10.3** ✅ | Awakening reaction: sign flares, holograph brightens + one slow stretch, sloth drones rise to hover for the pulse, then resume | Reaction plays during AWAKE, everything returns to idle after DECAY |
 | **M11.1** ✅ | Audio master graph: compressor → user-mute gain → destination; gesture-gated start (START button), resume-safe | Audio starts only after gesture; mute key mutes all; refresh/re-entry safe |
 | **M11.2** ✅ | Looping beds: reactor hum (detuned sines + sub + LFO), fans (filtered noise, band-pass sweep), distant machinery (noise + random low thumps) | Beds run indefinitely without audible repeats/bugs; identifiable as "machine city" within 3 s |
-| **M11.3** | Event sounds: pulse thump, arc crackle, steam hiss, drone whir — wired to M6–M9 emitters | Each event in-game produces its sound; all silent when muted; zero cost when idle |
+| **M11.3** ✅ | Event sounds: pulse thump, arc crackle, steam hiss, drone whir — wired to M6–M9 emitters | Each event in-game produces its sound; all silent when muted; zero cost when idle |
 | **M11.4** | Spatial-ish mixing: one panner + distance gain for 2–3 nearest emitters, rest folded into ambient bed | Walking past an emitter pans/attenuates; cost bounded |
 | **M12.1** | Intro engine: camera-keyframe timeline runner (no async resources) + beat 1 dark server corridor (procedural instanced LED-strip tunnel + dolly) | Corridor beat plays; timeline runner test: start/cancel/seek all clean |
 | **M12.2** | Intro beats 2–5: corridor opens → wide reveal dolly over city → 1.5-orbit low orbit of dormant creature → `QWEN FLASH // AWAKENING` title card (DOM, fades) → lerp to street-level player position | Full ~12–15 s intro ends in controllable street-level camera |
@@ -943,12 +943,61 @@ feels like it belongs to the world, not pasted on.
   hooks — and M14.1 tiers).
 
 #### M11.3 — Event sounds
-- [ ] Pulse thump (sine drop + noise hit), arc crackle (short filtered-
+- [x] Pulse thump (sine drop + noise hit), arc crackle (short filtered-
       noise bursts), steam hiss, drone whir — wired to the M6–M9
       emitters.
 - **Test:** each corresponding in-game event produces its sound; all
       silent when muted; zero cost when idle.
 - **Commit when:** every event sound verified in-game.
+  Four fire-and-forget Web Audio one-shots fired from the real M6–M9
+  emitter call sites, every output connecting to `AUDIO.master` (the
+  M11.1 choke point ⇒ the M key mutes all event sounds at zero cost),
+  all tunables in `CFG.audio.events`: **pulse thump** (`AUDIO.pulseThump()`
+  ← `FX.pulse()` — the M7.2 seam) = sine pitch drop (130→38 Hz
+  exponential) + short low-passed (420 Hz) noise hit, gain 0.50;
+  **arc crackle** (`AUDIO.arcCrackle()` ← `FX.arc()`) = 5 sharp on/off
+  band-passed (2400 Hz) noise bursts over 0.5 s, gain 0.16; **steam
+  hiss** (`AUDIO.steamHiss()` ← `PARTS._spawnSteam`) = band-passed
+  (3200 Hz) noise, fast attack, 1.2 s decay, gain 0.05 (one per puff);
+  **drone whir** (`AUDIO.droneWhir()` ← `TRAFFIC._spawn`) = band-passed
+  noise with a rising center sweep (700→1800 Hz — rotor spin-up),
+  gain 0.07 (one per drone launch). `FX.flash` stays silent (out of
+  scope — lightning/arc events carry the crackle). Zero cost when idle:
+  nothing added to `AUDIO.update` — each one-shot stops its own sources;
+  a shared 2 s noise buffer (`AUDIO._evNoise`) feeds every noise
+  one-shot, so an event allocates only its self-stopping nodes.
+  **Self-stopping ≠ collected:** a one-shot subgraph wired into
+  `AUDIO.master` stays reachable from the graph forever, so the one-shots
+  (and the M11.2 machine thump — same pattern) now call
+  `g.disconnect()` from the last source's `onended` to drop the subgraph
+  so it is collected (at ambient steam rate ~8 puffs/s the unfixed
+  version is a visible heap growth). Wiring verification (headless gotcha,
+  same as M11.1): the app captures `AUDIO.eventsWired = { pulse, arc,
+  steam, drone }` from `connect()` return values and keeps per-type fire
+  counters `AUDIO.events` — the headless build exposes no graph
+  introspection. Smoke M11.3 section (8 checks, after M11.2, page already
+  RUNNING): counters + shared noise buffer exist; each emitter's real
+  call site increments its counter exactly once (pulse/arc via `FX.pulse`
+  / `FX.arc` + `dropPulse`/`dropArc` cleanup; steam via `_sReleaseAt(0)`
+  + `spool.acquire` + `_spawnSteam` with a synthetic `src` — the steam
+  pool is saturated at cap; drone via `_releaseAt(0)` + `pool.acquire`
+  + `_spawn` with a retry loop — `_spawn` early-returns when the seeded
+  dock search finds no dock); all silent when muted (fire every type
+  while the M-key mute is on — counters still move, muteGain 0, choke
+  point); `eventsWired` all true; heap flat (min-of-3, ≤ 2 MB, no
+  errors). Full suite 3 runs: M11.3 8/8 in 2 runs (the single failure was
+  the heap-flat check, same environmental class); the only other
+  failures are the documented pre-existing headless flakes (M7.3 bolt
+  cadence, M7.5 shake `energy=1.18`, M8.1 star brightness, M9.4 vehicle
+  ease-out, M11.2/M6.2-class heap) — the M11.2 "heap flat" check was
+  re-verified to flake identically at the pre-M11.3 HEAD baseline (git
+  worktree run: Δ=2.55 MB FAIL vs Δ=-5.08 MB PASS), environmental GC
+  noise, not an M11.3 regression; an A/B heap experiment confirmed the
+  event one-shots add no measurable heap growth (370 forced one-shots
+  → +0.27 MB net, ambient 10 s window flat, with- vs without-events
+  3×8 s windows indistinguishable). M11.4 seam: the panner + distance
+  gain wraps these same one-shot call sites; M14.1 tiers can scale
+  `CFG.audio.events` levels.
 
 #### M11.4 — Spatial-ish mixing
 - [ ] One panner + distance gain for the 2–3 nearest emitters;
