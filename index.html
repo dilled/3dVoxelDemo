@@ -111,6 +111,15 @@
     bottom: 7vh;
     left: 50%;
     transform: translateX(-50%);
+    /* M12.3: hidden until 2 s into the intro (INTRO._applyBeatFx adds
+     * .on as a pure function of t) — click/keypress skip work from 0. */
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.5s ease, background 0.2s ease, box-shadow 0.2s ease;
+  }
+  #overlay.intro #startBtn.on {
+    opacity: 1;
+    pointer-events: auto;
   }
   #overlay .title {
     font-size: 15px;
@@ -847,6 +856,11 @@ const CFG = {
     },
     beat5: { dur: 1.6 },
     street: { pos: [0, 4, 18], look: [0, 2, 0] }, // M0 spawn handoff
+    /* M12.3: skip/cancel — the 0.5 s white fade to the street camera
+     * (0.25 s out to white, hand off at the midpoint, 0.25 s in) and
+     * the START button's visible delay (hidden until 2 s into the
+     * intro; click/keypress skip work from t=0). */
+    skip: { fade: 0.5, delay: 2 },
   },
 };
 
@@ -7175,6 +7189,20 @@ const HUD = {
  * keyframes and the city keyframes share the scene-switch time (the
  * pair search picks the first pair with t < next.t, so at that instant
  * the city pose wins).
+ *
+ * M12.3 — skip/cancel robustness: the intro is skippable/cancellable at
+ * ANY moment (START click, any click, any keypress — all wired to
+ * skip(), which is idempotent: the first gesture wins). skip() freezes
+ * the timeline and starts a CFG.intro.skip.fade (0.5 s) white fade to
+ * the street camera, driven from update() via _skip: 0.25 s fade to
+ * white with the pose frozen at the skip time, hand off to the street
+ * camera AT the midpoint (BOOT.enter('RUNNING') — the play state is
+ * live while the fade is still on screen ⇒ the intro never blocks
+ * play), 0.25 s fade in from the street. The START button stays hidden
+ * until CFG.intro.skip.delay (2 s) — its .on class is part of
+ * _applyBeatFx (pure function of t ⇒ seek-safe); before that, click
+ * and keypress still skip (the button is pointer-events:none, so the
+ * click lands on the page and the window pointerdown fires).
  * ------------------------------------------------------------------ */
 const INTRO = {
   name: 'INTRO',
@@ -7187,6 +7215,8 @@ const INTRO = {
   dashes: null,           // InstancedBox batcher — flowing dashes (1 call)
   _fadeEl: null,          // DOM: white scene-switch flash (beat 2)
   _titleEl: null,         // DOM: beat 4 title card
+  _startBtn: null,       // DOM: START button (M12.3: .on ⇔ t ≥ skip.delay)
+  _skip: null,           // M12.3: { t, done } — active skip fade (null = none)
   _inCity: false,         // beat 2 onward: the city scene renders
   _dashZ: null,           // Float32Array — dash z (flow along -Z, wrap)
   _dashLine: null,        // Int16Array — dash line index
@@ -7246,6 +7276,7 @@ const INTRO = {
     INTRO._fadeEl = document.getElementById('introFade');
     INTRO._titleEl = document.getElementById('introTitle');
     INTRO._titleEl.textContent = CFG.intro.beat4.text;
+    INTRO._startBtn = document.getElementById('startBtn');
 
     /* rack rows: instanced server racks along both walls (1 call),
      * deterministic per-instance tint salt (no two neighbours equal). */
@@ -7408,8 +7439,23 @@ const INTRO = {
     INTRO.dur = track[track.length - 1].t;
     INTRO.onDone = onDone || null;
     INTRO.playing = true;
+    INTRO._skip = null;
     INTRO._applyPose();
     INTRO._applyBeatFx();
+  },
+
+  /* M12.3: skip/cancel — START click, any click, any keypress. The
+   * first gesture wins (idempotent). Freezes the timeline and starts
+   * the 0.5 s white fade to the street camera (update() drives it via
+   * _updateSkip; the street handoff lands at the midpoint). AUDIO
+   * unlock happens HERE, inside the user gesture — the street handoff
+   * itself runs 0.25 s later, outside it. */
+  skip() {
+    if (BOOT.state !== 'INTRO' || INTRO._skip) return;
+    AUDIO.unlock();
+    INTRO.playing = false;
+    INTRO.onDone = null;
+    INTRO._skip = { t: 0, done: false };
   },
 
   cancel() {
@@ -7429,6 +7475,10 @@ const INTRO = {
   },
 
   update(dt, t) {
+    if (INTRO._skip) {
+      INTRO._updateSkip(dt);
+      return;                    // timeline + dashes frozen during the fade
+    }
     if (INTRO.playing) {
       INTRO.t += dt;
       if (INTRO.t >= INTRO.dur) {
@@ -7483,6 +7533,11 @@ const INTRO = {
           : 1;
     }
     INTRO._titleEl.style.opacity = clamp(op, 0, 1);
+    /* M12.3: the START button is the skip affordance — hidden until
+     * CFG.intro.skip.delay (2 s), visible for the rest of the intro
+     * (pure function of t ⇒ seek-safe). */
+    if (t >= CFG.intro.skip.delay) INTRO._startBtn.classList.add('on');
+    else INTRO._startBtn.classList.remove('on');
   },
 
   /* skip / natural end — the beat FX is off, the corridor closes
@@ -7491,9 +7546,39 @@ const INTRO = {
     INTRO.endWall.visible = true;
     INTRO.portal.visible = false;
     INTRO.portal.material.opacity = 0;
-    INTRO._fadeEl.style.opacity = 0;
+    /* the skip fade owns the fade element (it runs _toStreet →
+     * _resetFx mid-fade) — never zero it under the skip. */
+    if (!INTRO._skip) INTRO._fadeEl.style.opacity = 0;
     INTRO._titleEl.style.opacity = 0;
     INTRO._inCity = false;
+  },
+
+  /* M12.3: the 0.5 s skip fade, driven from update(). First half:
+   * fade to white with the camera pose frozen at the skip time. AT the
+   * midpoint: _toStreet — the street camera is live and the play state
+   * (RUNNING) is entered while the fade is still on screen (the intro
+   * never blocks play). Second half: fade in from the street. */
+  _updateSkip(dt) {
+    const half = CFG.intro.skip.fade / 2;
+    INTRO._skip.t += dt;
+    const el = INTRO._fadeEl;
+    if (!INTRO._skip.done) {
+      if (INTRO._skip.t < half) {
+        el.style.opacity = INTRO._skip.t / half;
+        INTRO._applyPose();     // hold the frozen pose (INTRO still wins)
+        return;
+      }
+      INTRO._skip.done = true;
+      el.style.opacity = 1;
+      INTRO._toStreet();        // ⇒ BOOT RUNNING, street camera live
+    }
+    const r = INTRO._skip.t - half;
+    if (r >= half) {
+      el.style.opacity = 0;
+      INTRO._skip = null;
+    } else {
+      el.style.opacity = 1 - r / half;
+    }
   },
 
   /* keyframe pair + smoothstep → camera pose (position + lookAt) */
@@ -7632,15 +7717,24 @@ function frame(now) {
  * ------------------------------------------------------------------ */
 try {
   const startBtn = document.getElementById('startBtn');
+  /* M12.3: the intro is skippable/cancellable at ANY moment — START
+   * click, any click (pointerdown), any keypress — each starts the
+   * 0.5 s white fade to the street camera. INTRO.skip is idempotent
+   * (the first gesture wins): a START press fires the window
+   * pointerdown AND the button click, and a keydown repeats — all
+   * collapse onto the one active _skip. */
   startBtn.addEventListener('click', () => {
     if (BOOT.state === 'INTRO') {            // M12: skip the intro
-      startBtn.disabled = true;
-      INTRO._toStreet();
+      INTRO.skip();
       return;
     }
     if (BOOT.state !== 'LOADER') return;     // idempotent gate
     BOOT.enter('RUNNING');
     startBtn.disabled = true;
+  });
+  window.addEventListener('pointerdown', () => INTRO.skip());
+  window.addEventListener('keydown', e => {
+    if (!e.repeat) INTRO.skip();
   });
 
   // Boot succeeded: renderer constructed, scene + camera attached,

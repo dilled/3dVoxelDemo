@@ -14,6 +14,16 @@
  *   - page reload (refresh) returns to a fresh, unstuck intro and
  *     START works again
  *
+ *   M12.3 checks:
+ *   - intro skippable/cancellable at any moment (START/click/keypress)
+ *     → 0.5 s white fade to the street camera; the play state (RUNNING)
+ *     is live at the fade midpoint (the intro never blocks play)
+ *   - START hidden until 2 s into the intro (pure fn of t), visible
+ *     after — boundary checked at the seek(1.9)/seek(2.1) edge
+ *   - finish / early-skip (click, corridor) / late-interrupt
+ *     (keypress, beat 5) — all three paths end in a controllable
+ *     street-level camera with every beat FX off
+ *
  *   M1 checks:
  *   - systems registry boots in fixed order
  *     (INPUT, CAMERA, KIT, WORLD, ENTITY, TRAFFIC, PARTS, HUD)
@@ -9263,6 +9273,223 @@ try {
       check('M12.2: bounded cost (heap flat while the city beats play)',
         h0 > 0 && h1 - h0 <= 2 * 1024 * 1024,
         `Δ=${((h1 - h0) / 1048576).toFixed(2)} MB`);
+    }
+  }
+
+  /* ------------------------------------------------------------------
+   * M12.3 — Skip/cancel robustness
+   *
+   *  The intro is skippable/cancellable at ANY moment — START click,
+   *  any click, any keypress — each starts a 0.5 s white fade to the
+   *  street camera (INTRO._skip, driven from update()). The street
+   *  handoff lands at the fade midpoint: the play state (RUNNING) is
+   *  live while the fade is still on screen (the intro never blocks
+   *  play). The START button stays hidden until 2 s into the intro
+   *  (its .on class is a pure function of t ⇒ seek-safe); before that
+   *  click/keypress still skip (the button is pointer-events:none,
+   *  so the click lands on the page and the window pointerdown
+   *  fires). All three paths must end in a controllable street-level
+   *  camera: early skip (click, corridor), late interrupt (keypress,
+   *  beat 5), natural finish.
+   * ------------------------------------------------------------------ */
+  {
+    const startBtnState = () => page.evaluate(() => {
+      const b = document.getElementById('startBtn');
+      const cs = getComputedStyle(b);
+      return {
+        on: b.classList.contains('on'),
+        op: parseFloat(cs.opacity),
+        pe: cs.pointerEvents,
+      };
+    });
+
+    /* the shared end state for every path: street RUNNING, timeline
+     * off, street spawn pose, every beat FX off, overlay gone. */
+    const endState = () => page.evaluate(() => {
+      const S = window.SIM, I = S.INTRO;
+      const c = S.camera.position;
+      return {
+        state: S.BOOT.state,
+        playing: I.playing,
+        skipDone: I._skip === null,
+        inCity: I._inCity,
+        cam: { x: c.x, y: c.y, z: c.z },
+        fade: parseFloat(document.getElementById('introFade').style.opacity),
+        titleOp: parseFloat(document.getElementById('introTitle').style.opacity),
+        endWall: I.endWall.visible,
+        portal: I.portal.visible,
+        overlayHide: document.getElementById('overlay').classList.contains('hide'),
+      };
+    });
+
+    const checkEnd = (name, s) => check(name,
+      s.state === 'RUNNING' && !s.playing && s.skipDone &&
+      Math.abs(s.cam.x) < 0.05 && Math.abs(s.cam.y - 4) < 0.05 &&
+      Math.abs(s.cam.z - 18) < 0.05 &&
+      s.fade === 0 && s.titleOp === 0 &&
+      s.endWall === true && s.portal === false &&
+      !s.inCity && s.overlayHide,
+      `state=${s.state}, cam=(${s.cam.x.toFixed(1)}, ${s.cam.y.toFixed(1)}, ${s.cam.z.toFixed(1)}), fade=${s.fade}, title=${s.titleOp}, wall=${s.endWall}, inCity=${s.inCity}, overlay=${s.overlayHide}`);
+
+    /* controllable: W moves the camera forward from the street spawn */
+    const checkControllable = async (name) => {
+      await page.keyboard.down('w');
+      await sleep(700);
+      await page.keyboard.up('w');
+      const c = await page.evaluate(() => {
+        const p = window.SIM.camera.position;
+        return { x: p.x, y: p.y, z: p.z, state: window.SIM.BOOT.state };
+      });
+      check(name, c.state === 'RUNNING' && c.z < 17.5,
+        `cam=(${c.x.toFixed(1)}, ${c.y.toFixed(1)}, ${c.z.toFixed(1)}), state=${c.state}`);
+    };
+
+    /* in-flight skip state: fade running, timeline frozen, BOOT state
+     * exactly where the fade clock says it is. */
+    const inFlight = () => page.evaluate(() => {
+      const I = window.SIM.INTRO;
+      return {
+        skip: I._skip !== null,
+        playing: I.playing,
+        state: window.SIM.BOOT.state,
+        fade: parseFloat(document.getElementById('introFade').style.opacity),
+      };
+    });
+
+    /* 1. EARLY SKIP (click, corridor, t ≈ 1.5 s) — the START button
+     *    is still hidden, so the click lands on the page (window
+     *    pointerdown) and skips from there. */
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT.state === 'INTRO',
+      { timeout: 20000 },
+    );
+    {
+      /* hidden before 2 s (sampled after the 0.5 s CSS transition
+       * settles at intro start) */
+      await page.waitForFunction(
+        () => window.SIM.INTRO.t > 0.8, { timeout: 10000 });
+      const b = await startBtnState();
+      check('M12.3: START hidden before 2 s (class off, no pointer events, opacity 0)',
+        !b.on && b.pe === 'none' && b.op < 0.05,
+        `on=${b.on}, pe=${b.pe}, op=${b.op.toFixed(2)}`);
+      /* visible-delay boundary: pure function of t (seek ⇒ same-frame)
+       * — hidden at 1.9, on at 2.1 */
+      const b1 = await page.evaluate(() => {
+        window.SIM.INTRO.seek(1.9);
+        return document.getElementById('startBtn').classList.contains('on');
+      });
+      const b2 = await page.evaluate(() => {
+        window.SIM.INTRO.seek(2.1);
+        return document.getElementById('startBtn').classList.contains('on');
+      });
+      check('M12.3: START visible-delay boundary (hidden at t=1.9, on at t=2.1)',
+        b1 === false && b2 === true, `t1.9=${b1}, t2.1=${b2}`);
+      /* back early for the skip itself (real play from the seeked pose) */
+      await page.evaluate(() => window.SIM.INTRO.seek(1.0));
+      await page.waitForFunction(
+        () => window.SIM.INTRO.t > 1.5 && window.SIM.INTRO.t < 2.0,
+        { timeout: 10000 });
+      /* the skip: a plain click on the page (button hidden ⇒ the
+       * pointerdown lands on the window listener) */
+      await page.mouse.click(640, 400);
+      const f = await inFlight();
+      check('M12.3: early skip in flight (click) — fade started, timeline frozen, still INTRO',
+        f.skip && !f.playing && f.state === 'INTRO' && f.fade >= 0 && f.fade < 1,
+        `skip=${f.skip}, playing=${f.playing}, state=${f.state}, fade=${f.fade.toFixed(2)}`);
+      /* the fade actually animates while the intro is still on screen
+       * (headless runs ~10 fps — poll per-frame instead of sampling at
+       * a fixed offset) */
+      const anim = await page.waitForFunction(() => {
+        const I = window.SIM.INTRO;
+        const f = parseFloat(document.getElementById('introFade').style.opacity);
+        return I._skip !== null && !I.playing &&
+          window.SIM.BOOT.state === 'INTRO' && f > 0 && f < 1;
+      }, { timeout: 3000 }).then(() => true).catch(() => false);
+      check('M12.3: early skip fade animates while the intro is still on screen (0 < fade < 1)',
+        anim);
+      /* idempotent: a second trigger (a real START press fires the
+       * window pointerdown AND the button click) must not restart or
+       * double the fade */
+      const same = await page.evaluate(() => {
+        const I = window.SIM.INTRO;
+        const a = I._skip;
+        I.skip();
+        return I._skip === a && I._skip !== null;
+      });
+      check('M12.3: skip is idempotent (second gesture keeps the one fade)', same);
+      /* at the midpoint the PLAY STATE IS LIVE — RUNNING entered while
+       * the fade is still on screen (the intro never blocks play).
+       * Poll per-frame: the fade is 0.5 s ≈ 5 headless frames. */
+      const live = await page.waitForFunction(() => {
+        const I = window.SIM.INTRO;
+        const f = parseFloat(document.getElementById('introFade').style.opacity);
+        return window.SIM.BOOT.state === 'RUNNING' &&
+          I._skip !== null && f > 0 && f < 1;
+      }, { timeout: 3000 }).then(() => true).catch(() => false);
+      check('M12.3: play state live mid-fade (RUNNING entered while the fade is still on screen)',
+        live, `live=${live}`);
+      await page.waitForFunction(
+        () => parseFloat(document.getElementById('introFade').style.opacity) === 0 &&
+          window.SIM.INTRO._skip === null,
+        { timeout: 3000 });
+      const s = await endState();
+      checkEnd('M12.3: early skip ends in the street (fade done, beat FX off)', s);
+      await checkControllable('M12.3: early skip → controllable street camera (W moves forward)');
+    }
+
+    /* 2. LATE INTERRUPT (keypress, beat 5, t ≈ 14.3 s) — the START
+     *    button is visible by then; any keypress skips. */
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT.state === 'INTRO',
+      { timeout: 20000 },
+    );
+    await page.waitForFunction(
+      () => window.SIM.INTRO.t > 14.2 && window.SIM.INTRO.t < 15.05,
+      { timeout: 25000 });
+    {
+      const b = await startBtnState();
+      check('M12.3: START visible after 2 s (late intro: on, clickable, opaque)',
+        b.on && b.pe === 'auto' && b.op > 0.9,
+        `on=${b.on}, pe=${b.pe}, op=${b.op.toFixed(2)}`);
+      /* the interrupt: a keypress (Escape) */
+      await page.keyboard.press('Escape');
+      const f = await inFlight();
+      check('M12.3: late interrupt in flight (keypress) — fade started, timeline frozen, still INTRO',
+        f.skip && !f.playing && f.state === 'INTRO' && f.fade >= 0 && f.fade < 1,
+        `skip=${f.skip}, playing=${f.playing}, state=${f.state}, fade=${f.fade.toFixed(2)}`);
+      /* same live-mid-fade guarantee (per-frame poll, ~10 fps headless) */
+      const live = await page.waitForFunction(() => {
+        const I = window.SIM.INTRO;
+        const f = parseFloat(document.getElementById('introFade').style.opacity);
+        return window.SIM.BOOT.state === 'RUNNING' &&
+          I._skip !== null && f > 0 && f < 1;
+      }, { timeout: 3000 }).then(() => true).catch(() => false);
+      check('M12.3: late interrupt — play state live mid-fade (RUNNING)',
+        live, `live=${live}`);
+      await page.waitForFunction(
+        () => parseFloat(document.getElementById('introFade').style.opacity) === 0 &&
+          window.SIM.INTRO._skip === null,
+        { timeout: 3000 });
+      const s = await endState();
+      checkEnd('M12.3: late interrupt ends in the street (fade done, beat FX off)', s);
+      await checkControllable('M12.3: late interrupt → controllable street camera (W moves forward)');
+    }
+
+    /* 3. FINISH (natural) — the full intro plays to the end: the
+     *    third path to the same controllable street camera. */
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT.state === 'INTRO',
+      { timeout: 20000 });
+    await page.waitForFunction(
+      () => window.SIM.BOOT.state === 'RUNNING',
+      { timeout: 30000 });
+    {
+      const s = await endState();
+      checkEnd('M12.3: natural finish ends in the street (fade done, beat FX off)', s);
+      await checkControllable('M12.3: natural finish → controllable street camera (W moves forward)');
     }
   }
 
