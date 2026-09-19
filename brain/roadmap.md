@@ -2,12 +2,12 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-09-19T02:39:46"
+updated: "2026-09-19T04:02:07"
 ---
 
 # Roadmap
 
-Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status: **M0–M11.1 done and smoke-verified headless** — M11.1 audio master graph + gesture gate + M-key mute ([[m111-audio-master-graph]]); M10.3 awakening reaction ([[m103-awakening-reaction]]); M10.2 holo-sloth hologram + street-only sloth drones ([[m102-holo-sloth-drones]]); M10.1 unsloth monument + UNSLOTH sign ([[m101-sloth-monument]]); M9 awakening sequence ([[m92-wake-state-machine]], [[m94-city-cascade]], [[m95-awakening-decay]], [[m96-wake-triggers]]); M8 atmosphere ([[m81-night-sky]], [[m82-fog-zone-tint]], [[m83-light-shafts]], [[m84-distant-lightning]]); M7 particles + FX ([[m71-parts-particle-system]], [[m72-fx-pulse]], [[m73-fx-arcs]], [[m74-fx-flash]], [[m75-camera-shake]]); M6 traffic/ambient ([[m61-object-pool]], [[m62-traffic-drones]], [[m63-traffic-vehicles]], [[m64-steam-sparks]]); M5 dormant creature ([[entity-system-m5]]).
+Full per-milestone scope/gates live in `PLAN.md` (M0–M14, single-file demo "QWEN FLASH // AWAKENING"). Status: **M0–M11.2 done and smoke-verified headless** — M11.2 looping beds (hum / fans / machinery, deterministic update-driven motion + random low thumps) ([[m112-looping-beds]]); M11.1 audio master graph + gesture gate + M-key mute ([[m111-audio-master-graph]]); M10.3 awakening reaction ([[m103-awakening-reaction]]); M10.2 holo-sloth hologram + street-only sloth drones ([[m102-holo-sloth-drones]]); M10.1 unsloth monument + UNSLOTH sign ([[m101-sloth-monument]]); M9 awakening sequence ([[m92-wake-state-machine]], [[m94-city-cascade]], [[m95-awakening-decay]], [[m96-wake-triggers]]); M8 atmosphere ([[m81-night-sky]], [[m82-fog-zone-tint]], [[m83-light-shafts]], [[m84-distant-lightning]]); M7 particles + FX ([[m71-parts-particle-system]], [[m72-fx-pulse]], [[m73-fx-arcs]], [[m74-fx-flash]], [[m75-camera-shake]]); M6 traffic/ambient ([[m61-object-pool]], [[m62-traffic-drones]], [[m63-traffic-vehicles]], [[m64-steam-sparks]]); M5 dormant creature ([[entity-system-m5]]).
 
 ```mermaid
 gantt
@@ -34,7 +34,8 @@ gantt
   M10.3 easter-egg reaction :done, m103, after m102, 1d
   section Finish
   M11.1 audio master graph + gesture gate :done, m111, after m103, 1d
-  M11.2-11.4 beds, events, mixing :m11, after m111, 2d
+  M11.2 looping beds :done, m112, after m111, 1d
+  M11.3-11.4 event sounds + mixing :m11, after m112, 2d
   M12 intro cinematic :m12, after m11, 2d
   M13 emergent event director :m13, after m12, 3d
   M14 perf, tiers, polish :m14, after m13, 3d

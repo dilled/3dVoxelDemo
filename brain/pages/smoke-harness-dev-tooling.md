@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-19T02:38:36"
+updated: "2026-09-19T04:02:20"
 ---
 
 <!-- compiled_truth -->
@@ -65,3 +65,9 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   summary: "M11.1 extends the harness: new M11.1 section (9 checks, after M10.3) reloads the page for the pre-gesture check (AUDIO.ctx null before START), verifies the master graph via the app-side AUDIO.wired flag (captured from connect() return values) + node constructor names — the headless WebAudio build exposes no inputs/outputs/connections and no DynamicsCompressor global — then M-key mute/unmute by gain value and refresh/re-entry; window.SIM now also exposes AUDIO"
   source: M11.1 implementation
   affects: [smoke-harness-dev-tooling]
+
+- time: 2026-09-19T04:02:20
+  kind: note
+  summary: "WebAudio gotcha (M11.2): AudioParam.value returns the BASE value — connected-input (oscillator LFO) modulation is NOT reflected in .value reads (headless or not). Verify bed motion driven from update() against the exact deterministic formula (tolerances for ≤ ~0.1 s frame/IPC lag); connected-LFO graphs are unobservable via .value and the graph has no inputs/outputs introspection in this build."
+  source: M11.2 verification
+  affects: [smoke-harness-dev-tooling, m112-looping-beds]

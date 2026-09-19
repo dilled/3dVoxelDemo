@@ -686,6 +686,45 @@ const CFG = {
       flashDur: 0.5,           // s — point flash lifetime (flicker)
     },
   },
+
+  /* ---- M11.2: looping beds (all connect to AUDIO.master — M11.1) ----
+   * Three always-on beds that make the city read as "machine city":
+   * reactor hum (2 detuned sines + sub sine, slow swell), fans
+   * (looped filtered noise, band-pass sweep), distant machinery (looped
+   * muffled noise + random low thumps). The swell/sweep are driven
+   * from the central update loop (AUDIO.update) as deterministic
+   * sinusoids. Levels are bed gains on the
+   * master bus (0.8) before the compressor. Looped buffers are long
+   * enough (≥ 4 s) that no repeat is audible; nothing here allocates
+   * per frame (thumps are random events, not per-frame work). */
+  audio: {
+    hum: {
+      gain: 0.22,              // bed level on the master bus
+      f1: 55,                  // Hz — detuned sine 1 (A1)
+      f2: 55.66,               // Hz — detuned sine 2 (slow beat with f1)
+      sub: 27.5,               // Hz — sub sine (A0)
+      subGain: 0.5,            // sub level relative to the hum bed gain
+      lfo: 0.07,               // Hz — slow swell rate on the bed gain
+      lfoDepth: 0.25,          // 0..1 — swell depth
+    },
+    fan: {
+      gain: 0.16,
+      noiseSec: 4,             // s — looped noise buffer (no audible repeat)
+      band: { f: 1310, q: 1.4 },   // band-pass center (sweep midpoint) + Q
+      sweep: { range: [420, 2200], speed: 0.05 },  // Hz — LFO sweep
+    },
+    machine: {
+      gain: 0.10,
+      noiseSec: 6,
+      lowpass: 300,            // Hz — muffled distant machinery
+      thump: {
+        every: [5, 14],        // s between random low thumps
+        f: [34, 62],           // Hz — thump pitch (drops to 55 % over decay)
+        dur: [0.5, 1.1],       // s — thump decay length
+        gain: 1.2,             // thump level relative to the machine bed gain
+      },
+    },
+  },
 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -766,14 +805,24 @@ const BOOT = {
  * suspended (tab hidden/backgrounded) is resumed on the next gesture
  * or visibility; refresh / re-entry just rebuilds this module fresh
  * and hits the same path again.
+ *
+ * M11.2 looping beds (hum / fans / distant machinery) are built at
+ * unlock and connect to `master` — never a second compressor or
+ * destination path. Looped noise buffers + oscillators run forever;
+ * the live parts are all in `update()` (a system in the fixed boot
+ * order): the random low-thump scheduler + the slow deterministic
+ * bed motion (hum swell, fan band-pass sweep).
  * ------------------------------------------------------------------ */
 const AUDIO = {
+  name: 'AUDIO',
   ctx: null,
   master: null,
   comp: null,
   muteGain: null,
   muted: false,
   wired: false,
+  beds: null,                 // M11.2: { hum, fan, machine } sub-graphs
+  _rng: null,
   _gestureWired: false,
 
   unlock() {
@@ -798,10 +847,160 @@ const AUDIO = {
       const c3 = AUDIO.muteGain.connect(AUDIO.ctx.destination);
       AUDIO.wired = c1 === AUDIO.comp && c2 === AUDIO.muteGain &&
         c3 === AUDIO.ctx.destination;
+      AUDIO._startBeds();
     } catch (_) {
       AUDIO.ctx = null;
     }
     AUDIO._wireResume();
+  },
+
+  /* ---- M11.2: looping beds (reactor hum / fans / distant machinery)
+   * Built once at unlock, run forever: looped noise buffers (long
+   * enough that no repeat is audible) + oscillators. Every bed
+   * connects to AUDIO.master (M11.1) — the compressor and the mute
+   * gain are the only choke points, so the M key mutes the beds at
+   * zero cost. A failed bed build never breaks the master graph. */
+  _noise(sec) {
+    const ctx = AUDIO.ctx;
+    const buf = ctx.createBuffer(
+      1, Math.max(1, Math.floor(ctx.sampleRate * sec)), ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    return buf;
+  },
+
+  _startBeds() {
+    if (AUDIO.beds || !AUDIO.ctx) return;
+    const ctx = AUDIO.ctx;
+    const C = CFG.audio;
+    const beds = {};
+    try {
+      /* reactor hum: 2 detuned sines (slow beat) + sub sine, slow LFO
+       * swell on the bed gain. */
+      const hum = {};
+      hum.osc1 = ctx.createOscillator();
+      hum.osc1.type = 'sine';
+      hum.osc1.frequency.value = C.hum.f1;
+      hum.osc2 = ctx.createOscillator();
+      hum.osc2.type = 'sine';
+      hum.osc2.frequency.value = C.hum.f2;
+      hum.sub = ctx.createOscillator();
+      hum.sub.type = 'sine';
+      hum.sub.frequency.value = C.hum.sub;
+      hum.subGain = ctx.createGain();
+      hum.subGain.gain.value = C.hum.subGain;
+      hum.gain = ctx.createGain();
+      hum.gain.gain.value = C.hum.gain;
+      hum.osc1.connect(hum.gain);
+      hum.osc2.connect(hum.gain);
+      hum.sub.connect(hum.subGain);
+      hum.subGain.connect(hum.gain);
+      hum.gain.connect(AUDIO.master);
+      hum.osc1.start();
+      hum.osc2.start();
+      hum.sub.start();
+      /* the slow swell on hum.gain is driven in update() — see below */
+      beds.hum = hum;
+
+      /* fans: looped noise through a band-pass whose center is swept
+       * by a slow LFO (the air of a city of cooling fans). */
+      const fan = {};
+      fan.src = ctx.createBufferSource();
+      fan.src.buffer = AUDIO._noise(C.fan.noiseSec);
+      fan.src.loop = true;
+      fan.filter = ctx.createBiquadFilter();
+      fan.filter.type = 'bandpass';
+      fan.filter.frequency.value = C.fan.band.f;
+      fan.filter.Q.value = C.fan.band.q;
+      fan.gain = ctx.createGain();
+      fan.gain.gain.value = C.fan.gain;
+      fan.src.connect(fan.filter);
+      fan.filter.connect(fan.gain);
+      fan.gain.connect(AUDIO.master);
+      fan.src.start();
+      /* the band-pass sweep is driven in update() — see below */
+      beds.fan = fan;
+
+      /* distant machinery: looped muffled noise + random low thumps
+       * (scheduled in update — the only live part of the beds). */
+      const machine = {};
+      machine.src = ctx.createBufferSource();
+      machine.src.buffer = AUDIO._noise(C.machine.noiseSec);
+      machine.src.loop = true;
+      machine.filter = ctx.createBiquadFilter();
+      machine.filter.type = 'lowpass';
+      machine.filter.frequency.value = C.machine.lowpass;
+      machine.gain = ctx.createGain();
+      machine.gain.gain.value = C.machine.gain;
+      machine.src.connect(machine.filter);
+      machine.filter.connect(machine.gain);
+      machine.gain.connect(AUDIO.master);
+      machine.src.start();
+      machine.thumpCount = 0;
+      machine.nextThumpAt =
+        performance.now() / 1000 +
+        C.machine.thump.every[0] +
+        (AUDIO._rng = mulberry32(0x51A7C3))() *
+        (C.machine.thump.every[1] - C.machine.thump.every[0]);
+      beds.machine = machine;
+
+      AUDIO.beds = beds;
+    } catch (_) {
+      AUDIO.beds = null;      // master graph stays intact
+    }
+  },
+
+  /* One random low thump: sine with a pitch drop + exponential
+   * decay, into the machine bed gain. Fire-and-forget — the
+   * oscillator stops itself and is collected. */
+  _thump() {
+    if (!AUDIO.ctx || !AUDIO.beds) return;
+    const ctx = AUDIO.ctx;
+    const m = AUDIO.beds.machine;
+    const C = CFG.audio.machine.thump;
+    const t0 = ctx.currentTime + 0.01;
+    const f0 = C.f[0] + AUDIO._rng() * (C.f[1] - C.f[0]);
+    const dur = C.dur[0] + AUDIO._rng() * (C.dur[1] - C.dur[0]);
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(f0, t0);
+    osc.frequency.exponentialRampToValueAtTime(f0 * 0.55, t0 + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(C.gain, t0 + 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g);
+    g.connect(m.gain);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.1);
+    m.thumpCount++;
+  },
+
+  /* System update (fixed boot order, after ATMOS / before HUD):
+   * the random low-thump scheduler + the slow bed motion (hum swell,
+   * fan band-pass sweep) — driven from the central loop as
+   * deterministic sinusoids (ground rule: everything animated is
+   * driven by update(dt, t); and — unlike oscillator LFOs wired into
+   * AudioParams — the values are directly observable). Everything
+   * else in the beds is set-and-forget (looped buffers +
+   * oscillators): two param writes + the thump check per frame. */
+  update(dt, t) {
+    if (!AUDIO.ctx || !AUDIO.beds) return;
+    const C = CFG.audio;
+    const beds = AUDIO.beds;
+    beds.hum.gain.gain.value =
+      C.hum.gain * (1 + C.hum.lfoDepth *
+        Math.sin(t * 2 * Math.PI * C.hum.lfo));
+    const s = C.fan.sweep;
+    beds.fan.filter.frequency.value =
+      (s.range[0] + s.range[1]) / 2 +
+      (s.range[1] - s.range[0]) / 2 *
+      Math.sin(t * 2 * Math.PI * s.speed);
+    const m = beds.machine;
+    if (t < m.nextThumpAt) return;
+    AUDIO._thump();
+    const e = C.machine.thump.every;
+    m.nextThumpAt = t + e[0] + AUDIO._rng() * (e[1] - e[0]);
   },
 
   setMuted(on) {
@@ -6414,6 +6613,7 @@ const ATMOS = {
  * M6.2: TRAFFIC   (registered after ENTITY, before HUD)
  * M7.2: FX   (registered after PARTS, before HUD)
  * M8.1: ATMOS   (registered after FX, before HUD)
+ * M11.2: AUDIO  (registered after ATMOS, before HUD — bed thump timer)
  * ------------------------------------------------------------------ */
 const systems = [];
 function registerSystem(sys) {
@@ -6483,6 +6683,7 @@ registerSystem(TRAFFIC);
 registerSystem(PARTS);
 registerSystem(FX);
 registerSystem(ATMOS);
+registerSystem(AUDIO);
 registerSystem(HUD);
 for (const s of systems) if (s.init) s.init();
 /* M10.3: wire the unsloth easter-egg reaction (after all systems init —

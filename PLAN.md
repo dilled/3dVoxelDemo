@@ -74,7 +74,7 @@ smoke-test evidence.
 | **M10.2** ✅ | Relaxed holographic sloth silhouette on the antenna arm (billboard + canvas sprite, additive, slow breathing) + 1–2 slow sloth-themed maintenance drones (bigger, soft pink) patrolling that street only | Holo sloth breathes; pink drones patrol only that street |
 | **M10.3** ✅ | Awakening reaction: sign flares, holograph brightens + one slow stretch, sloth drones rise to hover for the pulse, then resume | Reaction plays during AWAKE, everything returns to idle after DECAY |
 | **M11.1** ✅ | Audio master graph: compressor → user-mute gain → destination; gesture-gated start (START button), resume-safe | Audio starts only after gesture; mute key mutes all; refresh/re-entry safe |
-| **M11.2** | Looping beds: reactor hum (detuned sines + sub + LFO), fans (filtered noise, band-pass sweep), distant machinery (noise + random low thumps) | Beds run indefinitely without audible repeats/bugs; identifiable as "machine city" within 3 s |
+| **M11.2** ✅ | Looping beds: reactor hum (detuned sines + sub + LFO), fans (filtered noise, band-pass sweep), distant machinery (noise + random low thumps) | Beds run indefinitely without audible repeats/bugs; identifiable as "machine city" within 3 s |
 | **M11.3** | Event sounds: pulse thump, arc crackle, steam hiss, drone whir — wired to M6–M9 emitters | Each event in-game produces its sound; all silent when muted; zero cost when idle |
 | **M11.4** | Spatial-ish mixing: one panner + distance gain for 2–3 nearest emitters, rest folded into ambient bed | Walking past an emitter pans/attenuates; cost bounded |
 | **M12.1** | Intro engine: camera-keyframe timeline runner (no async resources) + beat 1 dark server corridor (procedural instanced LED-strip tunnel + dolly) | Corridor beat plays; timeline runner test: start/cancel/seek all clean |
@@ -893,12 +893,54 @@ feels like it belongs to the world, not pasted on.
   work).
 
 #### M11.2 — Looping beds
-- [ ] Reactor hum (2 detuned sines/triangles + sub sine, slow LFO); fans
+- [x] Reactor hum (2 detuned sines/triangles + sub sine, slow LFO); fans
       (filtered noise loop, band-pass sweep); distant machinery (filtered
       noise + random low thumps).
 - **Test:** beds run for minutes without audible repeats/bugs; mix
       identifiable as "machine city" within 3 s.
 - **Commit when:** long-run listen test passes.
+  All three beds are built at unlock and connect to `AUDIO.master`
+  (M11.1 — never a second compressor or destination path), all tunables
+  in `CFG.audio`: **reactor hum** = 2 detuned sines (55 / 55.66 Hz —
+  slow beat) + sub sine (27.5 Hz, `subGain` 0.5) into one bed gain
+  (0.22); **fans** = looped white-noise `AudioBufferSourceNode` (4 s
+  buffer, `loop = true`) through a band-pass BiquadFilter (1310 Hz
+  center, Q 1.4) into a bed gain (0.16); **distant machinery** = looped
+  white-noise buffer (6 s) through a low-pass (300 Hz) into a bed gain
+  (0.10) + **random low thumps** (sine with a pitch drop f → 0.55 f +
+  exponential-decay gain envelope, self-stopping). The slow bed motion —
+  hum-gain swell (0.07 Hz) and the band-pass center sweep (420–2200 Hz,
+  0.05 Hz) — is driven from the central `update(dt, t)` loop as
+  deterministic sinusoids: `AUDIO` is now a system (registered after
+  ATMOS, before HUD), and `AudioParam.value` does NOT reflect
+  connected-input (oscillator-LFO) modulation — it returns the base
+  value — so an oscillator-LFO sweep would be unobservable to the smoke
+  harness (the deterministic formula is exactly checkable); this also
+  matches the ground rule "everything animated is driven by update".
+  The thumps run on a deadline scheduler (`beds.machine.nextThumpAt`,
+  `performance.now()/1000` clock, re-armed into 5–14 s by a seeded
+  `mulberry32`, `thumpCount` counter) — fire-and-forget, the only
+  allocation in the beds, and a random event rather than per-frame work.
+  Looped buffers are ≥ 4 s ⇒ no audible repeat; oscillators + looped
+  buffers run indefinitely. Smoke M11.2 section (11 checks, after
+  M11.1, page already RUNNING): node types (OscillatorNode ×3 /
+  AudioBufferSourceNode ×2 / BiquadFilterNode ×2), hum frequencies
+  exactly from CFG, hum swell + band-pass sweep checked against the
+  EXACT deterministic formula at 0 s and 5 s (tolerances for ≤ ~0.1 s
+  frame/IPC lag: 0.01 gain / 40 Hz), fan/machine `loop === true` +
+  buffer ≥ 3 s + filter types, forced thump (`nextThumpAt = now`
+  in-page → `thumpCount +1`, deadline re-armed into [5, 14] s), long-run
+  window (ctx `running`, bed gains intact, zero page errors), heap flat
+  (min-of-3, ≤ 2 MB), M-key mute → muteGain 0 with bed gains untouched.
+  The "machine city within 3 s" gate is qualitative — the smoke proxy
+  is all three beds live at once, each with its own spectral element
+  (sub-60 Hz detuned hum / band-passed air / muffled rumble + low
+  thumps), running error-free over the long window. Full suite ALL
+  PASS (299/0) in 2 consecutive runs; the "systems registered in fixed
+  order" check now expects `… ATMOS, AUDIO, HUD`. M11.3 seam: event
+  sounds connect to `AUDIO.master` too; `AUDIO.beds.{hum,fan,machine}.gain`
+  are the gain scaling points ("hum settles" at DECAY/DORMANT — M9.5
+  hooks — and M14.1 tiers).
 
 #### M11.3 — Event sounds
 - [ ] Pulse thump (sine drop + noise hit), arc crackle (short filtered-

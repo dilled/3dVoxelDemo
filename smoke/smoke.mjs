@@ -487,13 +487,13 @@ try {
 
   /* ---- 6a. Fixed-order systems registry (M5 adds ENTITY after WORLD,
    * M7.1 adds PARTS after TRAFFIC, M7.2 adds FX after PARTS, M8.1
-   * adds ATMOS after FX) ---- */
+   * adds ATMOS after FX, M11.2 adds AUDIO after ATMOS) ---- */
   {
     const names = await page.evaluate(() => window.SIM.systems.map(s => s.name));
     check('systems registered in fixed order',
       JSON.stringify(names) === JSON.stringify(
         ['INPUT', 'CAMERA', 'KIT', 'WORLD', 'ENTITY', 'TRAFFIC',
-         'PARTS', 'FX', 'ATMOS', 'HUD']),
+         'PARTS', 'FX', 'ATMOS', 'AUDIO', 'HUD']),
       names.join(', '));
   }
 
@@ -8103,6 +8103,181 @@ try {
       window.SIM.ATMOS._ltTimer = 1e9;
       window.SIM.ENTITY._autoAt = Infinity;
     });
+  }
+
+  /* ------------------------------------------------------------------ *
+   * M11.2 — Looping beds (reactor hum / fans / distant machinery)
+   *
+   *  All beds are built at unlock and connect to AUDIO.master
+   *  (M11.1): reactor hum (2 detuned sines + sub sine, slow LFO),
+   *  fans (looped noise through a band-pass with a slow LFO sweep),
+   *  distant machinery (looped muffled noise + random low thumps
+   *  scheduled in AUDIO.update). Looped buffers are ≥ 4 s ⇒ no
+   *  audible repeat; nothing allocates per frame. The hum swell and
+   *  the band-pass sweep are driven from the central update loop as
+   *  deterministic sinusoids, so they are checked against the exact
+   *  formula (AudioParam.value would not reflect oscillator-LFO
+   *  inputs either way). The "machine city within 3 s" gate is
+   *  qualitative — the proxy here is all three beds live at once,
+   *  each with its own spectral element, running error-free over a
+   *  long window with the mute untouched.
+   * ------------------------------------------------------------------ */
+  {
+    const bedsState = () => page.evaluate(() => {
+      const A = window.SIM.AUDIO;
+      const B = A && A.beds;
+      if (!B) return { beds: false };
+      const C = window.SIM.CFG.audio;
+      const ctor = n => (n && n.constructor) ? n.constructor.name : '';
+      return {
+        beds: true,
+        ctxState: A.ctx.state,
+        types:
+          ctor(B.hum.osc1) === 'OscillatorNode' &&
+          ctor(B.hum.osc2) === 'OscillatorNode' &&
+          ctor(B.hum.sub) === 'OscillatorNode' &&
+          ctor(B.fan.src) === 'AudioBufferSourceNode' &&
+          ctor(B.fan.filter) === 'BiquadFilterNode' &&
+          ctor(B.machine.src) === 'AudioBufferSourceNode' &&
+          ctor(B.machine.filter) === 'BiquadFilterNode',
+        humF: [
+          B.hum.osc1.frequency.value,
+          B.hum.osc2.frequency.value,
+          B.hum.sub.frequency.value,
+        ],
+        humGain: B.hum.gain.gain.value,
+        fanLoop: B.fan.src.loop,
+        fanBuf: B.fan.src.buffer.duration,
+        fanType: B.fan.filter.type,
+        fanFreq: B.fan.filter.frequency.value,
+        machLoop: B.machine.src.loop,
+        machBuf: B.machine.src.buffer.duration,
+        machType: B.machine.filter.type,
+        machGain: B.machine.gain.gain.value,
+        thumpCount: B.machine.thumpCount,
+        nextThumpAt: B.machine.nextThumpAt,
+        now: performance.now() / 1000,
+        cfg: {
+          f1: C.hum.f1, f2: C.hum.f2, sub: C.hum.sub,
+          humGain: C.hum.gain, humDepth: C.hum.lfoDepth,
+          humLfo: C.hum.lfo,
+          machGain: C.machine.gain,
+          sweep: C.fan.sweep,   // { range: [min, max], speed }
+          every: C.machine.thump.every,
+        },
+      };
+    });
+    /* The swell/sweep are deterministic sinusoids of the central-loop
+     * clock — check the live values against the exact formula (the
+     * tolerances cover ≤ ~0.1 s of frame/IPC lag). */
+    const humExpected = b => b.cfg.humGain * (1 + b.cfg.humDepth *
+      Math.sin(b.now * 2 * Math.PI * b.cfg.humLfo));
+    const fanExpected = b =>
+      (b.cfg.sweep.range[0] + b.cfg.sweep.range[1]) / 2 +
+      (b.cfg.sweep.range[1] - b.cfg.sweep.range[0]) / 2 *
+      Math.sin(b.now * 2 * Math.PI * b.cfg.sweep.speed);
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 250));
+      }
+      return m === Infinity ? -1 : m;
+    });
+
+    /* 1. beds built after the gesture (page already RUNNING from
+     *    M11.1's re-entry) */
+    const b0 = await bedsState();
+    check('M11.2: beds built after the gesture (hum/fan/machine node types)',
+      b0.beds && b0.types, `beds=${b0.beds}, types=${b0.types}`);
+
+    if (b0.beds) {
+      /* 2. reactor hum: 2 detuned sines + sub, slow swell live */
+      const [f1, f2, fs] = b0.humF;
+      check('M11.2: reactor hum = 2 detuned sines + sub sine',
+        Math.abs(f1 - b0.cfg.f1) < 1e-6 &&
+        Math.abs(f2 - b0.cfg.f2) < 1e-6 &&
+        Math.abs(fs - b0.cfg.sub) < 1e-6,
+        `f1=${f1}, f2=${f2}, sub=${fs}`);
+      check('M11.2: hum swell is live (gain tracks the deterministic formula)',
+        Math.abs(b0.humGain - humExpected(b0)) < 0.01,
+        `gain=${b0.humGain}, want=${humExpected(b0).toFixed(4)}`);
+
+      /* 3. fans: looped noise through a band-pass inside the sweep */
+      check('M11.2: fans = looped noise through a band-pass',
+        b0.fanLoop === true && b0.fanBuf >= 3 && b0.fanType === 'bandpass',
+        `loop=${b0.fanLoop}, buf=${b0.fanBuf}s, type=${b0.fanType}`);
+      check('M11.2: band-pass sweep is live (center tracks the formula)',
+        Math.abs(b0.fanFreq - fanExpected(b0)) < 40 &&
+        b0.fanFreq >= b0.cfg.sweep.range[0] &&
+        b0.fanFreq <= b0.cfg.sweep.range[1],
+        `freq=${b0.fanFreq}, want=${fanExpected(b0).toFixed(1)}, ` +
+        `range=${b0.cfg.sweep.range}`);
+
+      /* 4. distant machinery: looped noise through a low-pass */
+      check('M11.2: machinery = looped noise through a low-pass',
+        b0.machLoop === true && b0.machBuf >= 3 &&
+        b0.machType === 'lowpass',
+        `loop=${b0.machLoop}, buf=${b0.machBuf}s, type=${b0.machType}`);
+
+      /* 5. the sweep keeps moving (re-check the formula 5 s later —
+       * the phase advanced a quarter period) */
+      await sleep(5000);
+      const b1 = await bedsState();
+      check('M11.2: band-pass sweep still tracks the formula after 5 s',
+        Math.abs(b1.fanFreq - fanExpected(b1)) < 40 &&
+        Math.abs(b1.humGain - humExpected(b1)) < 0.01,
+        `freq=${b1.fanFreq}, want=${fanExpected(b1).toFixed(1)}, ` +
+        `humGain=${b1.humGain}, want=${humExpected(b1).toFixed(4)}`);
+
+      /* 6. random low thump: force one now — count +1 and the
+       *    deadline re-armed into [5, 14] s */
+      await page.evaluate(() => {
+        const A = window.SIM.AUDIO;
+        A.beds.machine.nextThumpAt = performance.now() / 1000 - 0.01;
+      });
+      await sleep(600);
+      const b2 = await bedsState();
+      check('M11.2: low thump fires and re-arms the random deadline',
+        b2.thumpCount >= b1.thumpCount + 1 &&
+        b2.nextThumpAt > b2.now + b2.cfg.every[0] - 1 &&
+        b2.nextThumpAt < b2.now + b2.cfg.every[1] + 1,
+        `count=${b2.thumpCount} (was ${b1.thumpCount}), ` +
+        `next=${(b2.nextThumpAt - b2.now).toFixed(1)}s`);
+
+      /* 7. long-run: all beds still live, gains intact, no errors,
+       *    heap flat (min-of-3 churn, same bound as the other sections) */
+      const heapBefore = await heapMin();
+      await sleep(8000);
+      const b3 = await bedsState();
+      const heapAfter = await heapMin();
+      const humLo = b3.cfg.humGain * (1 - b3.cfg.humDepth);
+      const humHi = b3.cfg.humGain * (1 + b3.cfg.humDepth);
+      check('M11.2: beds run indefinitely (ctx running, gains intact, no errors)',
+        b3.ctxState === 'running' &&
+        b3.humGain > humLo && b3.humGain < humHi &&
+        Math.abs(b3.machGain - b3.cfg.machGain) < 1e-6 &&
+        pageErrors.length === 0,
+        `state=${b3.ctxState}, humGain=${b3.humGain}, machGain=${b3.machGain}, ` +
+        `pageErrors=${pageErrors.length}`);
+      check('M11.2: heap flat across the long-run window',
+        heapBefore > 0 && heapAfter - heapBefore <= 2 * 1024 * 1024,
+        `Δ=${((heapAfter - heapBefore) / 1048576).toFixed(2)} MB`);
+
+      /* 8. the M key mutes the beds (mute gain → 0) without touching
+       *    them — then unmutes */
+      await page.keyboard.press('KeyM');
+      await sleep(300);
+      const b4 = await bedsState();
+      const muteGain = await page.evaluate(
+        () => window.SIM.AUDIO.muteGain.gain.value);
+      check('M11.2: M key mutes the beds (mute gain → 0, bed gains untouched)',
+        muteGain < 0.01 && Math.abs(b4.machGain - b3.machGain) < 1e-6,
+        `mute=${muteGain}, machGain=${b4.machGain}`);
+      await page.keyboard.press('KeyM');
+      await sleep(300);
+    }
   }
 
   /* ---- 10. No errors anywhere ---- */
