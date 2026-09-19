@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [events, scheduler, m13]
 created: "2026-09-19T15:16:24"
-updated: "2026-09-19T20:13:44"
+updated: "2026-09-19T23:38:21"
 ---
 
 <!-- compiled_truth -->
@@ -31,10 +31,11 @@ updated: "2026-09-19T20:13:44"
 - **One at a time, strict priority preemption**: a higher-priority event that becomes ready immediately preempts the running one; the victim's `end(a, interrupted=true)` fires, its log entry is marked `interrupted: true`, and the new event's `start` equals the victim's `end` exactly.
 - Seeded RNG (mulberry32, same seed as WORLD) ⇒ deterministic firing order for a forced seed.
 - `trigger()` ignores readiness/cooldowns but still obeys one-at-a-time + priority.
+- **Creature/ambient compatibility gate** (added in M13.4, [[m134-ambient-events-c]]): while `ENTITY.state !== 'DORMANT'` only creature-priority (priority > 0) events may start; running events continue; DORMANT restores ambient firing.
 
 ## Status
 
-M13.1 is scheduler-only. The ambient events are registered by M13.2 ([[m132-ambient-events-a]] — data-pulse, power-cycle) and M13.3 ([[m133-ambient-events-b]] — cooling-emergency, drone-launch), so the scheduler now carries all four; M13.4 remains. Each follows the same pattern: register on init, verify with the same harness pattern.
+M13.1 is scheduler-only. All six ambient events are registered by the M13.x pages — M13.2 ([[m132-ambient-events-a]] — data-pulse, power-cycle), M13.3 ([[m133-ambient-events-b]] — cooling-emergency, drone-launch), M13.4 ([[m134-ambient-events-c]] — mech-reposition, em-discharge) — so the M13.1–M13.4 ambient-event set is complete. Each follows the same pattern: register idempotently from `EVENTS.registerAmbient()` on init, verify with the same harness pattern.
 
 
 ## Timeline
@@ -60,5 +61,11 @@ M13.1 is scheduler-only. The ambient events are registered by M13.2 ([[m132-ambi
 - time: 2026-09-19T20:13:44
   kind: decision
   summary: "M13.3 done: scheduler now carries all four ambient events (M13.2 A-pair + M13.3 B-pair); M13.4 remains"
+  source: brain update-truth
+  affects: [m131-events-scheduler-core]
+
+- time: 2026-09-19T23:38:21
+  kind: decision
+  summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
   affects: [m131-events-scheduler-core]
