@@ -76,7 +76,7 @@ smoke-test evidence.
 | **M11.1** ✅ | Audio master graph: compressor → user-mute gain → destination; gesture-gated start (START button), resume-safe | Audio starts only after gesture; mute key mutes all; refresh/re-entry safe |
 | **M11.2** ✅ | Looping beds: reactor hum (detuned sines + sub + LFO), fans (filtered noise, band-pass sweep), distant machinery (noise + random low thumps) | Beds run indefinitely without audible repeats/bugs; identifiable as "machine city" within 3 s |
 | **M11.3** ✅ | Event sounds: pulse thump, arc crackle, steam hiss, drone whir — wired to M6–M9 emitters | Each event in-game produces its sound; all silent when muted; zero cost when idle |
-| **M11.4** | Spatial-ish mixing: one panner + distance gain for 2–3 nearest emitters, rest folded into ambient bed | Walking past an emitter pans/attenuates; cost bounded |
+| **M11.4** ✅ | Spatial-ish mixing: one panner + distance gain for 2–3 nearest emitters, rest folded into ambient bed | Walking past an emitter pans/attenuates; cost bounded |
 | **M12.1** | Intro engine: camera-keyframe timeline runner (no async resources) + beat 1 dark server corridor (procedural instanced LED-strip tunnel + dolly) | Corridor beat plays; timeline runner test: start/cancel/seek all clean |
 | **M12.2** | Intro beats 2–5: corridor opens → wide reveal dolly over city → 1.5-orbit low orbit of dormant creature → `QWEN FLASH // AWAKENING` title card (DOM, fades) → lerp to street-level player position | Full ~12–15 s intro ends in controllable street-level camera |
 | **M12.3** | Intro robustness: skippable/cancellable at any point (START/click/keypress) → 0.5 s fade to street camera; START visible after 2 s; intro never blocks play state | Finish / early-skip / late-interrupt all end in controllable camera, zero console errors |
@@ -1000,11 +1000,58 @@ feels like it belongs to the world, not pasted on.
   `CFG.audio.events` levels.
 
 #### M11.4 — Spatial-ish mixing
-- [ ] One panner + distance gain for the 2–3 nearest emitters;
+- [x] One panner + distance gain for the 2–3 nearest emitters;
       everything else folded into the ambient bed.
 - **Test:** walking past an emitter pans/attenuates it; cost stays
       bounded in stats.
 - **Commit when:** spatial behavior verified.
+  A fixed pool of 3 channels, each = GainNode (distance gain, set at
+  fire time) → PannerNode (`panningModel 'equalpower'`,
+  `distanceModel 'none'`) → `AUDIO.master` (M11.1 choke point ⇒ M-key
+  mutes spatial events at zero cost): only the 2–3 NEAREST emitters
+  are spatially processed, everything the pool cannot hold folds into
+  the ambient master (no spatial treatment) — `AUDIO.spatialFolded`
+  counts folds, all tunables in `CFG.audio.spatial = { channels: 3,
+  refDistance: 6, rolloff: 1.0, minGain: 0.02, settle: 0.3 }`.
+  Routing (`AUDIO._spatialSink(type, x, y, z, dur)`): free channel,
+  else steal the farthest-held one when the new emitter is nearer
+  (the pool always keeps the nearest emitters spatial), else fold.
+  Distance gain = Web Audio inverse model, floored:
+  `d ≤ ref ? 1 : max(minGain, ref / (ref + rolloff·(d − ref)))`
+  from `CAMERA.pos`; the one-shot's own gain (M11.3 levels) connects
+  to the channel gain instead of master (`_evGain(type, level, node)`),
+  `eventsWired[type]` set on the spatial path too so the M11.3 wired
+  check stays valid. Call sites pass the emitter position:
+  `FX.pulse` → `origin`, `FX.arc` → midpoint(a,b),
+  `PARTS._spawnSteam` → tower top `{src.x, src.hTop, src.z}`,
+  `TRAFFIC._spawn` → drone `{px,py,pz}`. Listener drive (the only
+  per-frame cost): `AUDIO.update` writes listener position + forward +
+  up from `CAMERA.pos`/`yaw`/`pitch` (forward =
+  `(−sin·cos, sin, −cos·cos)`, up = (0,1,0)) and releases channels
+  whose hold (`dur + settle`) expired — 9 param writes + 3
+  comparisons/frame; channels are reused so a spatial fire allocates
+  only the one-shot itself; no `createPanner` ⇒ `AUDIO.spatial` stays
+  null and every fire folds. Durable gotchas: AudioParam values are
+  float32 (read-back Δ≈1e-8 ⇒ smoke tolerance ≥1e-6), PannerNode
+  internal attenuation is unobservable headless ⇒ attenuation lives in
+  the explicit channel GainNode (directly readable), modern
+  `positionX/Y/Z` + `ctx.listener` API with legacy `setPosition` /
+  `setOrientation` fallback. Smoke M11.4 section (7 checks, after
+  M11.3, page already RUNNING): pool exists (3× PannerNode,
+  equalpower, wired flag from `connect()` return); listener tracks the
+  camera (teleport → read back); walking past an emitter attenuates it
+  (teleport −25/0/+25 past an emitter at origin → gain profile
+  0.237→1.000→0.237 vs the exact inverse formula); channel panner sits
+  at the emitter + channel gain IS the distance gain; 4 simultaneous
+  equidistant fires ⇒ exactly 1 fold; spatial fires mute at the choke
+  point (counters move, muteGain 0); bounded cost (heap flat 5 s while
+  the listener drives, no errors). Full suite 3 runs: M11.4 7/7 in all
+  3; M11.1–M11.3 sections green; zero page/console errors every run;
+  the only failures are the documented pre-existing headless flakes
+  (M7.5 shake `energy=1.18` exact baseline, M7.3 bolt cadence,
+  M11.2-class heap Δ~2 MB, M6.2 dock / M6.4 spark / M9.4
+  wave-brightness observation windows). Seams: M14.1 tiers can scale
+  `CFG.audio.spatial.channels` / bed + event levels.
 
 **Phase done-when:** muting audio costs nothing; mix identifiable as
 "machine city" within 3 seconds.

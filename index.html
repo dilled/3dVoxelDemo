@@ -760,6 +760,21 @@ const CFG = {
         q: 1.2,
       },
     },
+
+    /* ---- M11.4: spatial-ish mixing — a small pool of panner +
+     * distance-gain channels for the few NEAREST emitters; everything
+     * the pool cannot hold folds into the ambient master (no spatial
+     * treatment). The listener is driven from CAMERA every frame
+     * (position + look direction) — the only per-frame cost; each
+     * channel holds its panner for reuse, so a fire allocates only
+     * the one-shot itself. */
+    spatial: {
+      channels: 3,           // spatially-processed emitters (2–3)
+      refDistance: 6,        // m — full level inside this radius
+      rolloff: 1.0,          // inverse-model decay beyond refDistance
+      minGain: 0.02,         // floor — distant emitters never vanish
+      settle: 0.3,           // s — channel held a bit past its one-shot
+    },
   },
 };
 
@@ -865,6 +880,11 @@ const AUDIO = {
   events: { pulse: 0, arc: 0, steam: 0, drone: 0 },  // M11.3 fire counters
   eventsWired: { pulse: false, arc: false, steam: false, drone: false },
   _evNoise: null,             // M11.3: shared short noise buffer (one-shots)
+  spatial: null,              // M11.4: channel pool (null = no panner here)
+  spatialWired: false,        // M11.4: channel output → AUDIO.master
+  spatialFolded: 0,           // M11.4: fires folded into the ambient master
+  spatialLast: null,          // M11.4: last spatial assignment (smoke seam)
+  _listener: null,            // M11.4: ctx.listener (pos/forward driven)
   _rng: null,
   _gestureWired: false,
 
@@ -896,10 +916,105 @@ const AUDIO = {
        * buffer, looped where needed, so an event allocates only its
        * self-stopping one-shot nodes. */
       AUDIO._evNoise = AUDIO._noise(2);
+      AUDIO._startSpatial();
     } catch (_) {
       AUDIO.ctx = null;
     }
     AUDIO._wireResume();
+  },
+
+  /* ---- M11.4: spatial-ish mixing — a small pool of panner +
+   * distance-gain channels for the few nearest emitters. Each channel
+   * = a GainNode (distance gain, set at fire time) → a PannerNode
+   * (equalpower panning; distanceModel 'none' because the explicit
+   * distance gain does the attenuation — its value is directly
+   * observable, unlike PannerNode-internal attenuation). Channel
+   * output → AUDIO.master (M11.1 choke point ⇒ the M key mutes
+   * spatial events too). The listener (position + look direction)
+   * is driven from CAMERA in update() — the only per-frame cost;
+   * channels are reused, so a spatial fire allocates only the
+   * one-shot itself. No PannerNode support ⇒ spatial stays null and
+   * every fire folds into the ambient master. */
+  _startSpatial() {
+    if (AUDIO.spatial || !AUDIO.ctx) return;
+    const ctx = AUDIO.ctx;
+    if (typeof ctx.createPanner !== 'function') return;
+    AUDIO._listener = ctx.listener || null;
+    const C = CFG.audio.spatial;
+    const chs = [];
+    try {
+      for (let i = 0; i < C.channels; i++) {
+        const panner = ctx.createPanner();
+        panner.panningModel = 'equalpower';
+        panner.distanceModel = 'none';      // gain node does attenuation
+        const g = ctx.createGain();
+        g.gain.value = 1;
+        g.connect(panner);
+        if (panner.connect(AUDIO.master) === AUDIO.master) {
+          AUDIO.spatialWired = true;
+        }
+        chs.push({ g, panner, free: true, x: 0, y: 0, z: 0, d: 0, until: 0 });
+      }
+      AUDIO.spatial = chs;
+    } catch (_) {
+      AUDIO.spatial = null;                 // master graph stays intact
+    }
+  },
+
+  /* Position helper — modern AudioParams, legacy fallback. */
+  _setPos(node, x, y, z) {
+    if (node.positionX) {
+      node.positionX.value = x;
+      node.positionY.value = y;
+      node.positionZ.value = z;
+    } else if (node.setPosition) {
+      node.setPosition(x, y, z);
+    }
+  },
+
+  /* Route the next one-shot: pick a free channel (or steal the
+   * farthest-held one when the new emitter is nearer — the pool
+   * always keeps the 2–3 NEAREST emitters spatial); if the pool
+   * cannot take it, fold into the ambient master (no spatial
+   * treatment). Returns the channel gain node, or null = master. */
+  _spatialSink(type, x, y, z, dur) {
+    if (!AUDIO.spatial) { AUDIO.spatialFolded++; return null; }
+    const C = CFG.audio.spatial;
+    const P = CAMERA.pos;
+    const dx = x - P.x, dy = y - P.y, dz = z - P.z;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    let ch = null;
+    for (let i = 0; i < AUDIO.spatial.length; i++) {
+      if (AUDIO.spatial[i].free) { ch = AUDIO.spatial[i]; break; }
+    }
+    if (!ch) {
+      let worst = null, worstD = -1;
+      for (let i = 0; i < AUDIO.spatial.length; i++) {
+        const c = AUDIO.spatial[i];
+        if (c.d > worstD) { worstD = c.d; worst = c; }
+      }
+      if (d >= worstD) { AUDIO.spatialFolded++; return null; }
+      ch = worst;
+    }
+    /* distance gain — Web Audio inverse model, floored: full level
+     * inside refDistance, then ref / (ref + rolloff · (d − ref)). */
+    const dg = d <= C.refDistance
+      ? 1
+      : Math.max(C.minGain,
+        C.refDistance / (C.refDistance + C.rolloff * (d - C.refDistance)));
+    ch.free = false;
+    ch.x = x; ch.y = y; ch.z = z; ch.d = d;
+    ch.until = performance.now() / 1000 + dur + C.settle;
+    ch.g.gain.value = dg;
+    AUDIO._setPos(ch.panner, x, y, z);
+    /* the channel output reaches master ⇒ this type IS wired */
+    AUDIO.eventsWired[type] = true;
+    let idx = 0;
+    for (let i = 0; i < AUDIO.spatial.length; i++) {
+      if (AUDIO.spatial[i] === ch) { idx = i; break; }
+    }
+    AUDIO.spatialLast = { type, x, y, z, d, gain: dg, ch: idx };
+    return ch.g;
   },
 
   /* ---- M11.2: looping beds (reactor hum / fans / distant machinery)
@@ -1029,15 +1144,51 @@ const AUDIO = {
   },
 
   /* System update (fixed boot order, after ATMOS / before HUD):
-   * the random low-thump scheduler + the slow bed motion (hum swell,
-   * fan band-pass sweep) — driven from the central loop as
-   * deterministic sinusoids (ground rule: everything animated is
-   * driven by update(dt, t); and — unlike oscillator LFOs wired into
-   * AudioParams — the values are directly observable). Everything
-   * else in the beds is set-and-forget (looped buffers +
-   * oscillators): two param writes + the thump check per frame. */
+   * the M11.4 listener drive + channel expiry, the random low-thump
+   * scheduler + the slow bed motion (hum swell, fan band-pass sweep)
+   * — driven from the central loop as deterministic sinusoids
+   * (ground rule: everything animated is driven by update(dt, t);
+   * and — unlike oscillator LFOs wired into AudioParams — the values
+   * are directly observable). Everything else in the beds is
+   * set-and-forget (looped buffers + oscillators): a handful of
+   * param writes + the thump check per frame (bounded). */
   update(dt, t) {
-    if (!AUDIO.ctx || !AUDIO.beds) return;
+    if (!AUDIO.ctx) return;
+    /* M11.4: drive the listener from CAMERA — position + look
+     * direction (the panner pans against this) — and release expired
+     * channels. This is the whole per-frame cost of the spatial
+     * pool: 9 param writes + 3 comparisons. */
+    if (AUDIO._listener) {
+      const L = AUDIO._listener;
+      const P = CAMERA.pos;
+      const cp = Math.cos(CAMERA.pitch), sp = Math.sin(CAMERA.pitch);
+      const sy = Math.sin(CAMERA.yaw), cy = Math.cos(CAMERA.yaw);
+      /* free-fly forward from yaw/pitch (same convention as
+       * CAMERA.update: yaw=0 ⇒ −Z, pitch up ⇒ +Y) */
+      const fx = -sy * cp, fy = sp, fz = -cy * cp;
+      if (L.positionX) {
+        L.positionX.value = P.x;
+        L.positionY.value = P.y;
+        L.positionZ.value = P.z;
+        L.forwardX.value = fx;
+        L.forwardY.value = fy;
+        L.forwardZ.value = fz;
+        L.upX.value = 0;
+        L.upY.value = 1;
+        L.upZ.value = 0;
+      } else if (L.setPosition) {
+        L.setPosition(P.x, P.y, P.z);
+        L.setOrientation(fx, fy, fz, 0, 1, 0);
+      }
+    }
+    if (AUDIO.spatial) {
+      const now = performance.now() / 1000;
+      for (let i = 0; i < AUDIO.spatial.length; i++) {
+        const c = AUDIO.spatial[i];
+        if (!c.free && now > c.until) c.free = true;
+      }
+    }
+    if (!AUDIO.beds) return;
     const C = CFG.audio;
     const beds = AUDIO.beds;
     beds.hum.gain.gain.value =
@@ -1064,22 +1215,30 @@ const AUDIO = {
    * own sources and is collected. eventsWired is captured from
    * connect() return values (the headless smoke build exposes no
    * graph introspection); the counters serve the smoke harness. */
-  _evGain(type, level) {
+  _evGain(type, level, node) {
     const ctx = AUDIO.ctx;
     const g = ctx.createGain();
     g.gain.value = level;
-    if (g.connect(AUDIO.master) === AUDIO.master) AUDIO.eventsWired[type] = true;
+    const to = node || AUDIO.master;     // channel gain (M11.4) or master
+    if (to === AUDIO.master && g.connect(AUDIO.master) === AUDIO.master) {
+      AUDIO.eventsWired[type] = true;
+    } else {
+      g.connect(to);
+    }
     return g;
   },
 
   /* pulse thump: sine pitch drop + short low-passed noise hit
-   * (FX.pulse — the M7.2 seam). */
-  pulseThump() {
+   * (FX.pulse — the M7.2 seam). pos: emitter {x,y,z} — routed through
+   * the M11.4 spatial pool (panner + distance gain) or folded into
+   * the ambient master. */
+  pulseThump(pos) {
     if (!AUDIO.ctx) return;
     const ctx = AUDIO.ctx;
     const C = CFG.audio.events.pulse;
     const t0 = ctx.currentTime + 0.01;
-    const g = AUDIO._evGain('pulse', C.gain);
+    const sink = pos ? AUDIO._spatialSink('pulse', pos.x, pos.y, pos.z, C.dur) : null;
+    const g = AUDIO._evGain('pulse', C.gain, sink);
     const osc = ctx.createOscillator();
     osc.type = 'sine';
     osc.frequency.setValueAtTime(C.f[0], t0);
@@ -1115,13 +1274,14 @@ const AUDIO = {
   },
 
   /* arc crackle: a few sharp band-passed noise bursts (FX.arc — the
-   * M7.3 seam). */
-  arcCrackle() {
+   * M7.3 seam). pos: emitter {x,y,z} (see pulseThump). */
+  arcCrackle(pos) {
     if (!AUDIO.ctx) return;
     const ctx = AUDIO.ctx;
     const C = CFG.audio.events.arc;
     const t0 = ctx.currentTime + 0.01;
-    const g = AUDIO._evGain('arc', C.gain);
+    const sink = pos ? AUDIO._spatialSink('arc', pos.x, pos.y, pos.z, C.dur) : null;
+    const g = AUDIO._evGain('arc', C.gain, sink);
     const src = ctx.createBufferSource();
     src.buffer = AUDIO._evNoise;
     src.loop = true;
@@ -1148,13 +1308,15 @@ const AUDIO = {
   },
 
   /* steam hiss: band-passed noise, fast attack, long decay
-   * (PARTS._spawnSteam — one per puff). */
-  steamHiss() {
+   * (PARTS._spawnSteam — one per puff). pos: emitter {x,y,z}
+   * (see pulseThump). */
+  steamHiss(pos) {
     if (!AUDIO.ctx) return;
     const ctx = AUDIO.ctx;
     const C = CFG.audio.events.steam;
     const t0 = ctx.currentTime + 0.01;
-    const g = AUDIO._evGain('steam', C.gain);
+    const sink = pos ? AUDIO._spatialSink('steam', pos.x, pos.y, pos.z, C.dur) : null;
+    const g = AUDIO._evGain('steam', C.gain, sink);
     const src = ctx.createBufferSource();
     src.buffer = AUDIO._evNoise;
     src.loop = true;
@@ -1177,13 +1339,15 @@ const AUDIO = {
   },
 
   /* drone whir: band-passed noise with a rising center sweep (rotor
-   * spin-up) — TRAFFIC._spawn, one per drone launch. */
-  droneWhir() {
+   * spin-up) — TRAFFIC._spawn, one per drone launch. pos: emitter
+   * {x,y,z} (see pulseThump). */
+  droneWhir(pos) {
     if (!AUDIO.ctx) return;
     const ctx = AUDIO.ctx;
     const C = CFG.audio.events.drone;
     const t0 = ctx.currentTime + 0.01;
-    const g = AUDIO._evGain('drone', C.gain);
+    const sink = pos ? AUDIO._spatialSink('drone', pos.x, pos.y, pos.z, C.dur) : null;
+    const g = AUDIO._evGain('drone', C.gain, sink);
     const src = ctx.createBufferSource();
     src.buffer = AUDIO._evNoise;
     src.loop = true;
@@ -4004,7 +4168,8 @@ const TRAFFIC = {
     TRAFFIC._live[TRAFFIC.count++] = it;
     TRAFFIC._plan(it);
     TRAFFIC.mesh.setColorAt(TRAFFIC.count - 1, it.tint);
-    AUDIO.droneWhir();               // M11.3: whir (→ AUDIO.master)
+    AUDIO.droneWhir(               // M11.3: whir (M11.4: spatial pool)
+      { x: it.px, y: it.py, z: it.pz });
   },
 
   _releaseAt(i) {
@@ -4712,7 +4877,8 @@ const PARTS = {
     const b = 0.85 + r() * 0.3;
     it.cR = 0.62 * b; it.cG = 0.72 * b; it.cB = 0.82 * b;
     PARTS._sLive[PARTS.scount++] = it;
-    AUDIO.steamHiss();               // M11.3: hiss (→ AUDIO.master)
+    AUDIO.steamHiss(               // M11.3: hiss (M11.4: spatial pool)
+      { x: src.x, y: src.hTop, z: src.z });
   },
 
   /* spawn one spark at a substation roof (brief ballistic life) */
@@ -4941,7 +5107,9 @@ const PARTS = {
  *    0 flash = hidden plane = 0 draw calls added. Material color =
  *    tint × level IS the additive amount. Dev trigger: Key B
  *  - audio thump/crackle/whoosh: wired in M11.3 (seam: the
- *    pulse()/arc()/flash() call sites)
+ *    pulse()/arc()/flash() call sites), spatially mixed in M11.4
+ *    (panner + distance gain for the 2–3 nearest emitters; the rest
+ *    folds into the ambient master)
  * --------------------------------------------------------------------- */
 const FX = {
   name: 'FX',
@@ -5084,7 +5252,7 @@ const FX = {
       it.cR = FX._c.r; it.cG = FX._c.g; it.cB = FX._c.b;
     }
     FX._live[FX.count++] = it;
-    AUDIO.pulseThump();              // M11.3: thump (→ AUDIO.master)
+    AUDIO.pulseThump(origin);        // M11.3: thump (M11.4: spatial pool)
     return it;
   },
 
@@ -5138,7 +5306,8 @@ const FX = {
     FX._regenArc(FX.arcCount - 1);
     FX.arcs.geometry.setDrawRange(0, FX.arcCount * FX._arcVerts);
     FX.arcs.geometry.attributes.position.needsUpdate = true;
-    AUDIO.arcCrackle();              // M11.3: crackle (→ AUDIO.master)
+    AUDIO.arcCrackle(               // M11.3: crackle (M11.4: spatial pool)
+      { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 });
     return it;
   },
 

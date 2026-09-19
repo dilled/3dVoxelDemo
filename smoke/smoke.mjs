@@ -8443,6 +8443,199 @@ try {
       `counters=${JSON.stringify(e2.counters)}`);
   }
 
+  /* ------------------------------------------------------------------
+   * M11.4 — Spatial-ish mixing (one panner + distance gain for the
+   *          2–3 nearest emitters; the rest folded into ambient)
+   *
+   *  A pool of panner + distance-gain channels built at unlock
+   *  (channels are reused ⇒ a spatial fire allocates only the
+   *  one-shot itself); the listener is driven from CAMERA every
+   *  frame — the only per-frame cost. "Walking past an emitter
+   *  pans/attenuates it" is verified app-side (the headless build
+   *  exposes no graph introspection): the channel panner position
+   *  and the explicit distance gain are directly observable, and the
+   *  listener tracks the camera.
+   * ------------------------------------------------------------------ */
+  {
+    const spState = () => page.evaluate(() => {
+      const A = window.SIM.AUDIO;
+      const C = window.SIM.CFG.audio.spatial;
+      const L = A._listener;
+      const p0 = A.spatial && A.spatial.length ? A.spatial[0].panner : null;
+      return {
+        want: C.channels, ref: C.refDistance, rolloff: C.rolloff,
+        minGain: C.minGain,
+        channels: A.spatial ? A.spatial.length : -1,
+        wired: A.spatialWired,
+        folded: A.spatialFolded,
+        pannerName: p0 ? p0.constructor.name : 'none',
+        pannerModel: p0 ? p0.panningModel : 'none',
+        counters: { ...A.events },
+        muted: A.muted,
+        muteGain: A.muteGain ? A.muteGain.gain.value : -1,
+        listener: L ? {
+          x: L.positionX ? L.positionX.value : -1e9,
+          y: L.positionY ? L.positionY.value : -1e9,
+          z: L.positionZ ? L.positionZ.value : -1e9,
+        } : null,
+        cam: {
+          x: window.SIM.CAMERA.pos.x,
+          y: window.SIM.CAMERA.pos.y,
+          z: window.SIM.CAMERA.pos.z,
+        },
+      };
+    });
+    const teleport = async (x, y, z) => {
+      await page.evaluate(([x, y, z]) => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(x, y, z);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = 0;
+        S.CAMERA.pitch = 0;
+      }, [x, y, z]);
+      await sleep(250);
+    };
+    const firePulse = async (x, y, z) => page.evaluate(([x, y, z]) => {
+      const S = window.SIM;
+      const A = S.AUDIO;
+      const it = S.FX.pulse({ x, y, z });
+      if (it) S.FX.dropPulse(it);
+      const last = A.spatialLast;
+      const ch = last ? A.spatial[last.ch] : null;
+      const p = ch ? ch.panner : null;
+      return {
+        fired: !!it,
+        last: last ? {
+          type: last.type, x: last.x, y: last.y, z: last.z,
+          d: last.d, gain: last.gain,
+        } : null,
+        pannerPos: p ? {
+          x: p.positionX ? p.positionX.value : -1e9,
+          y: p.positionY ? p.positionY.value : -1e9,
+          z: p.positionZ ? p.positionZ.value : -1e9,
+        } : null,
+        channelGain: ch ? ch.g.gain.value : -1,
+      };
+    }, [x, y, z]);
+    const heapMin = () => page.evaluate(async () => {
+      let m = Infinity;
+      for (let i = 0; i < 3; i++) {
+        if (window.gc) window.gc();
+        if (performance.memory) m = Math.min(m, performance.memory.usedJSHeapSize);
+        await new Promise(r => setTimeout(r, 250));
+      }
+      return m === Infinity ? -1 : m;
+    });
+    const expGain = (d, s) => d <= s.ref
+      ? 1
+      : Math.max(s.minGain, s.ref / (s.ref + s.rolloff * (d - s.ref)));
+
+    /* 1. pool: 3 panner + distance-gain channels, wired to master */
+    const s0 = await spState();
+    check('M11.4: spatial pool exists (panner + distance-gain channels)',
+      s0.channels === s0.want && s0.wired &&
+      s0.pannerName === 'PannerNode' && s0.pannerModel === 'equalpower',
+      `channels=${s0.channels}/${s0.want}, wired=${s0.wired}, ` +
+      `panner=${s0.pannerName} (${s0.pannerModel})`);
+
+    /* 2. listener tracks the camera (position driven every frame) */
+    await teleport(20, 5, -30);
+    const s1 = await spState();
+    check('M11.4: listener tracks the camera (per-frame drive)',
+      s1.listener &&
+      Math.abs(s1.listener.x - 20) < 0.01 &&
+      Math.abs(s1.listener.y - 5) < 0.01 &&
+      Math.abs(s1.listener.z + 30) < 0.01,
+      `listener=(${s1.listener ? s1.listener.x.toFixed(2) + ', ' +
+        s1.listener.y.toFixed(2) + ', ' + s1.listener.z.toFixed(2) : 'n/a'})`);
+
+    /* 3. walking past an emitter attenuates it — near → far → near
+     *    gain profile against the exact inverse-model formula */
+    const walk = async (cx) => {
+      await teleport(cx, 4, 0);
+      return firePulse(0, 0, 0);
+    };
+    const w0 = await walk(-25);
+    const w1 = await walk(0);
+    const w2 = await walk(25);
+    check('M11.4: walking past an emitter attenuates it (near→far→near)',
+      w0.fired && w1.fired && w2.fired &&
+      Math.abs(expGain(w0.last.d, s0) - w0.last.gain) < 1e-6 &&
+      w1.last.gain === 1 &&
+      Math.abs(expGain(w2.last.d, s0) - w2.last.gain) < 1e-6 &&
+      w1.last.gain > w0.last.gain && w1.last.gain > w2.last.gain,
+      `gains=(${w0.last ? w0.last.gain.toFixed(3) : '?'}, ` +
+      `${w1.last ? w1.last.gain.toFixed(3) : '?'}, ` +
+      `${w2.last ? w2.last.gain.toFixed(3) : '?'}), d=(${w0.last ? w0.last.d.toFixed(1) : '?'}, ` +
+      `${w1.last ? w1.last.d.toFixed(1) : '?'}, ${w2.last ? w2.last.d.toFixed(1) : '?'})`);
+
+    /* 4. the channel panner sits at the emitter (equalpower panning
+     *    input) and the channel gain IS the distance gain */
+    const p4 = await firePulse(12, 3, -7);
+    check('M11.4: channel panner sits at the emitter (panning input)',
+      p4.fired && p4.pannerPos &&
+      Math.abs(p4.pannerPos.x - 12) < 1e-6 &&
+      Math.abs(p4.pannerPos.y - 3) < 1e-6 &&
+      Math.abs(p4.pannerPos.z + 7) < 1e-6 &&
+      /* AudioParam values are float32 — read-back rounds to ~3e-8 */
+      Math.abs(p4.channelGain - p4.last.gain) < 1e-6,
+      `panner=(${p4.pannerPos ? p4.pannerPos.x + ', ' +
+        p4.pannerPos.y + ', ' + p4.pannerPos.z : 'n/a'}), ` +
+      `gain=${p4.channelGain}`);
+
+    /* 5. pool overflow: 4 simultaneous emitters at equal distance →
+     *    3 spatial + 1 folded into the ambient master */
+    await sleep(1000);      // walking-test channels expire (hold ≈ 0.9 s)
+    const fold = await page.evaluate(() => {
+      const S = window.SIM;
+      const A = S.AUDIO;
+      const before = A.spatialFolded;
+      const its = [];
+      for (let i = 0; i < 4; i++) its.push(S.FX.pulse({ x: 0, y: 0, z: 0 }));
+      for (const it of its) if (it) S.FX.dropPulse(it);
+      return {
+        before, after: A.spatialFolded,
+        fired: its.filter(Boolean).length,
+        delta: A.events.pulse,
+      };
+    });
+    check('M11.4: pool overflow folds into the ambient master (4th fire)',
+      fold.fired === 4 && fold.after === fold.before + 1,
+      `fired=${fold.fired}, folded ${fold.before} → ${fold.after}`);
+
+    /* 6. spatial events mute at the M11.1 choke point */
+    await page.keyboard.press('KeyM');
+    await sleep(250);
+    const mute = await page.evaluate(() => {
+      const S = window.SIM;
+      const A = S.AUDIO;
+      const before = A.events.pulse;
+      const it = S.FX.pulse({ x: 5, y: 0, z: 5 });
+      if (it) S.FX.dropPulse(it);
+      return {
+        muted: A.muted,
+        mute: A.muteGain.gain.value,
+        delta: A.events.pulse - before,
+        gain: A.spatialLast ? A.spatialLast.gain : -1,
+      };
+    });
+    check('M11.4: spatial events mute at the M11.1 choke point',
+      mute.muted && mute.mute < 0.01 && mute.delta === 1 && mute.gain > 0,
+      `muted=${mute.muted}, mute=${mute.mute}, gain=${mute.gain}`);
+    await page.keyboard.press('KeyM');
+    await sleep(250);
+
+    /* 7. bounded cost: the per-frame listener drive + channel expiry
+     *    are a handful of param writes — heap stays flat */
+    await teleport(0, 4, 18);
+    const h0 = await heapMin();
+    await sleep(5000);
+    const h1 = await heapMin();
+    check('M11.4: bounded cost (heap flat while the listener drives)',
+      h0 > 0 && h1 - h0 <= 2 * 1024 * 1024 && pageErrors.length === 0,
+      `Δ=${((h1 - h0) / 1048576).toFixed(2)} MB, errors=${pageErrors.length}`);
+  }
+
   /* ---- 10. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));
