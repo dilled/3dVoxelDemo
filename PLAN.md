@@ -82,7 +82,7 @@ smoke-test evidence.
 | **M12.3** ✅ | Intro robustness: skippable/cancellable at any point (START/click/keypress) → 0.5 s fade to street camera; START visible after 2 s; intro never blocks play state | Finish / early-skip / late-interrupt all end in controllable camera, zero console errors |
 | **M13.1** ✅ | `EVENTS` scheduler: weighted picking, cooldowns, min/max gap, event registry, one-at-a-time + priority rules | Scheduler smoke test: forced random seed yields legal firing order (no overlap, gaps respected) |
 | **M13.2** ✅ | Ambient events A: data pulse (dot along conduit, both ends flash — M7 cable) + section power cycle (one ring chunk dims/brightens 3–6 s, per-chunk color multiplier) | Both events fire and resolve cleanly on manual + scheduled triggers |
-| **M13.3** | Ambient events B: cooling emergency (fan spin-up, steam burst, warning LEDs, drone dispatch, 20 s, resolves) + drone launch (roof-bay panel opens, 2–4 drones fly to patrol) | Both events run start→resolve with no leftover state; visible from street level |
+| **M13.3** ✅ | Ambient events B: cooling emergency (fan spin-up, steam burst, warning LEDs, drone dispatch, 20 s, resolves) + drone launch (roof-bay panel opens, 2–4 drones fly to patrol) | Both events run start→resolve with no leftover state; visible from street level |
 | **M13.4** | Ambient events C: mechanical reposition (giant fan/antenna/ring slow move + rumble + tiny shake) + distant EM discharge (far lightning + a few city arcs); awakening-compat: during AWAKE only creature-priority events fire | 3-min idle play shows ≥ 4 different events, none conflicting, none breaking perf; AWAKE window respected |
 | **M14.1** | Perf monitor + quality tiers: rolling FPS, `HIGH/MED/LOW` (auto + manual); tiers scale LOD radius, particle/drone/vehicle caps, sign texture updates, light shafts, audio beds | Forcing each tier in smoke run: stats within budget, no stutter on tier switch |
 | **M14.2** | HUD stats (small, corner, toggleable): FPS, visible instances, active drones, chunk id, AI state | HUD matches measured stats; toggle hides it; costs nothing hidden |
@@ -1105,9 +1105,9 @@ paths end in a controllable camera, zero console errors.
 - **Commit when:** both verified.
 
 #### M13.3 — Ambient events B: cooling emergency + drone launch
-- [ ] Cooling emergency: one cooling tower fans spin up, steam burst,
+- [x] Cooling emergency: one cooling tower fans spin up, steam burst,
       warning LEDs, drones dispatch, ~20 s, resolves.
-- [ ] Drone launch: a roof bay opens (animated panel), 2–4 drones fly
+- [x] Drone launch: a roof bay opens (animated panel), 2–4 drones fly
       to patrol.
 - **Test:** each event runs start→resolve with no leftover state; both
       visible from street level.

@@ -50,6 +50,26 @@
  *   - no leftover state: every chunk's power color at base, dot
  *     hidden, FX drained, nothing active
  *
+ *   M13.3 checks:
+ *   - ambient events B registered (cooling-emergency, drone-launch;
+ *     warning-LED / bay-panel / bay-recess meshes idle-hidden)
+ *   - cooling-emergency manual: fan phase advancing (spin-up), steam
+ *     puffs live above the tower, warning LEDs on, dispatch drones
+ *     state 4 at the tower; drone-launch PREEMPTS it (victim
+ *     interrupted, starts exactly at the victim's end)
+ *   - drone-launch in flight: bay panel fully open, >= 2 drones
+ *     holding at the bay; street-level screenshot of the open bay
+ *     (shots/m133-drone-launch-street.png); resolves clean (panel +
+ *     bay hidden, no drones holding, natural end, dur in [8, 12])
+ *   - cooling-emergency natural: full boost (level ~1), street-level
+ *     screenshot (shots/m133-cooling-emergency-street.png), resolves
+ *     clean (LEDs off, no drones holding, natural end, dur in [18, 24])
+ *   - scheduled: forced-seed 120 s drive — all four ambient events
+ *     fire, no overlaps, min gap >= 2, per-id cooldowns held,
+ *     deterministic
+ *   - no leftover state: warn/panel/bay hidden, no drones holding an
+ *     event role, no live event, nothing active
+ *
  *   M1 checks:
  *   - systems registry boots in fixed order
  *     (INPUT, CAMERA, KIT, WORLD, ENTITY, TRAFFIC, PARTS, HUD)
@@ -9534,15 +9554,18 @@ try {
      * preempt whatever is running). Page is RUNNING (no reload). */
     await page.evaluate(() => {
       const S = window.SIM, E = S.EVENTS;
-      /* M13.2: the ambient events (data-pulse / power-cycle) are
-       * registered from boot — this section tests the scheduler with
-       * a synthetic registry only, so end anything live, unregister
-       * the ambient events, and un-park the page loop (the boot park
-       * above froze it for the preceding sections). Cleanup
-       * re-registers the ambient events. */
+      /* M13.2: the ambient events (data-pulse / power-cycle, and the
+       * M13.3 cooling-emergency / drone-launch) are registered from
+       * boot — this section tests the scheduler with a synthetic
+       * registry only, so end anything live, unregister the ambient
+       * events, and un-park the page loop (the boot park above froze
+       * it for the preceding sections). Cleanup re-registers the
+       * ambient events. */
       if (E._active) E._end(E._active, true);
       E.unregister('data-pulse');
       E.unregister('power-cycle');
+      E.unregister('cooling-emergency');
+      E.unregister('drone-launch');
       E.paused = false;
       S.CFG.events.gap = [2, 4];   // test pacing (shorter than CFG)
       S.CFG.events.first = 0;
@@ -9824,7 +9847,13 @@ try {
 
     /* 5. no leftover state: every chunk's power color at base, dot
      * hidden, FX drained (the last pulses expire in real time),
-     * nothing active. */
+     * nothing active. (M13.3: the longer cooling-emergency /
+     * drone-launch durations make it likely a 1200-step drive ends
+     * mid-event — drain whatever is still running first.) */
+    await page.evaluate(() => {
+      const E = window.SIM.EVENTS;
+      while (E._active) E.step(0.1);
+    });
     await sleep(2000);
     const clean = await page.evaluate(() => {
       const S = window.SIM, E = S.EVENTS;
@@ -9841,6 +9870,393 @@ try {
     });
     check('M13.2: no leftover state (chunks at base, dot hidden, FX drained, nothing active)',
       clean.pwOk && clean.dotHidden && !clean.active && clean.fx === 0,
+      JSON.stringify(clean));
+
+    /* cleanup: real CFG/clock/rng restored, page loop resumes */
+    await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      S.CFG.events.gap = [14, 30];
+      S.CFG.events.first = 20;
+      E.reset();
+      E._rng = S.WORLD.mulberry(S.CFG.city.seed ^ S.CFG.events.seed);
+      E.paused = false;
+    });
+  }
+
+  /* ---- 9d. M13.3 — Ambient events B: cooling emergency + drone
+   *    launch (manual trigger + preemption, start→resolve clean,
+   *    street-level screenshots, scheduled firing order, determinism,
+   *    no leftover state) ---- */
+  {
+    /* take over the scheduler (page is RUNNING, no reload) */
+    await page.evaluate(() => {
+      const E = window.SIM.EVENTS;
+      if (E._active) E._end(E._active, true);
+      E.reset();
+      E.paused = true;
+    });
+
+    /* street-level screenshot helpers (M6.2 pose pattern). The pose
+     * search tries 8 bearings × 3 distances at street level (y = 1.7)
+     * and keeps the first with a provably clear line of sight against
+     * the instanced building boxes; the fallback is 70 m out on the
+     * radial bearing. The spawn pose is restored after. */
+    const streetPose = async (tg) => page.evaluate((tg) => {
+      const S = window.SIM;
+      const boxes = [];
+      for (const ch of S.WORLD.chunks.values()) {
+        if (!ch.group || !ch.group.visible) continue;
+        for (const b of [ch.boxA, ch.boxG, ch.cyl, ch.ledWin])
+          if (b && b.count > 0) boxes.push(b);
+      }
+      const inv = S.TRAFFIC._m.clone();
+      const la = S.TRAFFIC._p.clone();
+      function segHits(arr, o, ax, ay, az, bx, by, bz) {
+        inv.fromArray(arr, o);
+        inv.invert();
+        const p = la.set(ax, ay, az).applyMatrix4(inv);
+        const px = p.x, py = p.y, pz = p.z;
+        const q = la.set(bx, by, bz).applyMatrix4(inv);
+        const pp = [px, py, pz], qq = [q.x, q.y, q.z];
+        let t0 = 0, t1 = 1;
+        for (let k = 0; k < 3; k++) {
+          const dK = qq[k] - pp[k];
+          if (Math.abs(dK) < 1e-9) {
+            if (pp[k] < -0.5 || pp[k] > 0.5) return false;
+          } else {
+            let te = (-0.5 - pp[k]) / dK, tx = (0.5 - pp[k]) / dK;
+            if (te > tx) { const tm = te; te = tx; tx = tm; }
+            if (t0 < te) t0 = te;
+            if (t1 > tx) t1 = tx;
+            if (t0 > t1) return false;
+          }
+        }
+        return true;
+      }
+      function occluded(ax, ay, az, bx, by, bz) {
+        const dx = bx - ax, dy = by - ay, dz = bz - az;
+        const l2 = dx * dx + dy * dy + dz * dz;
+        for (const b of boxes) {
+          const arr = b.mesh.instanceMatrix.array;
+          for (let i = 0; i < b.count; i++) {
+            const o = i * 16;
+            const cx = arr[o + 12], cy = arr[o + 13], cz = arr[o + 14];
+            const sx = Math.abs(arr[o]) + Math.abs(arr[o + 1]) + Math.abs(arr[o + 2]);
+            const sy = Math.abs(arr[o + 4]) + Math.abs(arr[o + 5]) + Math.abs(arr[o + 6]);
+            const sz = Math.abs(arr[o + 8]) + Math.abs(arr[o + 9]) + Math.abs(arr[o + 10]);
+            const tt = ((cx - ax) * dx + (cy - ay) * dy + (cz - az) * dz) / l2;
+            if (tt < 0 || tt > 1) continue;
+            const px = ax + dx * tt, py = ay + dy * tt, pz = az + dz * tt;
+            const ex = Math.max(sx, sy, sz) * 0.5 + 1;
+            const ex2 = cx - px, ey = cy - py, ez = cz - pz;
+            if (ex2 * ex2 + ey * ey + ez * ez > ex * ex) continue;
+            if (segHits(arr, o, ax, ay, az, bx, by, bz)) return true;
+          }
+        }
+        return false;
+      }
+      const tx = tg.x, ty = tg.y, tz = tg.z;
+      for (let k = 0; k < 8; k++) {
+        const ang = k * 0.7854 + 0.4;
+        for (const rad of [50, 80, 110]) {
+          const x = tx - Math.cos(ang) * rad;
+          const z = tz - Math.sin(ang) * rad;
+          if (occluded(x, 1.7, z, tx, ty, tz)) continue;
+          const dx = tx - x, dz = tz - z;
+          return { x, z,
+            yaw: Math.atan2(-dx, -dz),
+            pitch: Math.atan2(ty - 1.7, Math.hypot(dx, dz)) };
+        }
+      }
+      const dist = Math.hypot(tx, tz);
+      const nx = tx / dist, nz = tz / dist;
+      return { x: tx - nx * 70, z: tz - nz * 70,
+        yaw: Math.atan2(-nx, -nz), pitch: Math.atan2(ty - 1.7, 70) };
+    }, tg);
+    const streetShot = async (name, pose) => {
+      if (!pose) return false;
+      await page.evaluate((p) => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(p.x, 1.7, p.z);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = p.yaw;
+        S.CAMERA.pitch = p.pitch;
+      }, pose);
+      await sleep(450);
+      await page.screenshot({ path: `${here}/shots/${name}.png` });
+      const ok = fs.existsSync(`${here}/shots/${name}.png`);
+      await page.evaluate(() => {
+        const S = window.SIM;
+        S.CAMERA.pos.set(0, 4, 18);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = 0;
+        S.CAMERA.pitch = 0;
+      });
+      await sleep(250);
+      return ok;
+    };
+
+    /* 1. registration: both ambient events B, all three meshes
+     * idle-hidden in WORLD.root */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      return {
+        ce: !!E._reg.get('cooling-emergency'),
+        dl: !!E._reg.get('drone-launch'),
+        warn: !!E._warn && E._warn.visible === false,
+        panel: !!E._bayPanel && E._bayPanel.visible === false,
+        bay: !!E._bayBay && E._bayBay.visible === false,
+        inRoot: !!E._warn && E._warn.parent === S.WORLD.root &&
+          E._bayPanel.parent === S.WORLD.root &&
+          E._bayBay.parent === S.WORLD.root,
+      };
+    });
+    check('M13.3: ambient events B registered (cooling-emergency, drone-launch; warn/panel/bay idle-hidden in WORLD.root)',
+      reg.ce && reg.dl && reg.warn && reg.panel && reg.bay && reg.inRoot,
+      JSON.stringify(reg));
+
+    /* 2. cooling-emergency manual: start, verify the four visual
+     * channels (fan spin-up, steam, warning LEDs, drone dispatch),
+     * then drone-launch PREEMPTS it (victim interrupted, drone-launch
+     * starts exactly at the victim's end). */
+    const ce = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E._rng = S.WORLD.mulberry(0x1353);
+      const okCe = E.trigger('cooling-emergency');
+      const e = E._ce;
+      if (!okCe || !e) return { okCe, ok: false };
+      const p = e.p;
+      const ph0 = p.ph;
+      for (let i = 0; i < 3; i++) E.step(0.1);   // 0.3 s into the ramp
+      const ph1 = p.ph;
+      /* steam puffs live above the tower (source = the fan vent) */
+      let steam = 0;
+      for (let i = 0; i < S.PARTS.scount; i++) {
+        const it = S.PARTS._sLive[i];
+        if (Math.abs(it.sx - p.x) < 1 && Math.abs(it.sz - p.z) < 1 &&
+            it.py > p.y) steam++;
+      }
+      /* dispatch drones: state 4, hover ring at the tower */
+      let drones = 0;
+      for (let i = 0; i < S.TRAFFIC.count; i++) {
+        const d = S.TRAFFIC._live[i];
+        if (d.state === 4 &&
+            Math.hypot(d.rx - p.x, d.rz - p.z) < 8 &&
+            Math.abs(d.ry - (p.y + 8)) < 1) drones++;
+      }
+      const warnOn = E._warn.visible && E._warn.count === 3;
+      const preDl = E.trigger('drone-launch');
+      return { okCe, ok: true, preDl,
+        tower: [p.x, p.y, p.z], ph0, ph1, steam, drones, warnOn,
+        ceEntry: E.log.filter(x => x.id === 'cooling-emergency').pop(),
+        active: E._active ? E._active.id : null,
+        activeStart: E._active ? E._active.startAt : null };
+    });
+    check('M13.3: cooling-emergency starts (fan phase advancing, steam above the tower, warning LEDs on, drones dispatched)',
+      ce.okCe && ce.ok && Math.abs(ce.ph1 - ce.ph0) > 1e-3 && ce.steam >= 3 &&
+      ce.warnOn && ce.drones >= 1,
+      `ph ${ce.ph0.toFixed(2)} -> ${ce.ph1.toFixed(2)}, steam=${ce.steam}, drones=${ce.drones}`);
+    check('M13.3: drone-launch preempts the running cooling-emergency (victim interrupted, start = victim end)',
+      ce.preDl && ce.active === 'drone-launch' && ce.ceEntry &&
+      ce.ceEntry.interrupted === true &&
+      ce.activeStart === ce.ceEntry.end,
+      `entry=${JSON.stringify(ce.ceEntry)}, dlStart=${ce.activeStart}`);
+
+    /* 3. drone-launch in flight: panel fully open, >= 2 drones
+     * holding at the bay; street-level screenshot; natural resolve.
+     * (The dispatch drones fly in at ~10 m/s in real time — wait a
+     * bounded moment for them to reach the bay for the screenshot.) */
+    const dl = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      const e = E._dl;
+      if (!e) return { ok: false };
+      for (let i = 0; i < 25; i++) E.step(0.1);   // 2.5 s → panel open
+      const u = (E._bayPanel.position.x - e.x) / 3.4;
+      let drones = 0;
+      for (let i = 0; i < S.TRAFFIC.count; i++) {
+        const d = S.TRAFFIC._live[i];
+        if (d.state === 4 && Math.hypot(d.rx - e.x, d.rz - e.z) < 5 &&
+            Math.abs(d.ry - (e.y + 6)) < 1) drones++;
+      }
+      return { ok: true, u, drones,
+        bay: [e.x, e.y, e.z],
+        panelVisible: E._bayPanel.visible, bayVisible: E._bayBay.visible };
+    });
+    check('M13.3: drone-launch in flight (bay open, >= 2 drones holding at the bay, both meshes visible)',
+      dl.ok && dl.u > 0.9 && dl.drones >= 2 && dl.panelVisible && dl.bayVisible,
+      `u=${dl.ok ? dl.u.toFixed(2) : 'n/a'}, drones=${dl.ok ? dl.drones : 'n/a'}`);
+    {
+      /* wait (bounded) for >= 2 drones to physically reach the bay,
+       * then the street-level screenshot of the open bay */
+      const t0 = Date.now();
+      let arrived = false;
+      while (Date.now() - t0 < 12000) {
+        arrived = await page.evaluate((b) => {
+          const T = window.SIM.TRAFFIC;
+          let n = 0;
+          for (let i = 0; i < T.count; i++) {
+            const d = T._live[i];
+            if (d.state === 4 &&
+                Math.hypot(d.px - b[0], d.pz - b[2]) < 10) n++;
+          }
+          return n >= 2;
+        }, dl.bay);
+        if (arrived) break;
+        await sleep(500);
+      }
+      /* aim just above the roofline so the bay + panel are on a clear
+       * sightline (the drones hover above it) */
+      const pose = dl.ok
+        ? await streetPose({ x: dl.bay[0], y: dl.bay[1] + 2, z: dl.bay[2] })
+        : null;
+      const shotOk = await streetShot('m133-drone-launch-street', pose);
+      check('M13.3: street-level screenshot of the open drone bay written (shots/m133-drone-launch-street.png)',
+        shotOk, `drones at bay when shot: ${arrived}`);
+    }
+    const dlEnd = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      while (E._active) E.step(0.1);
+      const entry = E.log.filter(x => x.id === 'drone-launch').pop();
+      let state4 = 0;
+      for (let i = 0; i < S.TRAFFIC.count; i++)
+        if (S.TRAFFIC._live[i].state === 4) state4++;
+      return { entry, state4,
+        panelHidden: !E._bayPanel.visible, bayHidden: !E._bayBay.visible,
+        active: E._active ? E._active.id : null };
+    });
+    check('M13.3: drone-launch resolves clean (panel + bay hidden, no drones holding, natural end, dur in [8, 12])',
+      dlEnd.panelHidden && dlEnd.bayHidden && dlEnd.state4 === 0 &&
+      dlEnd.entry && dlEnd.entry.interrupted === false &&
+      dlEnd.entry.end - dlEnd.entry.start >= 8 - 1e-9 &&
+      dlEnd.entry.end - dlEnd.entry.start <= 12 + 1e-9 && !dlEnd.active,
+      `entry=${JSON.stringify(dlEnd.entry)}, state4=${dlEnd.state4}`);
+
+    /* 4. cooling-emergency natural: start, fan at full boost, street
+     * screenshot, drive to natural end, verify the clean resolve. */
+    const ce2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      const ok = E.trigger('cooling-emergency');
+      const e = E._ce;
+      if (!ok || !e) return { ok: false };
+      for (let i = 0; i < 30; i++) E.step(0.1);   // 3 s → full boost
+      const p = e.p;
+      let state4 = 0;
+      for (let i = 0; i < S.TRAFFIC.count; i++)
+        if (S.TRAFFIC._live[i].state === 4) state4++;
+      return { ok: true, level: e.level, state4,
+        tower: [p.x, p.y, p.z] };
+    });
+    check('M13.3: cooling-emergency at full boost (spin level ~1, dispatch drones en route)',
+      ce2.ok && ce2.level > 0.9 && ce2.state4 >= 1,
+      `level=${ce2.ok ? ce2.level.toFixed(2) : 'n/a'}, drones=${ce2.ok ? ce2.state4 : 'n/a'}`);
+    {
+      /* wait (bounded) for a dispatch drone to reach the tower, then
+       * the street-level screenshot (steam + LEDs + fan + drone) */
+      const t0 = Date.now();
+      let arrived = false;
+      while (Date.now() - t0 < 12000) {
+        arrived = await page.evaluate((b) => {
+          const T = window.SIM.TRAFFIC;
+          for (let i = 0; i < T.count; i++) {
+            const d = T._live[i];
+            if (d.state === 4 &&
+                Math.hypot(d.px - b[0], d.pz - b[2]) < 12) return true;
+          }
+          return false;
+        }, ce2.tower);
+        if (arrived) break;
+        await sleep(500);
+      }
+      /* aim just above the fan (box top + ~2.5 m) so the steam column,
+       * LEDs and the dispatch drones are on a clear sightline */
+      const pose = ce2.ok
+        ? await streetPose({ x: ce2.tower[0], y: ce2.tower[1] + 2, z: ce2.tower[2] })
+        : null;
+      const shotOk = await streetShot('m133-cooling-emergency-street', pose);
+      check('M13.3: street-level screenshot of the cooling emergency written (shots/m133-cooling-emergency-street.png)',
+        shotOk, `drone at tower when shot: ${arrived}`);
+    }
+    const ceEnd = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      while (E._active) E.step(0.1);
+      const entry = E.log.filter(x => x.id === 'cooling-emergency').pop();
+      let state4 = 0;
+      for (let i = 0; i < S.TRAFFIC.count; i++)
+        if (S.TRAFFIC._live[i].state === 4) state4++;
+      return { entry, state4, warnHidden: !E._warn.visible,
+        ceNull: E._ce === null, active: E._active ? E._active.id : null };
+    });
+    check('M13.3: cooling-emergency resolves clean (LEDs off, no drones holding, natural end, dur in [18, 24])',
+      ceEnd.warnHidden && ceEnd.ceNull && ceEnd.state4 === 0 &&
+      ceEnd.entry && ceEnd.entry.interrupted === false &&
+      ceEnd.entry.end - ceEnd.entry.start >= 18 - 1e-9 &&
+      ceEnd.entry.end - ceEnd.entry.start <= 24 + 1e-9 && !ceEnd.active,
+      `entry=${JSON.stringify(ceEnd.entry)}, state4=${ceEnd.state4}`);
+
+    /* 5. scheduled: all four ambient events fire in a legal,
+     * deterministic order (forced seed, 1200 × 0.1 s, test pacing). */
+    const sched = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      S.CFG.events.gap = [2, 4];
+      S.CFG.events.first = 0;
+      E.reset();
+      E._rng = S.WORLD.mulberry(0x1333);
+      for (let i = 0; i < 1200; i++) E.step(0.1);
+      return JSON.parse(JSON.stringify(E.log));
+    });
+    {
+      const nCe = sched.filter(e => e.id === 'cooling-emergency').length;
+      const nDl = sched.filter(e => e.id === 'drone-launch').length;
+      const nDp = sched.filter(e => e.id === 'data-pulse').length;
+      const nPc = sched.filter(e => e.id === 'power-cycle').length;
+      /* the gap is a MINIMUM (cooldown waits are legal, M13.2) */
+      let noOverlap = true, gapsOk = true, cdOk = true;
+      const cdMin = { 'cooling-emergency': 45, 'drone-launch': 45,
+                      'data-pulse': 12, 'power-cycle': 12 };
+      for (let i = 1; i < sched.length; i++) {
+        const gap = sched[i].start - sched[i - 1].end;
+        if (!(sched[i].start > sched[i - 1].end)) noOverlap = false;
+        if (!(gap >= 2 - 1e-9)) gapsOk = false;
+        if (sched[i].id === sched[i - 1].id &&
+            !(gap >= cdMin[sched[i].id] - 1e-9)) cdOk = false;
+      }
+      check('M13.3: scheduled — all four ambient events fire (both B events included)',
+        nCe >= 1 && nDl >= 1 && nDp >= 1 && nPc >= 1,
+        `ce=${nCe}, dl=${nDl}, dp=${nDp}, pc=${nPc}, n=${sched.length}`);
+      check('M13.3: scheduled — no overlaps, min gap >= 2 held, per-id cooldowns held',
+        noOverlap && gapsOk && cdOk, `n=${sched.length}`);
+    }
+    const sched2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E.reset();
+      E._rng = S.WORLD.mulberry(0x1333);
+      for (let i = 0; i < 1200; i++) E.step(0.1);
+      return JSON.parse(JSON.stringify(E.log));
+    });
+    check('M13.3: scheduled — forced seed ⇒ identical firing order (deterministic)',
+      JSON.stringify(sched2) === JSON.stringify(sched),
+      `n1=${sched.length}, n2=${sched2.length}`);
+
+    /* 6. no leftover state: all three meshes hidden, no drone holding
+     * an event role, no live event, nothing active. (Steam puff life is
+     * bounded by the existing verified PARTS behavior — 5–8 s.) */
+    await sleep(2000);
+    const clean = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      while (E._active) E.step(0.1);
+      let state4 = 0;
+      for (let i = 0; i < S.TRAFFIC.count; i++)
+        if (S.TRAFFIC._live[i].state === 4) state4++;
+      return {
+        warnHidden: !E._warn.visible,
+        panelHidden: !E._bayPanel.visible,
+        bayHidden: !E._bayBay.visible,
+        state4, ceNull: E._ce === null, dlNull: E._dl === null,
+        active: E._active ? E._active.id : null };
+    });
+    check('M13.3: no leftover state (warn/panel/bay hidden, no drones holding, no live event, nothing active)',
+      clean.warnHidden && clean.panelHidden && clean.bayHidden &&
+      clean.state4 === 0 && clean.ceNull && clean.dlNull && !clean.active,
       JSON.stringify(clean));
 
     /* cleanup: real CFG/clock/rng restored, page loop resumes */

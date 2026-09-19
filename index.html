@@ -882,6 +882,22 @@ const CFG = {
       depth: 0.75,       // 1 − multiplier at the dimmest point
       reach: [0, 300],  // m from the player to the chunk edge
     },
+    /* M13.3: ambient events B (cooling emergency + drone launch) */
+    coolingEmergency: {
+      weight: 0.5, cd: [45, 90], dur: [18, 24],
+      reach: [40, 220],              // m from the player to the tower
+      spin: { boost: 3, rampUp: 2, rampDown: 3 },
+      warnHz: 3,                    // warning-LED chase rate (Hz)
+      steam: { first: 6, mid: 4 },  // puffs at start / at 35% / at 70%
+      dispatch: { n: [1, 2], hoverAlt: 8, hoverR: 7 },
+    },
+    droneLaunch: {
+      weight: 0.5, cd: [45, 90], dur: [8, 12],
+      reach: [40, 220],              // m from the player to the bay
+      count: [2, 4],                // drones that fly out to patrol
+      panel: { open: 1.5, close: 1.5 },
+      hover: 2,                     // s the drones hold at the open bay
+    },
   },
 };
 
@@ -4941,15 +4957,24 @@ const PARTS = {
     }
   },
 
-  /* public API — M9.4 beat 5 + M13.3 cooling emergency: n steam
-   * puffs burst from the ambient cooling-tower vents (the pool is
-   * the gate — excess is silently dropped). */
+  /* public API — M9.4 beat 5: n steam puffs burst from the ambient
+   * cooling-tower vents (the pool is the gate — excess is silently
+   * dropped). */
   steamBurst(n) {
     const st = CFG.parts.steam;
     const r = PARTS._rng;
     for (let k = 0; k < n; k++) {
       const src = PARTS._findSource(r, 'cool', st.radius, st.innerRadius);
       const it = src ? PARTS.spool.acquire() : null;
+      if (it) PARTS._spawnSteam(it, src);
+    }
+  },
+
+  /* public API — M13.3 cooling emergency: n steam puffs at ONE
+   * specific vent (src = { x, z, hTop, r }, the pool is the gate). */
+  steamBurstAt(src, n) {
+    for (let k = 0; k < n; k++) {
+      const it = PARTS.spool.acquire();
       if (it) PARTS._spawnSteam(it, src);
     }
   },
@@ -7746,7 +7771,16 @@ const EVENTS = {
   _dotMat: null,
   _dpCands: null, _dpPair: null, _dpT: -1e9, _dp: null,
   _pcCands: null, _pcT: -1e9, _pc: null,
+  /* M13.3: ambient events B state */
+  _warn: null, _warnMat: null,   // warning-LED chase (hidden at idle)
+  _bayPanel: null, _bayBay: null, // roof-bay panel + recess (idle-hidden)
+  _ceCands: null, _ceT: -1e9, _ce: null,
+  _dlCands: null, _dlT: -1e9, _dl: null,
   _v: new THREE.Vector3(),
+  _m4: new THREE.Matrix4(),
+  _q: new THREE.Quaternion(),
+  _s: new THREE.Vector3(1, 1, 1),
+  _c: new THREE.Color(),
 
   init() {
     this._rng = mulberry32(CFG.city.seed ^ CFG.events.seed);
@@ -7867,7 +7901,34 @@ const EVENTS = {
       this._dot.scale.setScalar(1.5);
       WORLD.root.add(this._dot);
     }
-    const dp = CFG.events.dataPulse, pc = CFG.events.powerCycle;
+    if (!this._warn) {
+      /* M13.3: warning-LED chase — three small unlit boxes on the fan
+       * rim; the per-instance color IS the light (hidden at idle ⇒
+       * 0 draw calls). */
+      this._warnMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+      this._warn = new THREE.InstancedMesh(
+        new THREE.BoxGeometry(0.6, 0.6, 0.6), this._warnMat, 3);
+      this._warn.count = 0;
+      this._warn.frustumCulled = false;
+      this._warn.visible = false;
+      WORLD.root.add(this._warn);
+    }
+    if (!this._bayPanel) {
+      /* M13.3: roof-bay panel + recess — one shared pair, hidden at
+       * idle, posed onto the target roof when drone-launch starts. */
+      this._bayPanel = new THREE.Mesh(
+        new THREE.BoxGeometry(3.2, 0.35, 3.2),
+        new THREE.MeshBasicMaterial({ color: 0x9fc4e4 }));
+      this._bayBay = new THREE.Mesh(
+        new THREE.BoxGeometry(2.6, 0.5, 2.6),
+        new THREE.MeshBasicMaterial({ color: 0x0a1018 }));
+      this._bayPanel.visible = false;
+      this._bayBay.visible = false;
+      WORLD.root.add(this._bayPanel);
+      WORLD.root.add(this._bayBay);
+    }
+    const dp = CFG.events.dataPulse, pc = CFG.events.powerCycle,
+      ce = CFG.events.coolingEmergency, dl = CFG.events.droneLaunch;
     this.register({
       id: 'data-pulse',
       weight: dp.weight, duration: dp.dur, cooldown: dp.cd, priority: 0,
@@ -7883,6 +7944,22 @@ const EVENTS = {
       start: (a) => EVENTS._pcStart(a),
       update: (a, dt, t) => EVENTS._pcUpdate(a, dt, t),
       end: (i) => EVENTS._pcEnd(i),
+    });
+    this.register({
+      id: 'cooling-emergency',
+      weight: ce.weight, duration: ce.dur, cooldown: ce.cd, priority: 0,
+      eligible: () => EVENTS._ceReady(),
+      start: (a) => EVENTS._ceStart(a),
+      update: (a, dt, t) => EVENTS._ceUpdate(a, dt, t),
+      end: (i) => EVENTS._ceEnd(i),
+    });
+    this.register({
+      id: 'drone-launch',
+      weight: dl.weight, duration: dl.dur, cooldown: dl.cd, priority: 0,
+      eligible: () => EVENTS._dlReady(),
+      start: (a) => EVENTS._dlStart(a),
+      update: (a, dt, t) => EVENTS._dlUpdate(a, dt, t),
+      end: (i) => EVENTS._dlEnd(i),
     });
   },
 
@@ -8004,6 +8081,219 @@ const EVENTS = {
   _pcEnd() {
     if (this._pc) WORLD.setChunkPower(this._pc, 1);
     this._pc = null;
+  },
+
+  /* ==================================================================
+   * M13.3: ambient events B — cooling emergency + drone launch.
+   * ================================================================== */
+
+  /* cooling-emergency candidate: one cooling-tower FAN (a chunk detail
+   * instance) within reach of the player — the nearest wins
+   * (deterministic). The fan par carries the tower x/z and roof height
+   * (p.y = h + 0.5). */
+  _ceRefresh(t) {
+    if (this._ceCands && t < this._ceT + 5) return;
+    this._ceT = t;
+    const P = CAMERA.pos, c = [];
+    const R = CFG.events.coolingEmergency.reach;
+    for (const ch of WORLD.chunks.values()) {
+      if (!ch.group.visible) continue;
+      for (let i = 0; i < ch.fan.count; i++) {
+        const p = ch.fan.pars[i];
+        const d = Math.hypot(p.x - P.x, p.z - P.z);
+        if (d < R[0] || d > R[1]) continue;
+        c.push({ ch, i, p, d });
+      }
+    }
+    c.sort((a, b) => a.d - b.d);
+    this._ceCands = c;
+  },
+  _ceReady() {
+    this._ceRefresh(this._time);
+    return this._ceCands.length > 0;
+  },
+  _ceStart(a) {
+    if (!this._ceCands || !this._ceCands.length)
+      this._ceRefresh(this._time);
+    const c = this._ceCands && this._ceCands.length
+      ? this._ceCands[0] : null;
+    if (!c) { this._ce = null; return; }
+    const p = c.p, C = CFG.events.coolingEmergency;
+    /* warning-LED chase: three boxes around the fan rim */
+    this._warn.visible = true;
+    this._warn.count = 3;
+    for (let i = 0; i < 3; i++) {
+      const ang = i * 2.0944;
+      this._v.set(p.x + Math.cos(ang) * p.s * 0.8, p.y + 0.7,
+                 p.z + Math.sin(ang) * p.s * 0.8);
+      this._s.setScalar(1);
+      this._m4.compose(this._v, this._q, this._s);
+      this._warn.setMatrixAt(i, this._m4);
+    }
+    this._warn.instanceMatrix.needsUpdate = true;
+    /* steam: the vent is the fan itself (src shape = PARTS source) */
+    const src = { x: p.x, z: p.z, hTop: p.y + 1.2, r: p.s * 2 };
+    PARTS.steamBurstAt(src, C.steam.first);
+    this._ce = {
+      ch: c.ch, slot: c.i, p, src, b1: false, b2: false,
+      drones: [],
+    };
+    /* drone dispatch: the nearest 1–2 fleet drones fly out and hover
+     * at the tower (state 4: fly to rx/ry/rz, hold roleT, then state
+     * 2 — end() sends them home early when preempted). */
+    const D = C.dispatch;
+    const n = D.n[0] + ((this._rng() * (D.n[1] - D.n[0] + 1)) | 0);
+    const order = [];
+    for (let i = 0; i < TRAFFIC.count; i++) {
+      const it = TRAFFIC._live[i];
+      order.push([Math.hypot(it.px - p.x, it.pz - p.z), i]);
+    }
+    order.sort((a, b) => a[0] - b[0]);
+    for (let i = 0; i < Math.min(n, order.length); i++) {
+      const it = TRAFFIC._live[order[i][1]];
+      const ang = i * 2.0944 + this._rng() * 0.5;
+      it.rx = p.x + Math.cos(ang) * D.hoverR;
+      it.ry = p.y + D.hoverAlt;
+      it.rz = p.z + Math.sin(ang) * D.hoverR;
+      it.roleT = a.dur;
+      it.state = 4;
+      this._ce.drones.push(it);
+    }
+  },
+  _ceUpdate(a, dt, t) {
+    const e = this._ce;
+    if (!e) return;
+    const C = CFG.events.coolingEmergency;
+    /* fan spin-up: the extra speed is integrated into the fan's PHASE
+     * (p.ph) — the blade angle (p.ph + t·p.sp) stays continuous and
+     * p.sp is never modified ⇒ nothing to restore at the end. */
+    const up = Math.min(1, a.t / C.spin.rampUp);
+    const down = Math.min(1, Math.max(0, a.dur - a.t) / C.spin.rampDown);
+    const level = Math.min(up, down);
+    e.level = level;
+    e.p.ph += dt * e.p.sp * (C.spin.boost - 1) * level;
+    /* warning-LED chase (staggered by 1/3 per corner) */
+    for (let i = 0; i < 3; i++) {
+      const on = ((a.t * C.warnHz + i / 3) % 1) < 0.45 ? 1 : 0.15;
+      this._c.setRGB(on, 0.12 * on, 0.06 * on);
+      this._warn.setColorAt(i, this._c);
+    }
+    if (this._warn.instanceColor)
+      this._warn.instanceColor.needsUpdate = true;
+    /* steam bursts at 35% and 70% of the duration */
+    if (!e.b1 && a.t >= a.dur * 0.35) {
+      e.b1 = true;
+      PARTS.steamBurstAt(e.src, C.steam.mid);
+    }
+    if (!e.b2 && a.t >= a.dur * 0.7) {
+      e.b2 = true;
+      PARTS.steamBurstAt(e.src, C.steam.mid);
+    }
+  },
+  _ceEnd() {
+    const e = this._ce;
+    if (e) {
+      for (const it of e.drones) it.state = 2;  // dispatch drones home
+      /* p.sp was never modified — the accumulated phase is arbitrary
+       * (the fan spins continuously), so there is nothing to restore */
+    }
+    this._warn.visible = false;
+    this._warn.count = 0;
+    this._ce = null;
+  },
+
+  /* drone-launch candidate: one flat-roof building (server/holo,
+   * h ≥ 12) within reach of the player — nearest wins. Seeded block
+   * scan (the M6.4 source-list pattern), planning-time only. */
+  _dlRefresh(t) {
+    if (this._dlCands && t < this._dlT + 5) return;
+    this._dlT = t;
+    const P = CAMERA.pos, c = [];
+    const R = CFG.events.droneLaunch.reach;
+    const B = WORLD.BLOCK, K = WORLD.CHUNK;
+    const pcx = Math.floor(Math.floor(P.x / B) / K);
+    const pcz = Math.floor(Math.floor(P.z / B) / K);
+    const n = Math.ceil(R[1] / B);
+    for (let bx = pcx - n; bx <= pcx + n; bx++) {
+      for (let bz = pcz - n; bz <= pcz + n; bz++) {
+        const ring = Math.max(
+          Math.abs(Math.floor(bx / K) - pcx),
+          Math.abs(Math.floor(bz / K) - pcz));
+        const b = WORLD.buildingAt(bx, bz, ring, ['server', 'holo'], 12);
+        if (!b) continue;
+        const d = Math.hypot(b.x - P.x, b.z - P.z);
+        if (d < R[0] || d > R[1]) continue;
+        c.push({ b, d });
+      }
+    }
+    c.sort((a, b) => a.d - b.d);
+    this._dlCands = c;
+  },
+  _dlReady() {
+    if (TRAFFIC.count < CFG.events.droneLaunch.count[0]) return false;
+    this._dlRefresh(this._time);
+    return this._dlCands.length > 0;
+  },
+  _dlStart(a) {
+    if (!this._dlCands || !this._dlCands.length)
+      this._dlRefresh(this._time);
+    const c = this._dlCands && this._dlCands.length
+      ? this._dlCands[0] : null;
+    if (!c) { this._dl = null; return; }
+    const b = c.b, C = CFG.events.droneLaunch;
+    const x = b.x, y = b.hTop, z = b.z;
+    /* roof bay: the recess appears, the panel swings open (update
+     * animates it; end hides both) */
+    this._bayBay.position.set(x, y + 0.1, z);
+    this._bayBay.visible = true;
+    this._bayPanel.position.set(x, y + 0.25, z);
+    this._bayPanel.rotation.set(0, 0, 0);
+    this._bayPanel.visible = true;
+    this._dl = { x, y, z, drones: [] };
+    /* 2–4 of the NEAREST fleet drones fly in, hold at the open bay,
+     * then fly out to their normal dock/patrol cycle (state 4 →
+     * state 2 → state 0 → state 1). */
+    const n = C.count[0]
+      + ((this._rng() * (C.count[1] - C.count[0] + 1)) | 0);
+    const order = [];
+    for (let i = 0; i < TRAFFIC.count; i++) {
+      const it = TRAFFIC._live[i];
+      order.push([Math.hypot(it.px - x, it.pz - z), i]);
+    }
+    order.sort((a, b2) => a[0] - b2[0]);
+    for (let i = 0; i < Math.min(n, order.length); i++) {
+      const it = TRAFFIC._live[order[i][1]];
+      const ang = i * 1.7;
+      it.rx = x + Math.cos(ang) * 4;
+      it.ry = y + 6;
+      it.rz = z + Math.sin(ang) * 4;
+      it.roleT = C.hover;
+      it.state = 4;
+      this._dl.drones.push(it);
+    }
+  },
+  _dlUpdate(a, dt, t) {
+    if (!this._dl) return;
+    const C = CFG.events.droneLaunch.panel;
+    /* open over the first 1.5 s, close over the last 1.5 s — u = 0
+     * at both endpoints, so the event's own boundaries are clean */
+    const open = Math.min(1, a.t / C.open);
+    const close = Math.min(1, Math.max(0, a.dur - a.t) / C.close);
+    const u = open * close;
+    this._bayPanel.position.set(this._dl.x + u * 3.4,
+                                this._dl.y + 0.25, this._dl.z);
+    this._bayPanel.rotation.y = -u * 1.5708;
+    this._bayBay.visible = u > 0.02;
+  },
+  _dlEnd() {
+    const e = this._dl;
+    if (e) {
+      /* still en route / holding → straight home (normal cycle) */
+      for (const it of e.drones) if (it.state === 4) it.state = 2;
+    }
+    this._bayPanel.visible = false;
+    this._bayBay.visible = false;
+    this._dl = null;
   },
 
   /* Manual trigger (M13.2): start immediately, preempting whatever

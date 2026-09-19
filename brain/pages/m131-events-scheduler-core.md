@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [events, scheduler, m13]
 created: "2026-09-19T15:16:24"
-updated: "2026-09-19T16:56:29"
+updated: "2026-09-19T20:13:44"
 ---
 
 <!-- compiled_truth -->
@@ -34,7 +34,7 @@ updated: "2026-09-19T16:56:29"
 
 ## Status
 
-M13.1 is scheduler-only — the first ambient events (data-pulse, power-cycle) are registered by M13.2 ([[m132-ambient-events-a]]); M13.3–M13.4 add more. The M13.3–M13.4 pages follow the same pattern: register on init, verify with the same harness pattern.
+M13.1 is scheduler-only. The ambient events are registered by M13.2 ([[m132-ambient-events-a]] — data-pulse, power-cycle) and M13.3 ([[m133-ambient-events-b]] — cooling-emergency, drone-launch), so the scheduler now carries all four; M13.4 remains. Each follows the same pattern: register on init, verify with the same harness pattern.
 
 
 ## Timeline
@@ -54,5 +54,11 @@ M13.1 is scheduler-only — the first ambient events (data-pulse, power-cycle) a
 - time: 2026-09-19T16:56:29
   kind: decision
   summary: "M13.2 has registered the first ambient events (data-pulse, power-cycle) — the 'scheduler-only, no events registered yet' status is superseded"
+  source: brain update-truth
+  affects: [m131-events-scheduler-core]
+
+- time: 2026-09-19T20:13:44
+  kind: decision
+  summary: "M13.3 done: scheduler now carries all four ambient events (M13.2 A-pair + M13.3 B-pair); M13.4 remains"
   source: brain update-truth
   affects: [m131-events-scheduler-core]
