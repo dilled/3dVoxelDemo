@@ -869,6 +869,19 @@ const CFG = {
     retry: 1,            // s — re-check when nothing eligible at pick time
     first: 20,           // s until the first pick attempt
     seed: 0x13E5,        // ^ city seed — reproducible firing order
+    /* M13.2: ambient events A (per-event weight/cooldown/duration) */
+    dataPulse: {
+      weight: 1, cd: [12, 24], dur: [2.5, 4],
+      reach: [60, 320],  // m from the player to EACH tower
+      sep: [50, 260],    // m between the two towers
+      arch: 0.15,        // path arch as a fraction of the separation
+      flash: { radius: 14, life: 1.2, color: 0x66e0ff },
+    },
+    powerCycle: {
+      weight: 1, cd: [12, 24], dur: [3, 6],
+      depth: 0.75,       // 1 − multiplier at the dimmest point
+      reach: [0, 300],  // m from the player to the chunk edge
+    },
   },
 };
 
@@ -2965,6 +2978,7 @@ const WORLD = {
       ch.fan.reset(); ch.dish.reset(); ch.pulse.reset();
       ch.sign.reset(); ch.ledWin.reset();
       ch.group.visible = false;
+      WORLD.setChunkPower(ch, 1);     // M13.2: a recycled chunk is never dim
       WORLD._pool.push(ch);           // buffers reused, never disposed
     }
     WORLD._countStats();
@@ -3008,6 +3022,21 @@ const WORLD = {
         sign:  WORLD._detailMesh(D.signGeo, MATS.signMat.qwen, D.signCap, true),
         ledWin: WORLD._detailMesh(D.ledGeo, D.ledMats.a, D.ledCap, true),
       };
+      /* M13.2: per-chunk power-multiplier materials — clones of the
+       * shared mass materials so the section power-cycle event can
+       * dim/brighten ONE chunk's color without touching the shared
+       * originals (1 = base; unbuild / event end restore exactly). */
+      ch.pw = {
+        dark: MATS.metalDark.clone(),
+        server: MATS.server.clone(),
+        darkBase: MATS.metalDark.color.clone(),
+        serverBase: MATS.server.color.clone(),
+      };
+      ch.boxA.mesh.material = ch.pw.dark;
+      ch.boxG.mesh.material = ch.pw.server;
+      ch.cyl.mesh.material = ch.pw.dark;
+      ch.fan.mesh.material = ch.pw.dark;
+      ch.dish.mesh.material = ch.pw.dark;
     }
     ch.cx = cx; ch.cz = cz;
     /* the five detail meshes ride in the chunk group too — without this
@@ -3020,6 +3049,14 @@ const WORLD = {
     WORLD.root.add(ch.group);
     WORLD.chunks.set(cx + ',' + cz, ch);
     WORLD._fill(ch, ring);
+  },
+
+  /* M13.2: per-chunk power multiplier (1 = base color). The ambient
+   * power-cycle event animates this over 3–6 s; unbuild restores 1. */
+  setChunkPower(ch, m) {
+    if (!ch || !ch.pw) return;
+    ch.pw.dark.color.copy(ch.pw.darkBase).multiplyScalar(m);
+    ch.pw.server.color.copy(ch.pw.serverBase).multiplyScalar(m);
   },
 
   /* refill one chunk from its block seeds — pure function of (cx, cz, ring).
@@ -7704,10 +7741,17 @@ const EVENTS = {
   log: [],               // { id, start, end, interrupted } (capped)
   enabled: true,
   paused: false,         // harness seam: freezes the page-loop clock
+  /* M13.2: ambient events A state */
+  _dot: null,            // data-pulse traveling dot (hidden at idle)
+  _dotMat: null,
+  _dpCands: null, _dpPair: null, _dpT: -1e9, _dp: null,
+  _pcCands: null, _pcT: -1e9, _pc: null,
+  _v: new THREE.Vector3(),
 
   init() {
     this._rng = mulberry32(CFG.city.seed ^ CFG.events.seed);
     this._nextAt = CFG.events.first;
+    this.registerAmbient();
   },
 
   register(def) {
@@ -7800,8 +7844,166 @@ const EVENTS = {
   },
 
   update(dt) {
-    if (this.paused) return;
+    /* ambient events only during play — never inside the intro
+     * cinematic (and the harness seam freezes the clock). */
+    if (this.paused || BOOT.state !== 'RUNNING') return;
     this.step(dt);
+  },
+
+  /* ==================================================================
+   * M13.2: ambient events A — data pulse + section power cycle.
+   * Registered at boot (init → registerAmbient); idempotent, so the
+   * smoke harness can unregister/re-register around the M13.1
+   * synthetic-registry section.
+   * ================================================================== */
+  registerAmbient() {
+    if (!this._dot) {
+      this._dotMat = new THREE.MeshBasicMaterial({
+        color: 0x66e0ff, transparent: true, opacity: 0.95,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      });
+      this._dot = new THREE.Mesh(WORLD._detailAssets.pulseGeo, this._dotMat);
+      this._dot.visible = false;
+      this._dot.scale.setScalar(1.5);
+      WORLD.root.add(this._dot);
+    }
+    const dp = CFG.events.dataPulse, pc = CFG.events.powerCycle;
+    this.register({
+      id: 'data-pulse',
+      weight: dp.weight, duration: dp.dur, cooldown: dp.cd, priority: 0,
+      eligible: (t) => EVENTS._dpReady(t),
+      start: (a) => EVENTS._dpStart(a),
+      update: (a, dt, t) => EVENTS._dpUpdate(a, dt, t),
+      end: (i) => EVENTS._dpEnd(i),
+    });
+    this.register({
+      id: 'power-cycle',
+      weight: pc.weight, duration: pc.dur, cooldown: pc.cd, priority: 0,
+      eligible: (t) => EVENTS._pcReady(t),
+      start: (a) => EVENTS._pcStart(a),
+      update: (a, dt, t) => EVENTS._pcUpdate(a, dt, t),
+      end: (i) => EVENTS._pcEnd(i),
+    });
+  },
+
+  /* data-pulse candidate pair: two fiber-spire conduit dashes (the
+   * 'light traveling in the cable' dashes, k=3) within reach of the
+   * player and separated like a conduit run. Refreshed on scheduler
+   * time (5 s throttle) ⇒ deterministic under the forced-seed drive.
+   * Selection is the first legal (i, j) in player-distance order. */
+  _dpRefresh(t) {
+    if (this._dpCands && t < this._dpT + 5) return;
+    this._dpT = t;
+    const P = CAMERA.pos, c = [];
+    for (const ch of WORLD.chunks.values()) {
+      if (!ch.group.visible) continue;
+      for (let i = 0; i < ch.pulse.count; i++) {
+        const p = ch.pulse.pars[i];
+        if (p.k !== 3) continue;
+        c.push({ x: p.x, z: p.z, top: p.hi,
+                 d: Math.hypot(p.x - P.x, p.z - P.z) });
+      }
+    }
+    c.sort((a, b) => a.d - b.d);
+    this._dpCands = c;
+    this._dpPair = null;
+    const R = CFG.events.dataPulse.reach, S = CFG.events.dataPulse.sep;
+    outer: for (let i = 0; i < c.length; i++) {
+      if (c[i].d < R[0] || c[i].d > R[1]) continue;
+      for (let j = 0; j < c.length; j++) {
+        if (j === i || c[j].d < R[0] || c[j].d > R[1]) continue;
+        const sep = Math.hypot(c[i].x - c[j].x, c[i].z - c[j].z);
+        if (sep >= S[0] && sep <= S[1]) { this._dpPair = [i, j]; break outer; }
+      }
+    }
+  },
+  _dpReady(t) {
+    this._dpRefresh(t);
+    return this._dpPair !== null;
+  },
+  _dpStart(a) {
+    if (!this._dpPair) this._dpRefresh(this._time);
+    if (!this._dpPair) { this._dp = null; return; }
+    const A = this._dpCands[this._dpPair[0]], B = this._dpCands[this._dpPair[1]];
+    const sep = Math.hypot(B.x - A.x, B.z - A.z);
+    this._dp = {
+      ax: A.x, ay: A.top, az: A.z,
+      bx: B.x, by: B.top, bz: B.z,
+      mx: (A.x + B.x) / 2, mz: (A.z + B.z) / 2,
+      my: (A.top + B.top) / 2 + sep * CFG.events.dataPulse.arch,
+    };
+    this._dot.visible = true;
+    const F = CFG.events.dataPulse.flash;
+    /* departure flash at tower A's base */
+    FX.pulse(this._v.set(A.x, 0, A.z), F.radius, F.color, F.life);
+  },
+  _dpUpdate(a, dt, t) {
+    if (!this._dp) return;
+    /* a.t is already incremented by step() before update — on the
+     * final frame (a.t >= dur, end() follows) the dot lands EXACTLY
+     * at B's top. */
+    const d = this._dp, u = a.t >= a.dur ? 1 : a.t / a.dur, s = 1 - u;
+    /* quadratic bezier A-top → B-top (arched conduit run) */
+    this._dot.position.set(
+      s * s * d.ax + 2 * s * u * d.mx + u * u * d.bx,
+      s * s * d.ay + 2 * s * u * d.my + u * u * d.by,
+      s * s * d.az + 2 * s * u * d.mz + u * u * d.bz);
+    this._dot.scale.setScalar(1.5 * (1 + 0.3 * Math.sin(Math.PI * u)));
+  },
+  _dpEnd(interrupted) {
+    /* arrival: the dot sits at B's top (and the flash fires) only
+     * when it actually arrived — a preempted pulse is dropped where
+     * it was. */
+    if (this._dp && !interrupted) {
+      this._dot.position.set(this._dp.bx, this._dp.by, this._dp.bz);
+      const F = CFG.events.dataPulse.flash;
+      FX.pulse(this._v.set(this._dp.bx, 0, this._dp.bz),
+        F.radius, F.color, F.life);
+    }
+    this._dot.visible = false;
+    this._dp = null;
+  },
+
+  /* power-cycle candidate: one visible detail-ring chunk with mass,
+   * near the player (distance to the chunk EDGE — the player's own
+   * chunk is 0) — the nearest wins (deterministic). */
+  _pcRefresh(t) {
+    if (this._pcCands && t < this._pcT + 5) return;
+    this._pcT = t;
+    const P = CAMERA.pos, c = [];
+    const R = CFG.events.powerCycle.reach;
+    const K = WORLD.CHUNK * WORLD.BLOCK;
+    for (const ch of WORLD.chunks.values()) {
+      if (!ch.group.visible || !ch.boxA.count || ch.ring > 1) continue;
+      const x0 = ch.cx * K, z0 = ch.cz * K;
+      const dx = Math.max(x0 - P.x, 0, P.x - (x0 + K));
+      const dz = Math.max(z0 - P.z, 0, P.z - (z0 + K));
+      const d = Math.hypot(dx, dz);
+      if (d < R[0] || d > R[1]) continue;
+      c.push({ ch, d });
+    }
+    c.sort((a, b) => a.d - b.d);
+    this._pcCands = c;
+  },
+  _pcReady(t) {
+    this._pcRefresh(t);
+    return this._pcCands.length > 0;
+  },
+  _pcStart(a) {
+    if (!this._pcCands || !this._pcCands.length) this._pcRefresh(this._time);
+    this._pc = this._pcCands && this._pcCands.length ? this._pcCands[0].ch : null;
+  },
+  _pcUpdate(a, dt, t) {
+    if (!this._pc) return;
+    const u = Math.min(1, a.t / a.dur);
+    /* dim to (1 − depth) at the midpoint, brighten back — 1 at u=0 and
+     * u=1, so the event's own endpoints are already clean */
+    WORLD.setChunkPower(this._pc,
+      1 - CFG.events.powerCycle.depth * Math.sin(Math.PI * u));
+  },
+  _pcEnd() {
+    if (this._pc) WORLD.setChunkPower(this._pc, 1);
+    this._pc = null;
   },
 
   /* Manual trigger (M13.2): start immediately, preempting whatever

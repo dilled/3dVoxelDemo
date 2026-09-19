@@ -36,6 +36,20 @@
  *     fires once, gap resumes
  *   - determinism: same seed + same steps ⇒ identical firing order
  *
+ *   M13.2 checks:
+ *   - ambient events A registered at boot (data-pulse, power-cycle;
+ *     the data-pulse dot mesh hidden at idle)
+ *   - manual trigger: trigger('data-pulse') preempts a running
+ *     'power-cycle' (victim interrupted, starts exactly at victim's end);
+ *     the dot travels A-top → B-top and ends at B; both ends flash
+ *     (FX.pulse fired at departure and arrival)
+ *   - power cycle: one chunk dims (material multiplier < 0.5 at the
+ *     dip) and restores byte-exact at the end
+ *   - scheduled: forced-seed 120 s drive — both events fire, no
+ *     overlaps, gaps respected, cooldowns held, deterministic
+ *   - no leftover state: every chunk's power color at base, dot
+ *     hidden, FX drained, nothing active
+ *
  *   M1 checks:
  *   - systems registry boots in fixed order
  *     (INPUT, CAMERA, KIT, WORLD, ENTITY, TRAFFIC, PARTS, HUD)
@@ -490,10 +504,15 @@ try {
    * (the refresh above re-seeded it) — a live event would add 2 draw
    * calls + a hemi/flash bump into the other sections' measurements.
    * The M8.4 section verifies the timer explicitly. M9.6: park the
-   * one-shot auto-awaken again (the refresh above re-armed it). */
+   * one-shot auto-awaken again (the refresh above re-armed it).
+   * M13.2: park the ambient event scheduler too — a live data-pulse
+   * dot / power-cycle dim would leak into the earlier sections'
+   * draw-call and visual measurements. The M13.1/M13.2 sections own
+   * the scheduler explicitly. */
   await page.evaluate(() => {
     window.SIM.ATMOS._ltTimer = 1e9;
     window.SIM.ENTITY._autoAt = Infinity;
+    window.SIM.EVENTS.paused = true;
   });
 
   /* ------------------------------------------------------------------
@@ -9515,6 +9534,16 @@ try {
      * preempt whatever is running). Page is RUNNING (no reload). */
     await page.evaluate(() => {
       const S = window.SIM, E = S.EVENTS;
+      /* M13.2: the ambient events (data-pulse / power-cycle) are
+       * registered from boot — this section tests the scheduler with
+       * a synthetic registry only, so end anything live, unregister
+       * the ambient events, and un-park the page loop (the boot park
+       * above froze it for the preceding sections). Cleanup
+       * re-registers the ambient events. */
+      if (E._active) E._end(E._active, true);
+      E.unregister('data-pulse');
+      E.unregister('power-cycle');
+      E.paused = false;
       S.CFG.events.gap = [2, 4];   // test pacing (shorter than CFG)
       S.CFG.events.first = 0;
       window.__m131 = { gate: false };
@@ -9628,7 +9657,8 @@ try {
       JSON.stringify(log2) === JSON.stringify(log1),
       `n1=${log1.length}, n2=${log2.length}`);
 
-    /* cleanup: synthetic registry gone, real CFG/clock/rng restored */
+    /* cleanup: synthetic registry gone, real CFG/clock/rng restored,
+     * ambient events back in the registry (M13.2 section follows) */
     await page.evaluate(() => {
       const S = window.SIM, E = S.EVENTS;
       E.unregister('evA');
@@ -9638,8 +9668,189 @@ try {
       S.CFG.events.first = 20;
       E.reset();
       E._rng = S.WORLD.mulberry(S.CFG.city.seed ^ S.CFG.events.seed);
+      E.registerAmbient();
       E.paused = false;
       delete window.__m131;
+    });
+  }
+
+  /* ---- 9c. M13.2 — Ambient events A: data pulse + section power
+   *    cycle (manual trigger + preemption, clean resolve, scheduled
+   *    firing order, determinism, no leftover state) ---- */
+  {
+    /* take over the scheduler (page is RUNNING, no reload) */
+    await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      if (E._active) E._end(E._active, true);
+      E.reset();
+      E.paused = true;
+    });
+
+    /* 1. registration: both ambient events, dot mesh hidden at idle */
+    const reg = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      return {
+        dp: !!E._reg.get('data-pulse'),
+        pc: !!E._reg.get('power-cycle'),
+        dot: !!E._dot && E._dot.visible === false,
+        inRoot: E._dot && E._dot.parent === S.WORLD.root,
+      };
+    });
+    check('M13.2: ambient events A registered (data-pulse, power-cycle; dot idle-hidden in WORLD.root)',
+      reg.dp && reg.pc && reg.dot && reg.inRoot,
+      JSON.stringify(reg));
+
+    /* 2. manual trigger: power-cycle starts, then data-pulse is
+     * triggered and must PREEMPT it (victim interrupted, data-pulse
+     * starts exactly at the victim's end). Drive the data-pulse to
+     * natural completion with the frozen clock. */
+    const man = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E._rng = S.WORLD.mulberry(0x1352);
+      const okPc = E.trigger('power-cycle');
+      const okDp = E.trigger('data-pulse');
+      const preempted = !!(E._active && E._active.id === 'data-pulse');
+      const A = E._dp ? [E._dp.ax, E._dp.ay, E._dp.az] : null;
+      const B = E._dp ? [E._dp.bx, E._dp.by, E._dp.bz] : null;
+      let maxFx = 0;
+      let p5 = null, p20 = null, pEnd = null, steps = 0;
+      while (E._active && steps < 80) {
+        E.step(0.1);
+        steps++;
+        maxFx = Math.max(maxFx, S.FX.count);
+        /* the position persists after the dot hides — on the final
+         * frame the event snaps it to EXACTLY B's top */
+        pEnd = E._dot.position.toArray();
+        if (steps === 5) p5 = E._dot.visible ? pEnd : null;
+        if (steps === 20) p20 = E._dot.visible ? pEnd : null;
+      }
+      const fxAfter = S.FX.count;
+      const pc = E.log.filter(e => e.id === 'power-cycle').pop();
+      const dp = E.log.filter(e => e.id === 'data-pulse').pop();
+      return { okPc, okDp, preempted, A, B, p5, p20, pEnd, maxFx, fxAfter,
+               pc, dp, active: E._active ? E._active.id : null };
+    });
+    check('M13.2: manual trigger — data-pulse preempts the running power-cycle',
+      man.okPc && man.okDp && man.preempted && man.pc && man.dp &&
+      man.pc.interrupted === true && man.dp.start === man.pc.end,
+      `pc=${JSON.stringify(man.pc)}, dp=${JSON.stringify(man.dp)}`);
+    {
+      const moved = !!man.p5 && !!man.p20 &&
+        JSON.stringify(man.p5) !== JSON.stringify(man.p20);
+      const atB = !!man.B && !!man.pEnd &&
+        Math.hypot(man.pEnd[0] - man.B[0], man.pEnd[1] - man.B[1],
+                   man.pEnd[2] - man.B[2]) < 0.01;
+      check('M13.2: data-pulse dot travels A-top → B-top and ends at B',
+        moved && atB && !man.active,
+        `p5=${JSON.stringify(man.p5)}, p20=${JSON.stringify(man.p20)}, B=${JSON.stringify(man.B)}`);
+      check('M13.2: data-pulse both ends flash (FX.pulse at departure + arrival)',
+        man.maxFx >= 1 && man.fxAfter >= 1,
+        `maxFx=${man.maxFx}, fxAfter=${man.fxAfter}`);
+      check('M13.2: data-pulse resolves clean (log entry, natural end, duration in [2.5, 4])',
+        man.dp && man.dp.interrupted === false &&
+        man.dp.end - man.dp.start >= 2.5 - 1e-9 && man.dp.end - man.dp.start <= 4 + 1e-9,
+        `dp=${JSON.stringify(man.dp)}`);
+    }
+
+    /* 3. power cycle: one chunk dims (multiplier < 0.5 at the dip)
+     * and restores byte-exact at the end. */
+    const pc2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E.trigger('power-cycle');
+      const ch = E._pc || null;   // E._pc IS the chunk
+      if (!ch) return { ok: false };
+      let minM = 1;
+      while (E._active) {
+        E.step(0.1);
+        const m = ch.pw.dark.color.r / ch.pw.darkBase.r;
+        if (m < minM) minM = m;
+      }
+      const c = ch.pw.dark.color, b = ch.pw.darkBase;
+      const cs = ch.pw.server.color, bs = ch.pw.serverBase;
+      const restored = c.r === b.r && c.g === b.g && c.b === b.b &&
+        cs.r === bs.r && cs.g === bs.g && cs.b === bs.b;
+      const entry = E.log.filter(e => e.id === 'power-cycle').pop();
+      return { ok: true, minM, restored, entry,
+               active: E._active ? E._active.id : null };
+    });
+    check('M13.2: power cycle dims the chunk (multiplier < 0.5 at the dip)',
+      pc2.ok && pc2.minM < 0.5, `minM=${pc2.ok ? pc2.minM.toFixed(3) : 'n/a'}`);
+    check('M13.2: power cycle restores the chunk byte-exact (no leftover state)',
+      pc2.ok && pc2.restored && !pc2.active && pc2.entry &&
+      pc2.entry.interrupted === false &&
+      pc2.entry.end - pc2.entry.start >= 3 - 1e-9 &&
+      pc2.entry.end - pc2.entry.start <= 6 + 1e-9,
+      `entry=${JSON.stringify(pc2.entry)}`);
+
+    /* 4. scheduled: both events fire in a legal, deterministic order
+     * (forced seed, 1200 × 0.1 s, test pacing). */
+    const sched = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      S.CFG.events.gap = [2, 4];
+      S.CFG.events.first = 0;
+      E.reset();
+      E._rng = S.WORLD.mulberry(0x1322);
+      for (let i = 0; i < 1200; i++) E.step(0.1);
+      return JSON.parse(JSON.stringify(E.log));
+    });
+    {
+      const nDp = sched.filter(e => e.id === 'data-pulse').length;
+      const nPc = sched.filter(e => e.id === 'power-cycle').length;
+      /* the gap is a MINIMUM: when both events are in cooldown the
+       * scheduler waits (retry) — gaps exceed [2, 4] legally. */
+      let noOverlap = true, gapsOk = true, cdOk = true;
+      for (let i = 1; i < sched.length; i++) {
+        const gap = sched[i].start - sched[i - 1].end;
+        if (!(sched[i].start > sched[i - 1].end)) noOverlap = false;
+        if (!(gap >= 2 - 1e-9)) gapsOk = false;
+        if (sched[i].id === sched[i - 1].id &&
+            !(gap >= 12 - 1e-9)) cdOk = false;
+      }
+      check('M13.2: scheduled — both ambient events fire',
+        nDp >= 2 && nPc >= 2, `data-pulse=${nDp}, power-cycle=${nPc}, n=${sched.length}`);
+      check('M13.2: scheduled — no overlaps, min gap >= 2 held, cooldowns >= 12',
+        noOverlap && gapsOk && cdOk, `n=${sched.length}`);
+    }
+    const sched2 = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      E.reset();
+      E._rng = S.WORLD.mulberry(0x1322);
+      for (let i = 0; i < 1200; i++) E.step(0.1);
+      return JSON.parse(JSON.stringify(E.log));
+    });
+    check('M13.2: scheduled — forced seed ⇒ identical firing order (deterministic)',
+      JSON.stringify(sched2) === JSON.stringify(sched),
+      `n1=${sched.length}, n2=${sched2.length}`);
+
+    /* 5. no leftover state: every chunk's power color at base, dot
+     * hidden, FX drained (the last pulses expire in real time),
+     * nothing active. */
+    await sleep(2000);
+    const clean = await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      let pwOk = true;
+      for (const ch of S.WORLD.chunks.values()) {
+        if (!ch.pw) continue;
+        for (const k of ['dark', 'server']) {
+          const c = ch.pw[k].color, b = ch.pw[k + 'Base'];
+          if (c.r !== b.r || c.g !== b.g || c.b !== b.b) pwOk = false;
+        }
+      }
+      return { pwOk, dotHidden: !E._dot.visible,
+               active: E._active ? E._active.id : null, fx: S.FX.count };
+    });
+    check('M13.2: no leftover state (chunks at base, dot hidden, FX drained, nothing active)',
+      clean.pwOk && clean.dotHidden && !clean.active && clean.fx === 0,
+      JSON.stringify(clean));
+
+    /* cleanup: real CFG/clock/rng restored, page loop resumes */
+    await page.evaluate(() => {
+      const S = window.SIM, E = S.EVENTS;
+      S.CFG.events.gap = [14, 30];
+      S.CFG.events.first = 20;
+      E.reset();
+      E._rng = S.WORLD.mulberry(S.CFG.city.seed ^ S.CFG.events.seed);
+      E.paused = false;
     });
   }
 

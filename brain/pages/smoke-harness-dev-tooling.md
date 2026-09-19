@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-19T15:17:58"
+updated: "2026-09-19T16:56:29"
 ---
 
 <!-- compiled_truth -->
@@ -82,3 +82,8 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   summary: "M13.1 extends the harness: fixed-order check is now …AUDIO→HUD→EVENTS; new M13.1 section (9 checks after M12.3, page already RUNNING, no reload) — synthetic evA/evB/evC registry, page-loop clock-advance check, then paused=true + reset + forced seed WORLD.mulberry(0x1337) + test pacing (CFG.events.gap=[2,4], first=0) + 1200×step(0.1): no overlaps / gap ∈ [2,4]+step / same-id cooldown / weighted A>B / gated-C-never; priority: gate flip preempts the running event (victim interrupted, c.start===victim.end exactly, fires once, gap resumes); determinism: same seed+steps ⇒ identical log; cleanup unregisters + restores CFG/clock/rng. Gotcha: the scheduler log holds ENDED events only — a just-preempted event is _active, not yet in the log"
   source: M13.1 implementation
   affects: [smoke-harness-dev-tooling]
+
+- time: 2026-09-19T16:56:29
+  kind: decision
+  summary: "M13.2 extends the harness: boot-park block now also parks EVENTS (paused=true, no ambient events during the earlier sections); M13.1 section now unregisters the ambient events before its synthetic registry (isolation) and re-registers them in cleanup; new M13.2 section (11 checks after M13.1, page already RUNNING, no reload) — registration (both ids, dot idle-hidden in WORLD.root), manual trigger (data-pulse preempts the running power-cycle; both log entries exact), data-pulse (dot travels A-top→B-top along the Bezier — sampled at steps 5/20, final position exactly B's top because step() increments a.t before update and the final frame uses u=1; FX.pulse at departure+arrival, FX.count sampled per step), power cycle (per-chunk cloned-material multiplier dips < 0.5 then restores byte-exact to the captured base colors, E._pc IS the chunk), scheduled determinism (forced seed WORLD.mulberry(0x1322), 1200×step(0.1), identical firing order across two runs — no overlaps / min gap >= 2 (the gap is a MINIMUM: cooldown waits are legal, no upper bound) / same-id cooldown >= 12), no leftover state (all chunks at base, dot hidden, FX drained, nothing active). Gotchas: chunk EDGE distance for power-cycle reach (street spawn sits on a chunk corner; nearest chunk center is ~259 m ⇒ center-distance reach finds zero candidates); the scheduler log holds ENDED events only; a preempted data-pulse is dropped where it was (no arrival flash)"
+  affects: [smoke-harness-dev-tooling, m132-ambient-events-a]

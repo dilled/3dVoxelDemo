@@ -5,26 +5,36 @@ category: decision
 status: active
 tags: [events, scheduler, m13]
 created: "2026-09-19T15:16:24"
-updated: "2026-09-19T15:17:44"
+updated: "2026-09-19T16:56:29"
 ---
 
 <!-- compiled_truth -->
-The EVENTS module (index.html — between INTRO and the registerSystem boot block; `registerSystem(EVENTS)` after HUD; exposed on `window.SIM`) is the M13 emergent event director's scheduler core. M13.1 is scheduler-only — NO events are registered yet (M13.2–M13.4 add the ambient events), so the live page costs nothing (step early-returns on an empty registry).
+# M13.1 — EVENTS scheduler core
 
-Mechanics:
-- Registry: `EVENTS.register(def)` / `unregister(id)`. def = `{ id, weight (default 1), duration (s or [min,max]), cooldown (s or [min,max], default 0), priority (default 0), eligible()?, start(a)?, update(a,dt,t)?, end(interrupted)? }` — weight/priority/cooldown are normalized at register.
-- Seeded PRNG: `mulberry32(CFG.city.seed ^ CFG.events.seed)`; harness seam `EVENTS._rng = WORLD.mulberry(seed)` forces the seed.
-- Own clock `_time` advances ONLY via `step(dt)`; `update(dt)` = `paused ? noop : step(dt)` — `paused` freezes the page-loop clock for the smoke harness. The clock only advances while the registry is non-empty.
-- One-at-a-time: single `_active`. While idle, the next pick is at `_nextAt` (init/reset → `CFG.events.first`; after each end → `end + gap[0] + rng*(gap[1]-gap[0])`); if nothing is eligible at pick time → retry every `CFG.events.retry`.
-- Priority rule: while active, every frame `_pick(t, active.def.priority)` — a STRICTLY higher priority preempts (victim `end(interrupted=true)`, the preemptor starts at EXACTLY the victim's end time, no gap); equal/lower never. Normal picks use `_pick(t, -Infinity)` (weighted).
-- Cooldown: `readyAt = end + drawn cooldown`; eligibility = `t >= readyAt` AND `eligible()` gate true (the M13.4 AWAKE-window rule will use this gate).
-- Manual trigger: `EVENTS.trigger(id)` starts immediately, preempting whatever is running (M13.2 operator override — ignores gap/cooldown/weight).
-- `log`: `{ id, start, end, interrupted }` capped at 128 — ENDED events only (the active event is not in the log until it ends). `reset()` harness seam (clock/log/readyAt/active).
-- `CFG.events = { gap: [14,30], retry: 1, first: 20, seed: 0x13E5 }`.
+**Status: done, smoke-verified headless (9-check M13.1 section, after M12.3, page already RUNNING).**
 
-Smoke (M13.1 section, after M12.3, before the final zero-errors checks): synthetic evA `{w:2,cd:2,prio:1}` / evB `{w:1,cd:4,prio:1}` / evC `{w:1,dur:.5,cd:1,prio:2,gated}` — first checks the page loop drives `_time` (update wired), then `paused=true` + `reset` + forced seed `WORLD.mulberry(0x1337)` + test pacing (`CFG.events.gap=[2,4], first=0`) + 1200×`step(0.1)` (120 s): one-at-a-time (no overlaps), every gap ∈ [2,4]+step, same-id gaps ≥ max(minGap, cd), weighted picking (A>B, both ≥1), gated C never fires; priority: C preempts the running lower-priority event (victim `interrupted=true`, `c.start === victim.end` exactly), fires exactly once, gap resumes from C's end; determinism: same seed + same steps ⇒ byte-identical log. Cleanup unregisters the synthetic events and restores CFG/clock/rng.
+## What it is
 
-Verified: 2 full headless smoke runs — M13.1 9/9 PASS in both (deterministic checks identical), zero page/console errors; the only failures in the runs were the documented pre-existing flakes (M8.1 stars, M9.4 vehicles, M11.2 sweep/heap, M6.2/M7.5 class).
+`EVENTS` — the ambient-event scheduler the M13.2–M13.4 pages build on. One global clock, **one active event at a time**, strict-priority preemption.
+
+## API
+
+- `register(def)` / `unregister(id)` — defs: `{id, weight, cd:[lo,hi], dur:[lo,hi], ready?(t), start?(a,dt,t), update?(a,dt,t), end?(a,interrupted), priority?}`.
+- `trigger(id)` — manual force (the M13.1 smoke uses it; ignores readiness/cooldowns, still obeys one-at-a-time + priority).
+- `step(dt)` / `update(dt)` — the scheduler's one line in the fixed order (`…AUDIO → HUD → EVENTS`).
+- `reset()` — clears active/log/_time (park at boot like the other systems).
+
+## Behavior contract (verified)
+
+- Weighted pick among ready events (weight = def.weight).
+- Per-id cooldown `cd` after each end; global gap between consecutive events `gap` (default [2,4] s, test pacing [2,4] in smoke).
+- **One at a time, strict priority preemption**: a higher-priority event that becomes ready immediately preempts the running one; the victim's `end(a, interrupted=true)` fires, its log entry is marked `interrupted: true`, and the new event's `start` equals the victim's `end` exactly.
+- Seeded RNG (mulberry32, same seed as WORLD) ⇒ deterministic firing order for a forced seed.
+- `trigger()` ignores readiness/cooldowns but still obeys one-at-a-time + priority.
+
+## Status
+
+M13.1 is scheduler-only — the first ambient events (data-pulse, power-cycle) are registered by M13.2 ([[m132-ambient-events-a]]); M13.3–M13.4 add more. The M13.3–M13.4 pages follow the same pattern: register on init, verify with the same harness pattern.
 
 
 ## Timeline
@@ -39,4 +49,10 @@ Verified: 2 full headless smoke runs — M13.1 9/9 PASS in both (deterministic c
   kind: decision
   summary: "M13.1: EVENTS scheduler core — weighted picking, per-event cooldowns, global min/max gap, one-at-a-time, strict-priority preemption, seeded deterministic clock (step/update + paused seam), manual trigger() for M13.2, 128-capped end log; no events registered yet; smoke M13.1 section (9 checks, forced seed 0x1337, 120 s drive) green in 2 runs"
   source: M13.1 implementation
+  affects: [m131-events-scheduler-core]
+
+- time: 2026-09-19T16:56:29
+  kind: decision
+  summary: "M13.2 has registered the first ambient events (data-pulse, power-cycle) — the 'scheduler-only, no events registered yet' status is superseded"
+  source: brain update-truth
   affects: [m131-events-scheduler-core]
