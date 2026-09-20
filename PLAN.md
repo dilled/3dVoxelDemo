@@ -86,7 +86,7 @@ smoke-test evidence.
 | **M13.4** ✅ | Ambient events C: mechanical reposition (giant fan/antenna/ring slow move + rumble + tiny shake) + distant EM discharge (far lightning + a few city arcs); awakening-compat: during AWAKE only creature-priority events fire | 3-min idle play shows ≥ 4 different events, none conflicting, none breaking perf; AWAKE window respected |
 | **M14.1** ✅ | Perf monitor + quality tiers: rolling FPS, `HIGH/MED/LOW` (auto + manual); tiers scale LOD radius, particle/drone/vehicle caps, sign texture updates, light shafts, audio beds | Forcing each tier in smoke run: stats within budget, no stutter on tier switch |
 | **M14.2** ✅ | HUD stats (small, corner, toggleable): FPS, visible instances, active drones, chunk id, AI state | HUD matches measured stats; toggle hides it; costs nothing hidden |
-| **M14.3** | Polish pass: shake tuning, flash tuning, title fade, mute key (`M`), help overlay (`H`), cheap DOM vignette | Each control verified working; feel pass recorded (3-min run) |
+| **M14.3** ✅ | Polish pass: shake tuning, flash tuning, title fade, mute key (`M`), help overlay (`H`), cheap DOM vignette | Each control verified working; feel pass recorded (3-min run) |
 | **M14.4** | Robustness pass: refresh mid-game, tab-hide/resume (dt clamp), resize mid-awakening, gamepad plug/unplug — no errors, no stuck states | Robustness checklist in smoke run fully green |
 | **M14.5** | Final verification: manual 3-min screen-recording run — intro → reveal → idle life → manual awakening → easter-egg reaction → performance stable | Recording reviewed; stable frame rate through the awakening at default quality on a modern gaming GPU |
 
@@ -1171,10 +1171,48 @@ events, none conflicting, none breaking perf.
   M10.1 screenshot observation / M11.2 heap class).
 
 #### M14.3 — Polish pass
-- [ ] Camera shake tuning, flash tuning, title fade, mute key (`M`),
+- [x] Camera shake tuning, flash tuning, title fade, mute key (`M`),
       help overlay (`H`), vignette via cheap DOM gradient.
 - **Test:** each control verified working; short feel pass recorded.
 - **Commit when:** polish checklist green.
+  Verified: smoke M14.3 section green (11 checks, section 9h, after
+  M14.2, before the no-errors gate) — the polish pass: **vignette** =
+  `#vignette`, a STATIC DOM radial gradient (transparent centre →
+  `rgba(2,5,12,0.45)` at the edges), `position:fixed`, z-index 5 (above
+  the canvas, below the z-10 UI), `pointer-events:none`, and NO JS ever
+  writes it (computed style verified invariant across frames — one
+  composited layer, zero per-frame cost); **help overlay** = `#help`
+  centred panel in `.ui`, hidden by default (`display:none` ⇒ zero cost),
+  Key `H` (`INPUT.help` edge, repeat-guarded, RUNNING only) → `HUD.update`
+  consumes it BEFORE the hidden-stats early return (the toggle works in
+  every stats state — verified with the stats block hidden) → `.on`
+  class + `aria-hidden`; the overlay carries the 6-line control list
+  (WASD/ZQSD move / MOUSE look · WHEEL zoom · MMB orbit · V camera /
+  F awaken · M mute · I stats · H help / F1–F3 · F4 auto / P R T B N L
+  dev triggers), `pointer-events:none` (pass-through); hint line +=
+  ` · H help`; **mute key M** re-verified working (mute gain → 0 and
+  back — the M11.1 choke point); **shake tuned** — `CFG.input.shakeAmp`
+  0.22 → 0.18 m (subtle, no nausea; decay 2.4 / cap 1.5 / impulse 1.0
+  unchanged to keep the M7.5 cap-hold margin): Key N impulse decays
+  monotonically to EXACTLY 0 in ~0.35 s measured (< 0.42 s theoretical),
+  camera lands exactly back on the pose (sampled one frame after the
+  draining frame); **flash tuned** — `CFG.fx.flash.decay` τ 0.30 → 0.22 s
+  (crisper, no lingering): Key B flash resolves monotonically to exactly
+  0 in ~1.13 s measured (was ~1.66 s), overlay plane hidden again;
+  **title fade tuned** — `CFG.intro.beat4` fadeIn/fadeOut 0.5/0.6 →
+  0.7/0.7 (gentler, 0.6 s hold): `_applyBeatFx` is a pure function of t
+  — sampled in-window (0.45 s → 0.643, hold peak 1.0 at 0.85 s,
+  1.8 s → 0.286) and `_resetFx()` restores the post-intro state exactly
+  (title 0, end wall, portal, city, fade 0); M12.2's title-fade smoke
+  expectations updated to the tuned windows (12.05 → ≈0.64,
+  13.4 → ≈0.29; peak 12.3 still exactly 1). Feel pass (headless
+  measurements): shake impulse resolves in ~0.35 s; flash τ 0.22
+  resolves in ~1.13 s; title fade is seek-exact with no DOM animation
+  cost; vignette provably 0 JS writes. Full suite 3 runs on final code:
+  M14.3 11/11 in every run, zero page/console errors; only failures are
+  the documented pre-existing headless flakes (M7.5 cap-hold 1.18 /
+  M8.1 star brightness / M9.4 vehicle avoidance / M11.2/M11.3 heap
+  class).
 
 #### M14.4 — Robustness pass
 - [ ] Page refresh mid-game, tab-hide/resume (dt clamp), window resize

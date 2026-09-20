@@ -9282,11 +9282,12 @@ try {
         Math.abs(Math.hypot(kf.x, kf.z) - 104) < 0.01 &&
         Math.abs(kf.y - 68) < 0.01,
         `cam=(${kf.x.toFixed(1)}, ${kf.y.toFixed(1)}, ${kf.z.toFixed(1)})`);
-      /* fade in / fade out windows */
+      /* fade in / fade out windows (M14.3 tuned 0.7 s in / 0.7 s out,
+       * 0.6 s hold: 12.05 → 0.45/0.7 ≈ 0.64, 13.4 → 0.2/0.7 ≈ 0.29) */
       const f1 = await seekState(12.05);
       const f2 = await seekState(13.4);
-      check('M12.2: beat 4 — title fades (in at 12.05 ≈ 0.9, out at 13.4 ≈ 0.33)',
-        Math.abs(f1.titleOp - 0.9) < 0.05 && Math.abs(f2.titleOp - 1 / 3) < 0.05,
+      check('M12.2: beat 4 — title fades (in at 12.05 ≈ 0.64, out at 13.4 ≈ 0.29)',
+        Math.abs(f1.titleOp - 0.64) < 0.05 && Math.abs(f2.titleOp - 0.29) < 0.05,
         `t12.05=${f1.titleOp.toFixed(2)}, t13.4=${f2.titleOp.toFixed(2)}`);
       await page.evaluate(() => window.SIM.INTRO.seek(12.3));
       await sleep(120);
@@ -11063,6 +11064,245 @@ try {
     }));
     check('M14.2: no leftover state — stats block visible, no pending I edge',
       fin.visible === true && fin.edge === false, JSON.stringify(fin));
+  }
+
+  /* ---- 9h. M14.3 — polish: help overlay (H), DOM vignette, tuned
+       *     shake / flash / title fade, mute key ---- */
+  {
+    /* 1. vignette: a cheap STATIC DOM radial gradient — above the
+     *    canvas (z 5), below the z-10 UI, pass-through, and the style
+     *    never changes across frames (no JS writes it at all). */
+    const vig = await page.evaluate(async () => {
+      const el = document.getElementById('vignette');
+      if (!el) return { ok: false };
+      const cs = getComputedStyle(el);
+      const snap = () => cs.backgroundImage + '|' + cs.opacity;
+      const s0 = snap();
+      await new Promise(r => requestAnimationFrame(
+        () => requestAnimationFrame(r)));
+      return {
+        ok: true,
+        radial: cs.backgroundImage.includes('radial-gradient'),
+        pe: cs.pointerEvents,
+        z: cs.zIndex,
+        uiZ: getComputedStyle(document.querySelector('.ui')).zIndex,
+        static: s0 === snap(),
+      };
+    });
+    check('M14.3: vignette — static DOM radial-gradient, pointer-events none, above the canvas (z 5) below the UI (z 10), no JS writes',
+      vig.ok && vig.radial && vig.pe === 'none' &&
+      vig.z === '5' && vig.uiZ === '10' && vig.static,
+      `radial=${vig && vig.radial}, pe=${vig && vig.pe}, ` +
+      `z=${vig && vig.z}, uiZ=${vig && vig.uiZ}, static=${vig && vig.static}`);
+
+    /* 2. help overlay: hidden by default; Key H shows it (the full
+     *    control list, pass-through); Key H hides it again. */
+    const helpState = () => page.evaluate(() => {
+      const el = document.getElementById('help');
+      const cs = getComputedStyle(el);
+      return {
+        on: el.classList.contains('on'),
+        display: cs.display,
+        pe: cs.pointerEvents,
+        text: el.textContent,
+        edge: window.SIM.INPUT.help,
+      };
+    });
+    const h0 = await helpState();
+    check('M14.3: help overlay hidden by default (display none, no pending H edge)',
+      h0.on === false && h0.display === 'none' && h0.edge === false,
+      `on=${h0.on}, display=[${h0.display}], edge=${h0.edge}`);
+    await page.keyboard.press('h');
+    await sleep(150);
+    const h1 = await helpState();
+    const listOk = /WASD/.test(h1.text) && /shift sprint/i.test(h1.text) &&
+      /MOUSE look/i.test(h1.text) && /V camera/i.test(h1.text) &&
+      /F awaken/.test(h1.text) && /M mute/.test(h1.text) &&
+      /I stats/.test(h1.text) && /F1–F3/.test(h1.text) &&
+      /B flash/.test(h1.text) && /N shake/.test(h1.text) &&
+      /L lightning/.test(h1.text);
+    check('M14.3: Key H shows the help overlay — control list (move/look/awaken/mute/stats/quality/dev triggers), pointer-events none',
+      h1.on === true && h1.display !== 'none' && h1.pe === 'none' && listOk,
+      `on=${h1.on}, display=[${h1.display}], pe=${h1.pe}, ` +
+      `lines=${h1.text.split('\n').length}`);
+
+    /* the toggle must work even with the stats block hidden (the
+     * edge is consumed before HUD.update's hidden early-return) */
+    await page.keyboard.press('i');   // hide the stats
+    await sleep(100);
+    await page.keyboard.press('h');   // help: ON → OFF, stats hidden
+    await sleep(100);
+    const h2 = await helpState();
+    const hudHidden = await page.evaluate(() => window.SIM.HUD.visible);
+    check('M14.3: help HIDE works with the stats block hidden (edge consumed before the early return)',
+      h2.on === false && hudHidden === false,
+      `on=${h2.on}, hudVisible=${hudHidden}`);
+    await page.keyboard.press('h');   // help: OFF → ON, stats still hidden
+    await sleep(100);
+    const h3 = await helpState();
+    const hudStillHidden = await page.evaluate(() => window.SIM.HUD.visible);
+    check('M14.3: help SHOW works with the stats block hidden',
+      h3.on === true && h3.display !== 'none' && hudStillHidden === false,
+      `on=${h3.on}, display=[${h3.display}], hudVisible=${hudStillHidden}`);
+    await page.keyboard.press('h');   // help off
+    await page.keyboard.press('i');   // stats restored
+    await sleep(150);
+    const h4 = await helpState();
+    const hudBack = await page.evaluate(() => window.SIM.HUD.visible);
+    check('M14.3: Key H hides the help overlay again — no leftover (help off, no pending edge, stats visible)',
+      h4.on === false && h4.display === 'none' && h4.edge === false &&
+      hudBack === true,
+      `on=${h4.on}, display=[${h4.display}], edge=${h4.edge}, hudVisible=${hudBack}`);
+
+    /* 3. mute key (control re-verified): M → mute gain 0, M → back. */
+    const muteState = () => page.evaluate(() => {
+      const A = window.SIM.AUDIO;
+      return { muted: A.muted,
+        gain: A.muteGain ? A.muteGain.gain.value : -1 };
+    });
+    await page.keyboard.press('m');
+    await sleep(120);
+    const mu1 = await muteState();
+    await page.keyboard.press('m');
+    await sleep(120);
+    const mu0 = await muteState();
+    check('M14.3: mute key M works — mute gain → 0 and back to 1 (last stage before destination)',
+      mu1.muted === true && mu1.gain < 0.01 &&
+      mu0.muted === false && mu0.gain > 0.9,
+      `muted=${mu1.muted}, gainMute=${mu1.gain && mu1.gain.toFixed(3)}, gainOn=${mu0.gain && mu0.gain.toFixed(3)}`);
+
+    /* 4. tuned shake: deterministic still pose; the Key N impulse
+     *    decays monotonically to EXACTLY 0 within the tuned snappy
+     *    budget, and the camera lands exactly back on the pose. */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(-180, 40, 180);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 2.22;
+      S.CAMERA.pitch = -0.35;
+      S.CAMERA.fov = 60;
+      S.CAMERA.shakeEnergy = 0;
+      S.__m143T0 = null;
+    });
+    await sleep(400);
+    await page.keyboard.press('n');
+    const shakeUp = await page.waitForFunction(() => {
+      const C = window.SIM.CAMERA;
+      if (C.shakeEnergy > 0 && window.SIM.__m143T0 === null)
+        window.SIM.__m143T0 = performance.now();
+      return C.shakeEnergy > 0;
+    }, { timeout: 5000 }).then(() => true).catch(() => false);
+    const shakeDec = await page.evaluate(async () => {
+      const S = window.SIM, C = S.CAMERA;
+      const t0 = S.__m143T0;
+      const rows = [];
+      for (let i = 0; i < 60 && C.shakeEnergy > 0; i++) {
+        rows.push(C.shakeEnergy);
+        await new Promise(r => requestAnimationFrame(r));
+      }
+      const monotone = rows.every(
+        (v, i) => i === 0 || v <= rows[i - 1] + 1e-9);
+      /* one more frame: the frame that drained energy to 0 may have
+       * applied its tiny offset BEFORE draining — the next frame's
+       * pose copy is what we verify */
+      await new Promise(r => requestAnimationFrame(r));
+      const off = S.camera.position.clone().sub(C.pos).length();
+      return { zero: C.shakeEnergy === 0, monotone, off,
+        elapsed: t0 === null ? -1 : (performance.now() - t0) / 1000 };
+    });
+    check('M14.3: tuned shake — Key N impulse decays monotonically to exactly still in < 0.8 s (impulse 1.0, decay 2.4 ⇒ 0.42 s), camera exactly on the pose',
+      shakeUp && shakeDec.zero && shakeDec.monotone &&
+      shakeDec.elapsed > 0 && shakeDec.elapsed < 0.8 && shakeDec.off === 0,
+      `up=${shakeUp}, zero=${shakeDec.zero}, monotone=${shakeDec.monotone}, elapsed=${shakeDec.elapsed && shakeDec.elapsed.toFixed(2)}s, off=${shakeDec.off}`);
+
+    /* 5. tuned flash: Key B — the flash comes up, decays monotonically
+     *    to exactly 0 within the tuned budget, overlay hidden again. */
+    await page.evaluate(() => { window.SIM.__m143T0 = null; });
+    await page.keyboard.press('b');
+    const flashUp = await page.waitForFunction(() => {
+      const F = window.SIM.FX;
+      if (F._flash > 0 && window.SIM.__m143T0 === null)
+        window.SIM.__m143T0 = performance.now();
+      return F._flash > 0;
+    }, { timeout: 5000 }).then(() => true).catch(() => false);
+    const flashDec = await page.evaluate(async () => {
+      const S = window.SIM, F = S.FX;
+      const t0 = S.__m143T0;
+      const rows = [];
+      for (let i = 0; i < 60 && F._flash > 0; i++) {
+        rows.push(F._flash);
+        await new Promise(r => requestAnimationFrame(r));
+      }
+      const monotone = rows.every(
+        (v, i) => i === 0 || v <= rows[i - 1] + 1e-9);
+      return { zero: F._flash === 0, monotone,
+        planeHidden: F._flashPlane.visible === false,
+        elapsed: t0 === null ? -1 : (performance.now() - t0) / 1000 };
+    });
+    check('M14.3: tuned flash — Key B flash resolves monotonically to exactly 0 in < 1.6 s (τ 0.22 s snap), overlay hidden again',
+      flashUp && flashDec.zero && flashDec.monotone && flashDec.planeHidden &&
+      flashDec.elapsed > 0 && flashDec.elapsed < 1.6,
+      `up=${flashUp}, zero=${flashDec.zero}, monotone=${flashDec.monotone}, planeHidden=${flashDec.planeHidden}, elapsed=${flashDec.elapsed && flashDec.elapsed.toFixed(2)}s`);
+
+    /* 6. tuned title fade — _applyBeatFx is a pure function of t:
+     *    sample inside the beat-4 window (the tuned 0.7 s in/out with
+     *    a 0.6 s hold), then restore the post-intro state exactly. */
+    const titleFade = await page.evaluate(() => {
+      const S = window.SIM, I = S.INTRO, B = S.CFG.intro.beat4;
+      const el = document.getElementById('introTitle');
+      const tT0 = S.CFG.intro.beat1.dur + S.CFG.intro.beat2.dur +
+        S.CFG.intro.beat3.dur;
+      const at = lt => {
+        I.t = tT0 + lt; I._applyBeatFx();
+        return parseFloat(el.style.opacity);
+      };
+      const in1 = at(0.45), peak = at(0.85), out = at(1.8);
+      I._resetFx();   // restore the post-intro state
+      return { fadeIn: B.fadeIn, fadeOut: B.fadeOut, in1, peak, out,
+        title: parseFloat(el.style.opacity),
+        wall: I.endWall.visible, portal: I.portal.visible,
+        inCity: I._inCity,
+        fade: parseFloat(document.getElementById('introFade').style.opacity) };
+    });
+    check('M14.3: tuned title fade — gentle 0.7 s in/out (0.643 @ 0.45 s, hold peak 1, 0.286 @ 1.8 s), pure function of t, _resetFx restores',
+      titleFade.fadeIn === 0.7 && titleFade.fadeOut === 0.7 &&
+      Math.abs(titleFade.in1 - 0.643) < 0.02 && titleFade.peak === 1 &&
+      Math.abs(titleFade.out - 0.286) < 0.02 &&
+      titleFade.title === 0 && titleFade.wall === true &&
+      titleFade.portal === false && titleFade.inCity === false &&
+      titleFade.fade === 0,
+      `in=${titleFade.in1.toFixed(3)}, peak=${titleFade.peak}, out=${titleFade.out.toFixed(3)}, title=${titleFade.title}, wall=${titleFade.wall}`);
+
+    /* cleanup + no leftover: back to the street spawn, still camera,
+     * no pending edges, help off, unmuted, stats visible */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.CAMERA.pos.set(0, 4, 18);
+      S.CAMERA.vel.set(0, 0, 0);
+      S.CAMERA.yaw = 0;
+      S.CAMERA.pitch = 0;
+      S.CAMERA.fov = 60;
+      S.CAMERA.shakeEnergy = 0;
+      delete S.__m143T0;
+    });
+    await sleep(900);
+    const fin = await page.evaluate(() => ({
+      state: window.SIM.BOOT.state,
+      cam: window.SIM.CAMERA.pos.toArray(),
+      energy: window.SIM.CAMERA.shakeEnergy,
+      helpEdge: window.SIM.INPUT.help,
+      muted: window.SIM.AUDIO.muted,
+      helpOn: document.getElementById('help').classList.contains('on'),
+      hudVisible: window.SIM.HUD.visible,
+      tier: window.SIM.TIER.active(),
+    }));
+    check('M14.3: no leftover state — street spawn, still camera, help off, no pending edges, unmuted, stats visible, HIGH',
+      fin.state === 'RUNNING' && Math.abs(fin.cam[0]) < 0.1 &&
+      Math.abs(fin.cam[1] - 4) < 0.1 && Math.abs(fin.cam[2] - 18) < 0.1 &&
+      fin.energy === 0 && fin.helpEdge === false &&
+      fin.muted === false && fin.helpOn === false &&
+      fin.hudVisible === true && fin.tier === 'high',
+      JSON.stringify(fin));
   }
 
   /* ---- 10. No errors anywhere ---- */

@@ -58,6 +58,38 @@
     pointer-events: none;
   }
   #hint.on { opacity: 1; }
+  /* ---- M14.3: vignette — a cheap, STATIC DOM radial gradient.
+     *    One extra composited layer (z 5: above the canvas, below the
+     *    z-10 UI), no JS ever writes it — zero per-frame cost. ---- */
+  #vignette {
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(ellipse at 50% 46%,
+      transparent 0%, transparent 55%, rgba(2, 5, 12, 0.45) 100%);
+    pointer-events: none;
+    z-index: 5;
+  }
+  /* ---- M14.3: help overlay (Key H) — the full control list, centred,
+     *    hidden by default, pass-through (pointer-events none). ---- */
+  #help {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    max-width: 78vw;
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre;
+    color: #9fdcff;
+    background: rgba(4, 10, 20, 0.82);
+    border: 1px solid rgba(110, 210, 255, 0.35);
+    border-radius: 4px;
+    padding: 14px 20px;
+    text-shadow: 0 0 6px rgba(0, 180, 255, 0.25);
+    display: none;
+    pointer-events: none;
+  }
+  #help.on { display: block; }
   /* ---- M9.6: awaken button (bottom-right, HUD entry point) ---- */
   #awakeBtn {
     position: absolute;
@@ -227,9 +259,14 @@
 <body>
 <canvas id="gl"></canvas>
 
+<!-- M14.3: the cheap DOM vignette (static radial gradient, z 5: above
+     the canvas, below the z-10 UI; no JS ever touches it) -->
+<div id="vignette" aria-hidden="true"></div>
+
 <div class="ui">
   <div id="hud" aria-live="off"></div>
   <div id="hint"></div>
+  <div id="help" aria-hidden="true"></div>
   <button id="awakeBtn" type="button">&#9889; AWAKEN&nbsp;[F]</button>
   <div id="overlay">
     <div class="title">QWEN FLASH // AWAKENING</div>
@@ -293,8 +330,8 @@ const CFG = {
     orbitElevMin: -Math.PI * 0.45,
     orbitElevMax: Math.PI * 0.45,
     pitchClamp: { ground: Math.PI * 0.47, cine: Math.PI * 0.485 },
-    shakeDecay: 2.4,          // energy/s
-    shakeAmp: 0.22,           // metres (energy 1.0 ≈ strong hit)
+    shakeDecay: 2.4,          // energy/s (M14.3 tuned: impulse 1.0 ⇒ ~0.42 s to still)
+    shakeAmp: 0.18,           // metres (energy 1.0 ≈ strong hit; M14.3 tuned down — subtle, no nausea)
     shakeCap: 1.5,            // max energy — repeated triggers never accumulate past this
     shakeImpulse: 1.0,       // energy added by the manual dev trigger (Key N)
   },
@@ -646,7 +683,7 @@ const CFG = {
      * 0 draw calls. */
     flash: {
       max: 1,                            // clamp ceiling for FX.flash(intensity)
-      decay: 0.30,                       // s — exponential decay time constant
+      decay: 0.22,                       // s — exponential decay time constant (M14.3 tuned: crisper, no lingering)
       color: 0xcfe8ff,                  // tint (pale cyan-white)
     },
   },
@@ -883,7 +920,7 @@ const CFG = {
     beat2: { dur: 2.8, rush: 0.8, fade: 0.6, fadeOut: 0.8 },
     beat3: { dur: 4.4, dive: 0.8, orbits: 1.5, radius: 104, height: 64 },
     beat4: {
-      dur: 2.0, fadeIn: 0.5, fadeOut: 0.6, rise: 8,
+      dur: 2.0, fadeIn: 0.7, fadeOut: 0.7, rise: 8,  // M14.3 tuned: gentler, longer 0.6 s hold
       text: 'QWEN FLASH // AWAKENING',
     },
     beat5: { dur: 1.6 },
@@ -1774,6 +1811,7 @@ const INPUT = {
   lightningTrigger: false,    // L edge — distant lightning event (M8.4)
   wakeTrigger: false,         // F edge — manual awaken trigger (M9.6)
   hudStats: false,            // I edge — M14.2: toggle the corner stats block
+  help: false,                // H edge — M14.3: toggle the help overlay
 
   pad: {
     connected: false,
@@ -1796,6 +1834,7 @@ const INPUT = {
       if (e.code === 'KeyL' && !e.repeat) INPUT.lightningTrigger = true;
       if (e.code === 'KeyF' && !e.repeat) INPUT.wakeTrigger = true;
       if (e.code === 'KeyI' && !e.repeat) INPUT.hudStats = true;  // M14.2
+      if (e.code === 'KeyH' && !e.repeat) INPUT.help = true;     // M14.3
       if (e.code === 'KeyM' && !e.repeat) AUDIO.toggleMute();   // M11.1
       /* M14.1 quality tiers: F1/F2/F3 pin HIGH/MED/LOW (manual, auto
        * off); F4 restores auto-detect. */
@@ -7375,20 +7414,32 @@ const HUD = {
   name: 'HUD',
   el: null,
   hintEl: null,
+  helpEl: null,
   fps: 0,
   acc: 0,
   accFrames: 0,
   visible: true,            // M14.2: stats block on (Key I toggles)
+  helpOn: false,            // M14.3: help overlay off (Key H toggles)
   _ticks: 0,                // M14.2: stats writes so far (hidden ⇒ frozen)
 
   init() {
     HUD.el = document.getElementById('hud');
     HUD.hintEl = document.getElementById('hint');
+    /* M14.3: the help overlay (Key H) — the full control list in one
+     * place; hidden by default (display:none ⇒ zero cost). */
+    HUD.helpEl = document.getElementById('help');
+    HUD.helpEl.textContent =
+      'CONTROLS\n' +
+      'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
+      'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
+      'F awaken · M mute · I stats · H help\n' +
+      'F1–F3 quality · F4 auto\n' +
+      'P particles · R pulse · T arcs · B flash · N shake · L lightning';
     HUD.hintEl.textContent =
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
       'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
       'P particles · R pulse · T arcs · B flash · N shake · L lightning\n' +
-      'F awaken · M mute · I stats\nF1–F3 quality · F4 auto';
+      'F awaken · M mute · I stats · H help\nF1–F3 quality · F4 auto';
     /* M9.6: HUD awaken button — same entry as the F key: the manual
      * trigger path routes through ENTITY.wake() (no-op unless DORMANT)
      * and marks the session user-triggered so the one-shot auto skips. */
@@ -7411,6 +7462,14 @@ const HUD = {
   },
 
   update(dt) {
+    /* M14.3: Key H — toggle the help overlay. Consumed BEFORE the
+     * hidden-stats early-return, so it works in every stats state. */
+    if (INPUT.help) {
+      INPUT.help = false;
+      HUD.helpOn = !HUD.helpOn;
+      HUD.helpEl.classList.toggle('on', HUD.helpOn);
+      HUD.helpEl.setAttribute('aria-hidden', HUD.helpOn ? 'false' : 'true');
+    }
     if (INPUT.hudStats) {
       INPUT.hudStats = false;
       HUD.visible = !HUD.visible;
