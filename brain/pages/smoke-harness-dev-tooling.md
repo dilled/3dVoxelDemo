@@ -5,15 +5,17 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-19T16:56:29"
+updated: "2026-09-20T05:41:11"
 ---
 
 <!-- compiled_truth -->
-The smoke harness lives in `smoke/` (dev tooling only, not part of the product): `node smoke/smoke.mjs [url]` serves the project root on :8377 and drives `index.html` in headless Chrome via `playwright-core` (pinned in `smoke/node_modules`, system Chrome at /usr/bin/google-chrome). It asserts the M0 boot contract (LOADER → START → RUNNING, live loop, double-init guard, resize, refresh/re-entry), the M1 core loop (fixed system order INPUT→CAMERA→KIT→HUD, clean-without-gamepad, fake-gamepad movement, keyboard W/Space, wheel FOV zoom, V GROUND/CINE toggle with blend, middle-mouse orbit, shake impulse/decay), and the M2 gate (KIT registration: MATS/builders/textures/lighting rig; full test scene < 10 draw calls read from `renderer.info.render.calls`; LED `frame` counter advancing; two screenshots 0.4 s apart differing), always ending with zero page errors.
+The smoke harness lives in `smoke/` (dev tooling only, not part of the product): `node smoke/smoke.mjs [url]` serves the project root on :8377 and drives `index.html` in headless Chrome via `playwright-core` (pinned in `smoke/node_modules`, system Chrome at /usr/bin/google-chrome). It asserts the M0 boot contract (LOADER → START → RUNNING, live loop, double-init guard, resize, refresh/re-entry), the M1 core loop (fixed system order INPUT→CAMERA→KIT→HUD, clean-without-gamepad, fake-gamepad movement, keyboard W/Space, wheel FOV zoom, V GROUND/CINE toggle with blend, middle-mouse orbit, shake impulse/decay), the M2 gate (KIT registration: MATS/builders/textures/lighting rig; full test scene < 10 draw calls read from `renderer.info.render.calls`; LED `frame` counter advancing; two screenshots 0.4 s apart differing), always ending with a zero page-errors gate.
 
-Testing seams: `window.SIM` dev handle exposes BOOT/INPUT/CAMERA/KIT/HUD/CFG/renderer/scene/camera/systems; gamepads are faked by stubbing `navigator.getGamepads()` in-page with a standard-mapping pad object.
+Testing seams: `window.SIM` dev handle exposes BOOT/INPUT/CAMERA/KIT/HUD/CFG/renderer/scene/camera/systems (+ POOL, AUDIO, EVENTS, etc. as milestones land); gamepads are faked by stubbing `navigator.getGamepads()` in-page with a standard-mapping pad object.
 
 Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` enum has no `middle` — omit `buttons` and pass only `button:'middle'`; DOM `button` value for middle is 1 (0=left, 2=right). Playwright's `mouse.down({button:'middle'})` does emit the real middle button, but for middle-button *drags* the harness uses a CDP session (`page.context().newCDPSession`).
+
+**Known pre-existing headless flakes (as of M14.3 — interpret full-suite failures against this list):** M7.5 shake cap-hold (`energy=1.18` exact baseline), M8.1 star brightness, M9.4 vehicle ease-out / wave brightness, and the M11.2/M11.3/M6.2-class "heap flat" check (~2 MB delta, environmental GC noise). All were confirmed environmental at their respective pre-change baselines; the M14.3 full-suite 3-run evidence shows exactly this set as the only failures, with every in-scope section (e.g. 9h, 11/11) green in every run.
 
 
 ## Timeline
@@ -87,3 +89,9 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   kind: decision
   summary: "M13.2 extends the harness: boot-park block now also parks EVENTS (paused=true, no ambient events during the earlier sections); M13.1 section now unregisters the ambient events before its synthetic registry (isolation) and re-registers them in cleanup; new M13.2 section (11 checks after M13.1, page already RUNNING, no reload) — registration (both ids, dot idle-hidden in WORLD.root), manual trigger (data-pulse preempts the running power-cycle; both log entries exact), data-pulse (dot travels A-top→B-top along the Bezier — sampled at steps 5/20, final position exactly B's top because step() increments a.t before update and the final frame uses u=1; FX.pulse at departure+arrival, FX.count sampled per step), power cycle (per-chunk cloned-material multiplier dips < 0.5 then restores byte-exact to the captured base colors, E._pc IS the chunk), scheduled determinism (forced seed WORLD.mulberry(0x1322), 1200×step(0.1), identical firing order across two runs — no overlaps / min gap >= 2 (the gap is a MINIMUM: cooldown waits are legal, no upper bound) / same-id cooldown >= 12), no leftover state (all chunks at base, dot hidden, FX drained, nothing active). Gotchas: chunk EDGE distance for power-cycle reach (street spawn sits on a chunk corner; nearest chunk center is ~259 m ⇒ center-distance reach finds zero candidates); the scheduler log holds ENDED events only; a preempted data-pulse is dropped where it was (no arrival flash)"
   affects: [smoke-harness-dev-tooling, m132-ambient-events-a]
+
+- time: 2026-09-20T05:41:11
+  kind: decision
+  summary: "M14.3 extends the harness with section 9h (11 checks, after M14.2, before the no-errors gate) and documents the current pre-existing headless flake list: M7.5 cap-hold energy=1.18, M8.1 star brightness, M9.4 vehicle ease-out, M11.2/M11.3 heap class"
+  source: "M14.3 polish pass (99ebced)"
+  affects: [smoke-harness-dev-tooling]
