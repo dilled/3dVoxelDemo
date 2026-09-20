@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-09-19T23:12:25.769Z._
+_Auto-generated. Last updated 2026-09-20T00:38:03.917Z._
 
 - [entity-system-m5](pages/entity-system-m5.md) — category: decision | tags: [entity, m5, creature, instancing] | ENTITY is the 6th system in the fixed boot order (INPUT → CAMERA → KIT → WORLD → **ENTITY** → HUD), registered between WORLD and HUD in `ind
 - [m101-sloth-monument](pages/m101-sloth-monument.md) — category: decision | tags: [m10, unsloth, easter-egg, world] | M10.1 adds the unsloth monument as a **standalone** child of `WORLD.root`
@@ -18,6 +18,7 @@ _Auto-generated. Last updated 2026-09-19T23:12:25.769Z._
 - [m133-ambient-events-b](pages/m133-ambient-events-b.md) — category: project | tags: [m13, events, ambient, world, drones, steam] | # M13.3 — Ambient Events B: cooling emergency + drone launch
 - [m134-ambient-events-c](pages/m134-ambient-events-c.md) — category: project | tags: [m13, events, ambient, creature, audio] | # M13.4 — Ambient Events C: mechanical reposition + distant EM discharge
 - [m141-perf-monitor-quality-tiers](pages/m141-perf-monitor-quality-tiers.md) — category: decision | tags: [m14, perf, tier, quality, fps] | <current best understanding — replace this with the real content>
+- [m142-hud-stats](pages/m142-hud-stats.md) — category: decision | tags: [m14, hud, stats, perf] | ## M14.2 — HUD stats block
 - [m2-material-kit](pages/m2-material-kit.md) — category: decision | tags: [kit, materials, draw-calls, three] | M2's `KIT` system is the shared foundation every later visual milestone builds on:
 - [m61-object-pool](pages/m61-object-pool.md) — category: decision | tags: [pool, traffic, m6, performance] | `POOL` (top-level module in `index.html`, exposed as `window.SIM.POOL`) is the single object-pool foundation all M6/M7 emitters (drones, veh
 - [m62-traffic-drones](pages/m62-traffic-drones.md) — category: decision | tags: [m6, traffic, pool, tier] | ## Decided
