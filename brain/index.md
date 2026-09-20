@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-09-20T02:41:11.989Z._
+_Auto-generated. Last updated 2026-09-20T05:59:37.646Z._
 
 - [entity-system-m5](pages/entity-system-m5.md) — category: decision | tags: [entity, m5, creature, instancing] | ENTITY is the 6th system in the fixed boot order (INPUT → CAMERA → KIT → WORLD → **ENTITY** → HUD), registered between WORLD and HUD in `ind
 - [m101-sloth-monument](pages/m101-sloth-monument.md) — category: decision | tags: [m10, unsloth, easter-egg, world] | M10.1 adds the unsloth monument as a **standalone** child of `WORLD.root`

@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [testing, smoke, playwright, tooling]
 created: "2026-09-15T00:48:03"
-updated: "2026-09-20T05:41:11"
+updated: "2026-09-20T08:59:37"
 ---
 
 <!-- compiled_truth -->
@@ -94,4 +94,10 @@ Known gotchas (Chrome CDP / Playwright): `Input.dispatchMouseEvent`'s `buttons` 
   kind: decision
   summary: "M14.3 extends the harness with section 9h (11 checks, after M14.2, before the no-errors gate) and documents the current pre-existing headless flake list: M7.5 cap-hold energy=1.18, M8.1 star brightness, M9.4 vehicle ease-out, M11.2/M11.3 heap class"
   source: "M14.3 polish pass (99ebced)"
+  affects: [smoke-harness-dev-tooling]
+
+- time: 2026-09-20T08:59:37
+  kind: decision
+  summary: "M14.4 extends the harness with section 9i (9 checks, after 9h, before the no-errors gate): refresh mid-game (mid-awakening reload → fresh intro, entity DORMANT untriggered/uncounted, scheduler empty, no AudioContext pre-gesture; START after refresh → live RUNNING at street spawn), tab-hide/resume dt clamp, resize mid-awakening (1100x700→900x600, natural DORMANT end), gamepad plug/unplug (fake pad via the M1 navigator.getGamepads seam, restored at the end), no-leftover state. Harness gotchas: (1) in headless Chrome the rAF timeline COALESCES a blocked-main-thread gap — a 0.45 s busy block yields one normal frame period after, never the wall gap, so the dt-clamp test asserts the BOUNDED contract (exactly 0 advance while blocked, ≤0.1 s step after resume, loop live) — exactly-0.1 is code-verified, not headless-measurable; wrapping window.requestAnimationFrame and feeding a future fake timestamp hung the suite (headless rAF dispatch quirk) and frame() has no negative-dt guard — avoid that seam; (2) every rAF-wait in the harness now races a 5 s timer (fail loudly, not hang) so a stalled frame loop kills the run with a message. Updated documented pre-existing flake list: M7.5 cap-hold, M8.1 star brightness, M9.3 heap-flat, M9.4 vehicle class, M11.2 band-pass + heap class, M14.3 shake-monotone timing"
+  source: "M14.4 robustness pass (e514782)"
   affects: [smoke-harness-dev-tooling]
