@@ -11305,6 +11305,395 @@ try {
       JSON.stringify(fin));
   }
 
+  /* ---- 9i. M14.4 — Robustness pass: refresh mid-game, tab-hide/
+       *     resume (dt clamp), resize mid-awakening, gamepad plug/
+       *     unplug — no errors, no stuck states ---- */
+  {
+    /* 0. Park the autonomous timers on the current page (the same
+     *    suite-hygiene seams as after the earlier refreshes) — no
+     *    scheduled behaviour may interfere with the checklist. */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      S.ATMOS._ltTimer = 1e9;
+      S.ENTITY._autoAt = Infinity;
+      S.EVENTS.paused = true;
+    });
+
+    /* 1. Refresh mid-game — mid-awakening, no less: trigger the manual
+     *    awaken (F), reach the AWAKE hold, then reload. The fresh boot
+     *    arrives clean (watchdog cleared, entity / scheduler / audio
+     *    pristine, no AudioContext before the gesture) and START works
+     *    again. */
+    await page.keyboard.press('f');
+    await page.waitForFunction(
+      () => window.SIM.ENTITY.state === 'AWAKE',
+      { timeout: 10000 });
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(
+      () => window.SIM && window.SIM.BOOT &&
+        window.SIM.BOOT.state === 'INTRO',
+      { timeout: 20000 });
+    {
+      const fresh = await page.evaluate(() => {
+        const S = window.SIM;
+        return {
+          booted: window.__SIM_BOOTED__ === true,
+          frames: S.BOOT.frames,
+          t0: S.BOOT.t0,
+          entity: S.ENTITY.state,
+          userTriggered: S.ENTITY._userTriggered,
+          wakeCount: S.ENTITY._wakeCount,
+          autoFired: S.ENTITY._autoFired,
+          etime: S.EVENTS._time,
+          elog: S.EVENTS.log.length,
+          eactive: S.EVENTS._active,
+          ctx: S.AUDIO.ctx !== null,
+        };
+      });
+      check('M14.4: refresh mid-game — mid-awakening refresh returns to a fresh intro: watchdog cleared, entity DORMANT (untriggered, uncounted), scheduler empty, no AudioContext before the gesture',
+        fresh.booted && fresh.frames >= 1 && fresh.frames < 240 &&
+        fresh.t0 === 0 && fresh.entity === 'DORMANT' &&
+        fresh.userTriggered === false && fresh.wakeCount === 0 &&
+        fresh.autoFired === false && fresh.etime === 0 &&
+        fresh.elog === 0 && fresh.eactive === null && fresh.ctx === false,
+        JSON.stringify(fresh));
+      /* The refresh re-armed the autonomous timers — re-park them. */
+      await page.evaluate(() => {
+        const S = window.SIM;
+        S.ATMOS._ltTimer = 1e9;
+        S.ENTITY._autoAt = Infinity;
+        S.EVENTS.paused = true;
+      });
+      await page.locator('#startBtn').click();
+      await page.waitForFunction(
+        () => window.SIM.BOOT.state === 'RUNNING',
+        { timeout: 5000 });
+      await sleep(700);
+      const re = await page.evaluate(() => ({
+        state: window.SIM.BOOT.state,
+        t0: window.SIM.BOOT.t0,
+        frames: window.SIM.BOOT.frames,
+        cam: window.SIM.CAMERA.pos.toArray(),
+      }));
+      await sleep(300);
+      const reFrames = await page.evaluate(() => window.SIM.BOOT.frames);
+      check('M14.4: refresh mid-game — START after refresh reaches a live RUNNING loop at the street spawn (t0 anchored, frames advancing)',
+        re.state === 'RUNNING' && re.t0 > 0 &&
+        Math.abs(re.cam[0]) < 0.1 && Math.abs(re.cam[1] - 4) < 0.1 &&
+        Math.abs(re.cam[2] - 18) < 0.1 && reFrames > re.frames,
+        `state=${re.state}, t0=${re.t0 && re.t0.toFixed(2)}, ` +
+        `cam=${re.cam && re.cam.map(v => v.toFixed(1)).join(',')}, ` +
+        `frames=${re.frames}->${reFrames}`);
+    }
+
+    /* 2. Tab-hide/resume —
+     *    a) dt clamp: block the main thread for ~0.45 s (a blocked main
+     *       thread cannot run rAF, so the app's next frame sees exactly
+     *       the full gap a real tab-hide/resume produces): the sim
+     *       clock advances by exactly one clamped 0.1 s step — no
+     *       multi-second jump, no stuck loop.
+     *    b) visibilitychange: the resume hook (wired at audio unlock)
+     *       re-runs the suspended AudioContext when the tab returns;
+     *       the hidden=true dispatch is harmless. */
+    {
+      /* The tab-hide/resume contract: while the tab is hidden (or the
+       * main thread is busy) the sim clock must freeze; on return the
+       * loop resumes and advances by at most one clamped step
+       * (≤ 0.1 s — the `Math.min(dt, 0.1)` clamp in the frame loop):
+       * no multi-second sim jump, no stuck loop. A blocked main
+       * thread is the exact same seam a hidden tab is for the sim
+       * clock (no rAF callbacks can run either way); in headless
+       * Chrome the rAF timeline coalesces the blocked gap, so the
+       * contract asserted here is the bounded one: frozen while
+       * blocked, bounded step after. */
+      const dtClamp = await page.evaluate(async () => {
+        const S = window.SIM;
+        S.EVENTS.paused = false;
+        const t0 = S.EVENTS._time;
+        const w0 = performance.now();
+        while (performance.now() - w0 < 450) {} /* block: no rAF runs */
+        const w1 = performance.now();
+        const mid = S.EVENTS._time - t0; /* frozen while blocked */
+        await Promise.race([
+          new Promise(r => requestAnimationFrame(r)),
+          new Promise((_, rej) => setTimeout(() =>
+            rej(new Error('frame loop stalled — rAF never fired')), 5000)),
+        ]);
+        const advance = S.EVENTS._time - t0;
+        S.EVENTS.paused = true;
+        return { mid, advance, wall: (w1 - w0) / 1000 };
+      });
+      await sleep(200);
+      const dtLive = await page.evaluate(() => {
+        const S = window.SIM;
+        S.EVENTS.paused = false;
+        const f0 = S.BOOT.frames;
+        return Promise.race([
+          new Promise(resolve => {
+            requestAnimationFrame(() => {
+              resolve({
+                live: S.BOOT.frames > f0,
+                sane: S.EVENTS._time > 0,
+              });
+            });
+          }),
+          new Promise((_, rej) => setTimeout(() =>
+            rej(new Error('frame loop stalled — rAF never fired')), 5000)),
+        ]).then(o => {
+          S.EVENTS.paused = true;
+          return o;
+        });
+      });
+      check('M14.4: tab-hide/resume — a 0.45 s blocked main thread (the tab-hide gap) freezes the sim clock while blocked, then the loop resumes with a bounded ≤ 0.1 s clamped step — no multi-second jump, no stuck loop',
+        dtClamp.wall >= 0.4 && dtClamp.mid === 0 &&
+        dtClamp.advance > 0 && dtClamp.advance <= 0.101 &&
+        dtLive.live === true && dtLive.sane === true,
+        `wall=${dtClamp.wall.toFixed(2)}s, whileBlocked=${dtClamp.mid.toFixed(3)}s, ` +
+        `afterResume=${dtClamp.advance.toFixed(3)}s, live=${dtLive.live}, ` +
+        `sane=${dtLive.sane}`);
+
+      const vis = await page.evaluate(async () => {
+        const S = window.SIM;
+        const A = S.AUDIO;
+        const d = document;
+        const setHidden = v => Object.defineProperty(d, 'hidden',
+          { get: () => v, configurable: true });
+        await A.ctx.suspend();
+        const before = A.ctx.state;
+        setHidden(true);
+        d.dispatchEvent(new Event('visibilitychange'));
+        const whileHidden = A.ctx.state;
+        setHidden(false);
+        d.dispatchEvent(new Event('visibilitychange'));
+        await new Promise(r => setTimeout(r, 150));
+        delete d.hidden;  /* restore the Document.prototype getter */
+        return {
+          before, whileHidden, after: A.ctx.state,
+          muted: A.muted,
+          hiddenRestored: d.hidden === false,
+          frames: S.BOOT.frames,
+        };
+      });
+      await sleep(300);
+      const visFrames = await page.evaluate(() => window.SIM.BOOT.frames);
+      check('M14.4: tab-hide/resume — visibilitychange on tab return resumes the suspended AudioContext (mute untouched), hidden=true is harmless, loop stays live',
+        vis.before === 'suspended' &&
+        vis.whileHidden === 'suspended' && vis.after === 'running' &&
+        vis.muted === false && vis.hiddenRestored &&
+        visFrames > vis.frames,
+        `before=${vis.before}, whileHidden=${vis.whileHidden}, ` +
+        `after=${vis.after}, muted=${vis.muted}, ` +
+        `frames=${vis.frames}->${visFrames}`);
+    }
+
+    /* 3. Resize mid-awakening — F-triggered awaken; mid-AWAKE the
+     *    viewport changes: camera aspect + renderer size must follow;
+     *    and the awakening sequence still runs its natural
+     *    AWAKE → DECAY → DORMANT end (no stuck state). */
+    {
+      await page.keyboard.press('f');
+      await page.waitForFunction(
+        () => window.SIM.ENTITY.state === 'AWAKE',
+        { timeout: 10000 });
+      await page.setViewportSize({ width: 1100, height: 700 });
+      await sleep(400);
+      const rs = await page.evaluate(async () => {
+        const S = window.SIM;
+        const dpr = Math.min(window.devicePixelRatio || 1,
+          S.CFG.maxPixelRatio);
+        const f0 = S.BOOT.frames;
+        await new Promise(r => requestAnimationFrame(r));
+        return {
+          aspect: S.camera.aspect,
+          cw: S.renderer.domElement.width,
+          ch: S.renderer.domElement.height,
+          wantW: Math.round(1100 * dpr),
+          wantH: Math.round(700 * dpr),
+          state: S.ENTITY.state,
+          stateT: S.ENTITY.stateT,
+          awakeDur: S.ENTITY._awakeDur,
+          live: S.BOOT.frames > f0,
+        };
+      });
+      check('M14.4: resize mid-awakening — viewport change mid-AWAKE updates camera aspect + renderer size, loop stays live, still AWAKE',
+        Math.abs(rs.aspect - 1100 / 700) < 0.01 &&
+        rs.cw === rs.wantW && rs.ch === rs.wantH &&
+        rs.state === 'AWAKE' && rs.live,
+        `aspect=${rs.aspect && rs.aspect.toFixed(4)}, ` +
+        `canvas=${rs.cw}x${rs.ch} want ${rs.wantW}x${rs.wantH}, ` +
+        `state=${rs.state}`);
+      await page.setViewportSize({ width: 900, height: 600 });
+      await sleep(300);
+      const rs2 = await page.evaluate(() => {
+        const S = window.SIM;
+        const dpr = Math.min(window.devicePixelRatio || 1,
+          S.CFG.maxPixelRatio);
+        return {
+          aspect: S.camera.aspect,
+          cw: S.renderer.domElement.width,
+          ch: S.renderer.domElement.height,
+          wantW: Math.round(900 * dpr),
+          wantH: Math.round(600 * dpr),
+        };
+      });
+      const endTimeout = await page.evaluate(() => {
+        const E = window.SIM.ENTITY;
+        /* AWAKE ends at stateT+_awakeDur, DECAY adds 3 s → DORMANT */
+        return Math.max(4000,
+          (E.stateT + E._awakeDur + 3) * 1000 - performance.now() + 2000);
+      });
+      const dormanted = await page.waitForFunction(
+        () => window.SIM.ENTITY.state === 'DORMANT',
+        { timeout: endTimeout }).then(() => true).catch(() => false);
+      const liveEnd = await page.evaluate(() =>
+        window.SIM.BOOT.state === 'RUNNING' && window.SIM.BOOT.frames > 0);
+      check('M14.4: resize mid-awakening — aspect restores on the resize back (900x600), and the awakening runs its natural end to DORMANT (no stuck state, loop alive)',
+        Math.abs(rs2.aspect - 1.5) < 0.01 &&
+        rs2.cw === rs2.wantW && rs2.ch === rs2.wantH &&
+        dormanted && liveEnd,
+        `aspect=${rs2.aspect}, canvas=${rs2.cw}x${rs2.ch} ` +
+        `want ${rs2.wantW}x${rs2.wantH}, ` +
+        `dormanted=${dormanted}, live=${liveEnd}`);
+    }
+
+    /* 4. Gamepad plug/unplug — headless has no physical pad, so drive
+     *    navigator.getGamepads: plug (connected, idle zeros), move
+     *    with the stick, unplug while the stick is still held forward
+     *    (movement must stop — coast to rest, no stuck input), plug
+     *    again (clean edge state), press A → exactly one camera-mode
+     *    toggle, unplug while A is held + replug with A released →
+     *    no ghost toggle. The native API is restored on the way out. */
+    {
+      const frame = () => page.evaluate(
+        () => new Promise(r => requestAnimationFrame(r)));
+      const padState = () => page.evaluate(() => ({
+        connected: window.SIM.INPUT.pad.connected,
+        z: window.SIM.CAMERA.pos.z,
+        mode: window.SIM.CAMERA.mode,
+      }));
+      const plug = () => page.evaluate(() => {
+        if (!window.__smokeRobPad) {
+          window.__smokeRobPadOrig = navigator.getGamepads;
+          window.__smokeRobPad = {
+            id: 'smoke-robust-pad', timestamp: 0, connected: true,
+            mapping: 'standard', axes: [0, 0, 0, 0],
+            buttons: new Array(17).fill(null).map(() =>
+              ({ pressed: false, touched: false, value: 0 })),
+          };
+        } else {
+          window.__smokeRobPad.axes = [0, 0, 0, 0];
+          window.__smokeRobPad.buttons.forEach(b => {
+            b.pressed = false; b.touched = false; b.value = 0;
+          });
+        }
+        navigator.getGamepads = () => [window.__smokeRobPad];
+      });
+      const s0 = await padState();
+      await plug();
+      await frame();
+      const s1 = await padState();
+      check('M14.4: gamepad plug — a plugged (idle, all-zero) pad is reported connected, camera holds still',
+        s0.connected === false && s1.connected === true &&
+        Math.abs(s1.z - s0.z) < 0.05,
+        `was=${s0.connected}, now=${s1.connected}, ` +
+        `dz=${(s1.z - s0.z).toFixed(3)}`);
+
+      await page.evaluate(() =>
+        { window.__smokeRobPad.axes[1] = -1; });  /* stick forward */
+      await sleep(500);
+      const s2 = await padState();
+      check('M14.4: gamepad move — left-stick forward moves the camera (plugged pad drives the same pipeline as the mouse)',
+        s2.z < s1.z - 1, `dz=${(s2.z - s1.z).toFixed(2)}`);
+
+      /* Unplug while the stick is still forward: the input must stop
+       * — the camera coasts to rest, it does not keep flying. */
+      await page.evaluate(() => {
+        window.__smokeRobPad.axes[1] = -1;  /* still physically held */
+        navigator.getGamepads = () => [];
+      });
+      await frame();
+      const s3 = await padState();
+      await sleep(700);               /* let the velocity damp out */
+      const s4 = await padState();
+      await sleep(500);
+      const s5 = await padState();
+      check('M14.4: gamepad unplug mid-input — unplugging while the stick is forward stops the movement (coasts to rest, no stuck input)',
+        s3.connected === false && Math.abs(s5.z - s4.z) < 0.1,
+        `connected=${s3.connected}, coast=${(s4.z - s3.z).toFixed(2)}, ` +
+        `settled=${(s5.z - s4.z).toFixed(3)}`);
+
+      /* Replug clean; the A-button press toggles the camera mode
+       * exactly once; unplug while A is held and replug with A
+       * released must not ghost-toggle. */
+      await plug();
+      await frame();
+      const m0 = (await padState()).mode;
+      await page.evaluate(() => {
+        const b = window.__smokeRobPad.buttons[0];
+        b.pressed = true; b.touched = true; b.value = 1;
+      });
+      await frame();
+      const m1 = (await padState()).mode;
+      await page.evaluate(
+        () => { navigator.getGamepads = () => []; });
+      await frame();
+      await frame();
+      const m2 = (await padState()).mode;
+      await plug();          /* fresh pad, A released */
+      await sleep(400);
+      const m3 = (await padState()).mode;
+      check('M14.4: gamepad A-button across plug/unplug — a press toggles the camera mode exactly once (GROUND→CINE); unplug while A is held and replug with A released ghost-toggle nothing',
+        m0 === 'GROUND' && m1 === 'CINE' && m2 === 'CINE' &&
+        m3 === 'CINE',
+        `before=${m0}, afterPress=${m1}, ` +
+        `afterUnplug=${m2}, afterReplug=${m3}`);
+
+      /* Restore: native getGamepads (no pad), camera back to the
+       * street spawn, mode back to GROUND. */
+      await page.keyboard.press('v');   /* CINE → GROUND */
+      await sleep(700);                 /* mode-blend convergence */
+      await page.evaluate(() => {
+        navigator.getGamepads = window.__smokeRobPadOrig;
+        const S = window.SIM;
+        S.CAMERA.pos.set(0, 4, 18);
+        S.CAMERA.vel.set(0, 0, 0);
+        S.CAMERA.yaw = 0;
+        S.CAMERA.pitch = 0;
+        S.CAMERA.fov = 60;
+        S.CAMERA.shakeEnergy = 0;
+      });
+    }
+
+    /* 5. No leftover state from the whole robustness pass. */
+    await sleep(400);
+    const fin = await page.evaluate(() => {
+      const S = window.SIM;
+      return {
+        state: S.BOOT.state,
+        entity: S.ENTITY.state,
+        cam: S.CAMERA.pos.toArray(),
+        mode: S.CAMERA.mode,
+        energy: S.CAMERA.shakeEnergy,
+        keys: S.INPUT.keys.size,
+        edges: S.INPUT.wakeTrigger || S.INPUT.modeSwitch ||
+          S.INPUT.hudStats || S.INPUT.help || S.INPUT.shakeTrigger ||
+          S.INPUT.flashTrigger || S.INPUT.arcTrigger ||
+          S.INPUT.pulseTrigger || S.INPUT.rainTrigger ||
+          S.INPUT.lightningTrigger,
+        muted: S.AUDIO.muted,
+        paused: S.EVENTS.paused,
+        pad: S.INPUT.pad.connected,
+      };
+    });
+    check('M14.4: no leftover state — RUNNING, DORMANT, street spawn, still camera, GROUND mode, no pressed keys or pending input edges, unmuted, native gamepad API (no pad), scheduler parked',
+      fin.state === 'RUNNING' && fin.entity === 'DORMANT' &&
+      Math.abs(fin.cam[0]) < 0.1 && Math.abs(fin.cam[1] - 4) < 0.1 &&
+      Math.abs(fin.cam[2] - 18) < 0.1 && fin.mode === 'GROUND' &&
+      fin.energy === 0 && fin.keys === 0 && fin.edges === false &&
+      fin.muted === false && fin.paused === true && fin.pad === false,
+      JSON.stringify(fin));
+  }
+
   /* ---- 10. No errors anywhere ---- */
   check('zero uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   check('zero console.error', consoleErrors.length === 0, consoleErrors.join(' | '));

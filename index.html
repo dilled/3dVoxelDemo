@@ -1923,7 +1923,17 @@ const INPUT = {
         if (c && c.connected !== false) { g = c; break; }
       }
     } catch (_) { g = null; }
-    if (!g) return;
+    if (!g) {
+      /* A disconnect must never leave stale input behind — zero the
+       * per-frame samples (M14.4: unplug mid-stick/press stops the
+       * camera instead of keeping it flying). */
+      p.move.f = 0;
+      p.move.s = 0;
+      p.look.x = 0;
+      p.look.y = 0;
+      p.btnA = false;
+      return;
+    }
     p.connected = true;
     const dz = CFG.input.padDeadzone;
     const ax = i => {

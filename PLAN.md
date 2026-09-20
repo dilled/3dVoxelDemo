@@ -87,7 +87,7 @@ smoke-test evidence.
 | **M14.1** ✅ | Perf monitor + quality tiers: rolling FPS, `HIGH/MED/LOW` (auto + manual); tiers scale LOD radius, particle/drone/vehicle caps, sign texture updates, light shafts, audio beds | Forcing each tier in smoke run: stats within budget, no stutter on tier switch |
 | **M14.2** ✅ | HUD stats (small, corner, toggleable): FPS, visible instances, active drones, chunk id, AI state | HUD matches measured stats; toggle hides it; costs nothing hidden |
 | **M14.3** ✅ | Polish pass: shake tuning, flash tuning, title fade, mute key (`M`), help overlay (`H`), cheap DOM vignette | Each control verified working; feel pass recorded (3-min run) |
-| **M14.4** | Robustness pass: refresh mid-game, tab-hide/resume (dt clamp), resize mid-awakening, gamepad plug/unplug — no errors, no stuck states | Robustness checklist in smoke run fully green |
+| **M14.4** ✅ | Robustness pass: refresh mid-game, tab-hide/resume (dt clamp), resize mid-awakening, gamepad plug/unplug — no errors, no stuck states | Robustness checklist in smoke run fully green |
 | **M14.5** | Final verification: manual 3-min screen-recording run — intro → reveal → idle life → manual awakening → easter-egg reaction → performance stable | Recording reviewed; stable frame rate through the awakening at default quality on a modern gaming GPU |
 
 ## Milestone details
@@ -1215,10 +1215,45 @@ events, none conflicting, none breaking perf.
   class).
 
 #### M14.4 — Robustness pass
-- [ ] Page refresh mid-game, tab-hide/resume (dt clamp), window resize
+- [x] Page refresh mid-game, tab-hide/resume (dt clamp), window resize
       mid-awakening, gamepad plug/unplug — no errors, no stuck states.
 - **Test:** robustness checklist in the smoke run fully green.
 - **Commit when:** checklist green.
+  Verified: smoke M14.4 section green (9 checks, section 9i, after
+  M14.3, before the no-errors gate) — the robustness pass: **refresh
+  mid-game** — a mid-awakening reload returns to a fresh intro
+  (watchdog cleared, entity DORMANT — untriggered, uncounted, scheduler
+  empty, no AudioContext before the gesture), and START after the refresh
+  reaches a live RUNNING loop at the street spawn (t0 anchored, frames
+  advancing) — **tab-hide/resume (dt clamp)** — a 0.45 s blocked main
+  thread (the hidden-tab seam for the sim clock) freezes the sim clock
+  while blocked (exactly 0 advance) and the loop resumes with a bounded
+  ≤ 0.1 s step (the `Math.min(dt, 0.1)` clamp in the frame loop; the
+  headless rAF timeline coalesces a blocked gap, so the test asserts the
+  bounded contract — no multi-second jump, no stuck loop — plus a 5 s
+  stall guard on each rAF wait so a stalled frame loop fails loudly
+  instead of hanging the suite); visibilitychange on tab return resumes
+  a suspended AudioContext (mute untouched), a hidden=true dispatch is
+  harmless, loop stays live — **resize mid-awakening** — a viewport
+  change mid-AWAKE updates camera aspect + renderer size (1100x700,
+  back to 900x600) and the awakening runs its natural end to DORMANT
+  (no stuck state, loop alive) — **gamepad plug/unplug** — a fake pad
+  through the same seam the M1 section uses (`navigator.getGamepads`
+  patched, restored at the end): an idle plug is reported connected with
+  the camera holding still, left-stick forward moves the camera (the same
+  pipeline as the mouse), and unplugging mid-stick stops the movement and
+  coasts to rest (no stuck input) — which exposed a real bug: `INPUT.
+  _pollPad` early-returned on disconnect without zeroing the per-frame
+  samples, so a stale `p.move.f/s`/`p.look.x/y` kept driving the camera
+  after unplug — it now zeroes `p.move.f/s`, `p.look.x/y` and `p.btnA`
+  on disconnect (`p.zoom` was already zeroed at the top); an A-button
+  press toggles the camera mode exactly once (GROUND→CINE), and unplug
+  while A is held + replug with A released ghost-toggles nothing.
+  Full suite 3 runs on final code: M14.4 9/9 in every run, zero
+  page/console errors; only failures are the documented pre-existing
+  headless flakes (M7.5 cap-hold / M8.1 star brightness / M9.3 heap-
+  flat / M9.4 vehicle class / M11.2 band-pass + heap / M14.3 shake-
+  monotone timing).
 
 #### M14.5 — Final verification run
 - [ ] Manual 3-minute screen-recording run: intro → reveal → idle life →
