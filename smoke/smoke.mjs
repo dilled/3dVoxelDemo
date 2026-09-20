@@ -360,6 +360,18 @@
  *   - frustum + ring culling via stats (chunk meshes frustum-culled,
  *     high orbit down > horizon call counts)
  *
+ *   M14.2 checks (corner stats block, toggleable):
+ *   - #hud is the small corner block (top-left, small) with all lines:
+ *     FPS / Q / STATE / AI / INST / DRONE / CHUNK / CAM / mute; the
+ *     hint carries the "I stats" toggle line
+ *   - values cross-checked against independent in-page ground truth
+ *     (scene InstancedMesh walk, TRAFFIC.count + the traffic-drone
+ *     pool inUse, chunk id replayed from CAMERA.pos, ENTITY.state;
+ *     polled to ride out the 0.5 s stats staleness)
+ *   - toggle: Key I hides it (visible=false, display none) and the
+ *     hidden HUD costs nothing (stats ticks + text frozen while the
+ *     loop runs); Key I again restores it and the ticks advance
+ *
  * Usage:
  *   cd smoke && npm install        # once (playwright-core)
  *   node smoke.mjs [url]          # url defaults to a local server on :8377
@@ -10933,6 +10945,124 @@ try {
       fin.tier === 'high' && fin.auto === false && fin.chunks === 25 &&
       fin.calls < 150,
       JSON.stringify(fin));
+  }
+
+  /* ---- 9g. M14.2 — corner stats block (FPS / INST / DRONE / CHUNK / AI) ---- */
+  {
+    /* restore a known-visible state (this section owns the toggle). */
+    await page.evaluate(() => {
+      const S = window.SIM;
+      if (!S.HUD.visible) { S.HUD.visible = true; S.HUD.el.style.display = ''; }
+    });
+
+    const readStats = () => page.evaluate(() => {
+      const S = window.SIM;
+      /* independent ground truth (nothing read from the HUD text): */
+      let inst = 0;
+      S.scene.traverse(o => { if (o.isInstancedMesh) inst += o.count; });
+      const p = S.CAMERA.pos;
+      const bx = Math.floor(p.x / S.WORLD.BLOCK), bz = Math.floor(p.z / S.WORLD.BLOCK);
+      const cx = Math.floor(bx / S.WORLD.CHUNK), cz = Math.floor(bz / S.WORLD.CHUNK);
+      const pool = S.POOL.list.find(q => q.name === 'traffic-drone');
+      return {
+        hud: document.getElementById('hud').textContent,
+        style: document.getElementById('hud').style.display,
+        hint: document.getElementById('hint').textContent,
+        visible: S.HUD.visible,
+        ticks: S.HUD._ticks,
+        frames: S.BOOT.frames,
+        inst,
+        drones: S.TRAFFIC.count,
+        droneInUse: pool ? pool.capacity - pool.top : -1,
+        chunk: cx + ',' + cz,
+        ai: S.ENTITY.state,
+        fps: S.PERF.fps,
+      };
+    });
+
+    const parse = hud => {
+      const g = (re) => (hud.match(re) || [])[1];
+      return {
+        fps: g(/^FPS\s+(\d+)$/m),
+        inst: g(/^INST (\d+)$/m),
+        drone: g(/^DRONE (\d+)$/m),
+        chunk: g(/^CHUNK (-?\d+,-?\d+)$/m),
+        ai: g(/^AI (\w+)$/m),
+      };
+    };
+
+    /* 1. the small corner block: present, top-left, every line there,
+     * and the hint teaches the I toggle. */
+    await sleep(600);   // at least one stats tick with the new lines
+    const a0 = await readStats();
+    const p0 = parse(a0.hud);
+    check('M14.2: corner stats block — small, top-left, every line (FPS/Q/STATE/AI/INST/DRONE/CHUNK/CAM) + "I stats" in the hint',
+      a0.visible && a0.style !== 'none' &&
+      /^FPS\s+\d+\n/m.test(a0.hud) && /^Q /m.test(a0.hud) &&
+      /^STATE RUNNING$/m.test(a0.hud) && /^CAM /m.test(a0.hud) &&
+      /^INST \d+$/m.test(a0.hud) && /^DRONE \d+$/m.test(a0.hud) &&
+      /^CHUNK -?\d+,-?\d+$/m.test(a0.hud) && /^AI \w+$/m.test(a0.hud) &&
+      a0.hint.includes('I stats'),
+      `visible=${a0.visible}, style=[${a0.style}], hud=[${a0.hud.split('\n').join(' | ')}]`);
+
+    /* 2. values cross-checked against independent ground truth — poll
+     * to ride out the 0.5 s stats staleness: DRONE/CHUNK/AI exact;
+     * INST within ±4 (the steam pool oscillates 47↔48 between its
+     * release/refill frames, so the HUD's ≤0.5 s old snapshot can sit
+     * one live instance off the instant-true walk). */
+    let ok = false, last = a0, pp = p0;
+    for (let i = 0; i < 16; i++) {
+      last = await readStats();
+      pp = parse(last.hud);
+      if (pp.inst !== null && pp.drone !== null && pp.chunk !== null && pp.ai !== null &&
+          Math.abs(Number(pp.inst) - last.inst) <= 4 &&
+          Number(pp.drone) === last.drones &&
+          pp.chunk === last.chunk && pp.ai === last.ai) { ok = true; break; }
+      await sleep(250);
+    }
+    const fp = Number(pp.fps);
+    check('M14.2: HUD values match measured stats (INST = scene InstancedMesh walk, DRONE = TRAFFIC.count = traffic-drone pool inUse, CHUNK = chunk id replayed from CAMERA.pos, AI = ENTITY.state)',
+      ok && Number(pp.drone) === last.droneInUse && Number.isFinite(fp),
+      `hud[INST=${pp.inst},DRONE=${pp.drone},CHUNK=${pp.chunk},AI=${pp.ai}] vs truth[inst=${last.inst},drones=${last.drones},inUse=${last.droneInUse},chunk=${last.chunk},ai=${last.ai}]`);
+    await sleep(250);
+    const fpsNow = await readStats();
+    check('M14.2: HUD FPS line matches the PERF monitor (0.5 s windows, ±5 fps tolerance)',
+      Number(pp.fps) > 0 && Math.abs(Number(pp.fps) - fpsNow.fps) <= 5,
+      `hudFps=${pp.fps}, perfFps=${Math.round(fpsNow.fps)}`);
+
+    /* 3. toggle off: Key I hides it and the hidden HUD costs nothing
+     * — no stats tick, no DOM write — while the loop keeps running. */
+    await page.keyboard.press('I');
+    await sleep(150);
+    const h0 = await readStats();
+    check('M14.2: Key I hides the stats block (visible=false, display:none)',
+      h0.visible === false && h0.style === 'none',
+      `visible=${h0.visible}, style=[${h0.style}]`);
+    await sleep(1300);   // ~2.5 stats periods
+    const h1 = await readStats();
+    check('M14.2: hidden HUD costs nothing — no stats tick, no DOM write, loop still live',
+      h1.visible === false && h1.style === 'none' &&
+      h1.ticks === h0.ticks && h1.hud === h0.hud && h1.frames > h0.frames,
+      `ticks ${h0.ticks}->${h1.ticks}, frames ${h0.frames}->${h1.frames}, textSame=${h1.hud === h0.hud}`);
+
+    /* 4. toggle on: Key I restores it and the stats ticks resume. */
+    await page.keyboard.press('I');
+    await sleep(150);
+    const r0 = await readStats();
+    await sleep(700);   // at least one stats period
+    const r1 = await readStats();
+    check('M14.2: Key I restores the stats block — visible, display back, ticks resume',
+      r0.visible === true && r0.style !== 'none' &&
+      r1.ticks > r0.ticks && r1.hud !== '' && /^INST \d+$/m.test(r1.hud),
+      `visible=${r0.visible}, style=[${r0.style}], ticks ${r0.ticks}->${r1.ticks}`);
+
+    /* 5. no leftover: visible, no pending edge. */
+    const fin = await page.evaluate(() => ({
+      visible: window.SIM.HUD.visible,
+      edge: window.SIM.INPUT.hudStats,
+    }));
+    check('M14.2: no leftover state — stats block visible, no pending I edge',
+      fin.visible === true && fin.edge === false, JSON.stringify(fin));
   }
 
   /* ---- 10. No errors anywhere ---- */

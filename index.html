@@ -754,6 +754,13 @@ const CFG = {
     bedGain: { high: 1.0, med: 0.7, low: 0.45 },  // audio bed level scale
   },
 
+  /* ---- M14.2: HUD stats block ----
+   * The corner stats overlay refreshes every statsEvery s; a hidden
+   * HUD (Key I) does none of it (the HUD.update early return). */
+  hud: {
+    statsEvery: 0.5,   // s — stats refresh period (matches the M14.1 fps window)
+  },
+
   /* ---- M11.2: looping beds (all connect to AUDIO.master — M11.1) ----
    * Three always-on beds that make the city read as "machine city":
    * reactor hum (2 detuned sines + sub sine, slow swell), fans
@@ -1766,6 +1773,7 @@ const INPUT = {
   shakeTrigger: false,        // N edge — dev trigger: CAMERA.shake impulse
   lightningTrigger: false,    // L edge — distant lightning event (M8.4)
   wakeTrigger: false,         // F edge — manual awaken trigger (M9.6)
+  hudStats: false,            // I edge — M14.2: toggle the corner stats block
 
   pad: {
     connected: false,
@@ -1787,6 +1795,7 @@ const INPUT = {
       if (e.code === 'KeyN' && !e.repeat) INPUT.shakeTrigger = true;
       if (e.code === 'KeyL' && !e.repeat) INPUT.lightningTrigger = true;
       if (e.code === 'KeyF' && !e.repeat) INPUT.wakeTrigger = true;
+      if (e.code === 'KeyI' && !e.repeat) INPUT.hudStats = true;  // M14.2
       if (e.code === 'KeyM' && !e.repeat) AUDIO.toggleMute();   // M11.1
       /* M14.1 quality tiers: F1/F2/F3 pin HIGH/MED/LOW (manual, auto
        * off); F4 restores auto-detect. */
@@ -7346,6 +7355,22 @@ function registerSystem(sys) {
 }
 
 /* ---- HUD: FPS + state + camera readout (DOM, no 3D canvas text) ---- */
+/* ------------------------------------------------------------------ * * M14.2 — corner stats block (toggleable)
+ *
+ *  - The #hud overlay (top-left corner, small) shows: FPS (the M14.1
+ *    PERF monitor), INST — visible instances (sum of the live
+ *    instance counts of every InstancedMesh in the city scene),
+ *    DRONE — the active TRAFFIC drone count, CHUNK — the player's
+ *    chunk id (WORLD.playerKey, the same "cx,cz" key the keep-set
+ *    uses), AI — the ENTITY wake state, plus the pre-existing tier /
+ *    state / camera / mute lines
+ *  - Key I toggles it (INPUT.hudStats edge, repeat-guarded, RUNNING
+ *    only): hidden = display:none AND zero per-tick cost — update()
+ *    early-returns before the accumulator, the stats walk, and any
+ *    DOM write, so a hidden HUD allocates and computes nothing
+ *  - _ticks counts stats writes — the smoke uses it to prove the
+ *    hidden HUD does no stats work
+ * ------------------------------------------------------------------ */
 const HUD = {
   name: 'HUD',
   el: null,
@@ -7353,6 +7378,8 @@ const HUD = {
   fps: 0,
   acc: 0,
   accFrames: 0,
+  visible: true,            // M14.2: stats block on (Key I toggles)
+  _ticks: 0,                // M14.2: stats writes so far (hidden ⇒ frozen)
 
   init() {
     HUD.el = document.getElementById('hud');
@@ -7361,7 +7388,7 @@ const HUD = {
       'WASD/ZQSD move · SPACE up · C down · SHIFT sprint\n' +
       'MOUSE look · WHEEL zoom · MMB drag orbit · V camera\n' +
       'P particles · R pulse · T arcs · B flash · N shake · L lightning\n' +
-      'F awaken · M mute\nF1–F3 quality · F4 auto';
+      'F awaken · M mute · I stats\nF1–F3 quality · F4 auto';
     /* M9.6: HUD awaken button — same entry as the F key: the manual
      * trigger path routes through ENTITY.wake() (no-op unless DORMANT)
      * and marks the session user-triggered so the one-shot auto skips. */
@@ -7374,13 +7401,29 @@ const HUD = {
     });
   },
 
+  /* M14.2: visible instances — sum of the live instance counts over
+   * every InstancedMesh in the city scene. Runs only on the stats
+   * tick (CFG.hud.statsEvery), so the per-frame cost is zero. */
+  _instCount() {
+    let n = 0;
+    scene.traverse(o => { if (o.isInstancedMesh) n += o.count; });
+    return n;
+  },
+
   update(dt) {
+    if (INPUT.hudStats) {
+      INPUT.hudStats = false;
+      HUD.visible = !HUD.visible;
+      HUD.el.style.display = HUD.visible ? '' : 'none';
+    }
+    if (!HUD.visible) return;   // hidden HUD costs nothing
     HUD.acc += dt;
     HUD.accFrames++;
-    if (HUD.acc >= 0.5) {
+    if (HUD.acc >= CFG.hud.statsEvery) {
       HUD.fps = PERF.fps;      // M14.1 rolling FPS monitor
       HUD.acc = 0;
       HUD.accFrames = 0;
+      HUD._ticks++;
       if (HUD.el) {
         const mode = CAMERA.orbit ? 'ORBIT' : CAMERA.mode;
         const mouse = INPUT.pointerLocked ? 'locked' : 'click to capture';
@@ -7392,6 +7435,9 @@ const HUD = {
           `Q ${q}\n` +
           `STATE ${BOOT.state}\n` +
           `AI ${ENTITY.state}\n` +
+          `INST ${HUD._instCount()}\n` +
+          `DRONE ${TRAFFIC.count}\n` +
+          `CHUNK ${WORLD.playerKey}\n` +
           `CAM ${mode} · FOV ${Math.round(camera.fov)} · ${mouse} · ${pad}\n` +
           `${mute}`;
         HUD.el.style.whiteSpace = 'pre';

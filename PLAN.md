@@ -85,7 +85,7 @@ smoke-test evidence.
 | **M13.3** ✅ | Ambient events B: cooling emergency (fan spin-up, steam burst, warning LEDs, drone dispatch, 20 s, resolves) + drone launch (roof-bay panel opens, 2–4 drones fly to patrol) | Both events run start→resolve with no leftover state; visible from street level |
 | **M13.4** ✅ | Ambient events C: mechanical reposition (giant fan/antenna/ring slow move + rumble + tiny shake) + distant EM discharge (far lightning + a few city arcs); awakening-compat: during AWAKE only creature-priority events fire | 3-min idle play shows ≥ 4 different events, none conflicting, none breaking perf; AWAKE window respected |
 | **M14.1** ✅ | Perf monitor + quality tiers: rolling FPS, `HIGH/MED/LOW` (auto + manual); tiers scale LOD radius, particle/drone/vehicle caps, sign texture updates, light shafts, audio beds | Forcing each tier in smoke run: stats within budget, no stutter on tier switch |
-| **M14.2** | HUD stats (small, corner, toggleable): FPS, visible instances, active drones, chunk id, AI state | HUD matches measured stats; toggle hides it; costs nothing hidden |
+| **M14.2** ✅ | HUD stats (small, corner, toggleable): FPS, visible instances, active drones, chunk id, AI state | HUD matches measured stats; toggle hides it; costs nothing hidden |
 | **M14.3** | Polish pass: shake tuning, flash tuning, title fade, mute key (`M`), help overlay (`H`), cheap DOM vignette | Each control verified working; feel pass recorded (3-min run) |
 | **M14.4** | Robustness pass: refresh mid-game, tab-hide/resume (dt clamp), resize mid-awakening, gamepad plug/unplug — no errors, no stuck states | Robustness checklist in smoke run fully green |
 | **M14.5** | Final verification: manual 3-min screen-recording run — intro → reveal → idle life → manual awakening → easter-egg reaction → performance stable | Recording reviewed; stable frame rate through the awakening at default quality on a modern gaming GPU |
@@ -1138,11 +1138,37 @@ events, none conflicting, none breaking perf.
 - **Commit when:** all three tiers verified.
 
 #### M14.2 — HUD stats
-- [ ] Small corner HUD, toggleable: FPS, visible instances, active
+- [x] Small corner HUD, toggleable: FPS, visible instances, active
       drones, chunk id, AI state.
 - **Test:** HUD values match measured stats; toggle hides it; hidden HUD
       costs nothing.
 - **Commit when:** values cross-checked.
+  Verified: smoke M14.2 section green (7 checks, section 9g, after
+  M14.1, before the no-errors gate) — the #hud corner block (top-left,
+  small) now carries, alongside the existing FPS / Q / STATE / CAM / mute
+  lines: **AI** (ENTITY wake state), **INST** (visible instances — sum of
+  the live instance counts of every InstancedMesh in the city scene; a
+  scene walk on the 0.5 s stats tick only, zero per-frame cost), **DRONE**
+  (active TRAFFIC count) and **CHUNK** (the player's chunk id —
+  `WORLD.playerKey`, the same "cx,cz" key the keep-set uses). **Toggle** =
+  Key I (`INPUT.hudStats` edge, repeat-guarded, RUNNING only): hidden =
+  `display: none` AND zero cost — `HUD.update` early-returns before the
+  accumulator, the instance walk, and any DOM write (`HUD._ticks`
+  stats-write counter frozen ⇒ hidden HUD does no stats work); the hint
+  line gained `I stats`. `CFG.hud.statsEvery` (0.5 s) is the refresh
+  period. Gates: block content + hint; values cross-checked against
+  independent in-page ground truth (scene InstancedMesh walk, TRAFFIC.count
+  AND the traffic-drone pool inUse, chunk id replayed from CAMERA.pos,
+  ENTITY.state — DRONE/CHUNK/AI exact, INST within ±4 for the 0.5 s
+  staleness: the steam pool oscillates 47↔48 between release/refill
+  frames; polled 16×250 ms); HUD FPS line vs the PERF monitor (±5 fps);
+  Key I hide (visible=false, display none, ticks frozen over ~2.5 stats
+  periods, text frozen, loop live), Key I restore (ticks resume), no
+  leftover state (visible, no pending I edge). Full suite 3 runs on final
+  code: M14.2 7/7 in every run, zero page/console errors; only failures
+  are the documented pre-existing headless flakes (M7.3 bolt cadence /
+  M7.5 shake energy / M8.1 star brightness / M9.4 vehicle ease-out /
+  M10.1 screenshot observation / M11.2 heap class).
 
 #### M14.3 — Polish pass
 - [ ] Camera shake tuning, flash tuning, title fade, mute key (`M`),
