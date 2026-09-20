@@ -1857,8 +1857,10 @@ const INPUT = {
       INPUT.orbitHeld = false;
     });
 
-    /* --- mouse look (pointer lock preferred; fallback deltas) --- */
-    window.addEventListener('pointerlockchange', () => {
+    /* --- mouse look (pointer lock preferred; fallback deltas) ---
+     * NOTE: pointerlockchange fires on document and does NOT bubble to
+     * window — the listener must be attached to document. */
+    document.addEventListener('pointerlockchange', () => {
       INPUT.pointerLocked = document.pointerLockElement === canvas;
       if (!INPUT.pointerLocked) INPUT.orbitHeld = false;
       INPUT._lastMouse = null;

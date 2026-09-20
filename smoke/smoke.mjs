@@ -693,6 +693,69 @@ try {
     check('wheel zoom changes FOV', b.fov < a.fov - 1, `fov ${a.fov.toFixed(1)} -> ${b.fov.toFixed(1)}`);
   }
 
+  /* ---- 6e2. Pointer lock: the pointerlockchange listener must see
+   * the grant (it fires on document, not window), mouse look consumes
+   * movementX/Y, and unlock clears the flag ---- */
+  {
+    const pose0 = await page.evaluate(() => ({
+      yaw: window.SIM.CAMERA.yaw,
+      pitch: window.SIM.CAMERA.pitch,
+      sens: window.SIM.CFG.input.lookSens,
+    }));
+    // restore the pre-section pose when leaving (later sections assume
+    // the spawn orientation)
+    const restorePose = () => page.evaluate(
+      ({ yaw, pitch }) => {
+        window.SIM.CAMERA.yaw = yaw;
+        window.SIM.CAMERA.pitch = pitch;
+      }, pose0);
+    await page.mouse.move(640, 400);
+    await page.mouse.click(640, 400); // canvas click → requestPointerLock
+    await page.waitForFunction(
+      () => window.SIM.INPUT.pointerLocked === true,
+      { timeout: 3000 }).catch(() => {});
+    const lock = await page.evaluate(() => ({
+      flag: window.SIM.INPUT.pointerLocked,
+      el: document.pointerLockElement
+        === document.querySelector('canvas'),
+    }));
+    check('pointer lock: canvas click locks the pointer (pointerlockchange listener flips the flag)',
+      lock.flag === true && lock.el === true,
+      `flag=${lock.flag}, lockElement-is-canvas=${lock.el}`);
+
+    await page.evaluate(() => {
+      window.dispatchEvent(new MouseEvent('mousemove',
+        { movementX: 100, movementY: 50 }));
+    });
+    await sleep(200);
+    const pose1 = await page.evaluate(() => ({
+      yaw: window.SIM.CAMERA.yaw,
+      pitch: window.SIM.CAMERA.pitch,
+    }));
+    /* convention: mouse right (movementX > 0) ⇒ yaw decreases,
+     * mouse down (movementY > 0) ⇒ pitch decreases (look down) */
+    check('pointer lock: mouse look rotates the camera by lookSens * px',
+      Math.abs((pose1.yaw - pose0.yaw) + 100 * pose0.sens) < 5 * pose0.sens &&
+      Math.abs((pose1.pitch - pose0.pitch) + 50 * pose0.sens) < 5 * pose0.sens,
+      `dyaw=${(pose1.yaw - pose0.yaw).toFixed(5)}, dpitch=${(pose1.pitch - pose0.pitch).toFixed(5)}`);
+
+    await page.evaluate(() => document.exitPointerLock());
+    await page.waitForFunction(
+      () => window.SIM.INPUT.pointerLocked === false,
+      { timeout: 3000 }).catch(() => {});
+    await sleep(250);
+    const pose2 = await page.evaluate(() => ({
+      flag: window.SIM.INPUT.pointerLocked,
+      yaw: window.SIM.CAMERA.yaw,
+    }));
+    await sleep(250);
+    const pose3 = await page.evaluate(() => window.SIM.CAMERA.yaw);
+    check('pointer lock: unlock clears the flag and the camera holds still',
+      pose2.flag === false && pose2.yaw === pose3,
+      `flag=${pose2.flag}, dyaw=${(pose3 - pose2.yaw).toFixed(5)}`);
+    await restorePose();
+  }
+
   /* ---- 6f. V toggles GROUND <-> CINE with smooth blend ---- */
   {
     const a = await cam();

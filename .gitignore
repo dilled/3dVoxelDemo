@@ -1,3 +1,6 @@
 graphify-out/
 node_modules/
 .pi/
+.pi/milestone-working-set.md
+.pi/brain-sync/working-set.md
+.pi/brain-sync/prompt.txt
